@@ -209,3 +209,20 @@ def add_param_noise(state, sigma=1e-3, seed=None, return_seed=False):
     if return_seed:
         return state, seed
     return state
+
+
+def build_root_U(N: int, L: int, dtype=jnp.float64):
+    occ = np.arange(0, 3 * N, 3)
+    if occ[-1] >= L:
+        raise ValueError(f"Root partition does not fit: N={N}, L={L}")
+    U = np.zeros((L, N), dtype=np.float64)
+    U[occ, np.arange(N)] = 1.0
+    return jnp.asarray(U, dtype=dtype)
+
+
+def build_root_U_perturbed(N: int, L: int, eps: float = 1e-3, dtype=jnp.float64):
+    U = np.array(build_root_U(N, L, dtype=np.float64))
+    rng = np.random.default_rng(1234)
+    U = U + eps * rng.standard_normal(U.shape)
+    q, _ = np.linalg.qr(U)
+    return jnp.asarray(q[:, :N], dtype=dtype)
