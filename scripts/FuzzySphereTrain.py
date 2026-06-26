@@ -37,6 +37,8 @@ parser.add_argument("--lmlp-coeff", action="store", default=0,
 parser.add_argument("--lmlp-freq", action="store", default=5,
                     help="measurement frequency of L^- L^+ term")
 
+parser.add_argument("--pf-backflow", action="store_true", default=False,
+                    help="change the ansatz structure from PfBackflow to DetBackflow")
 parser.add_argument("--nbr-heads", action="store", default=4,
                     help="number of attention heads in the transformer")
 parser.add_argument("--attn-dim", action="store", default=16,
@@ -74,6 +76,7 @@ do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
 LmLp_freq = float(args["lmlp_freq"])
 
+pf_backflow = bool(args["pf_backflow"])
 nsweeps = int(args["nbr_sweeps"])
 nsamples = int(args["nbr_samples"])
 nb = int(args["nbr_blocks"])
@@ -104,12 +107,12 @@ pspot_inter = np.array([4.75, 1])
 pspot_intra = np.array([0])
 transverse_fld = -3.16
 tms_H = GetSpinfulDenIntTerms(nm = L, ps_pot=2*pspot_inter, mat_a = S1, mat_b = S2)
-tms_H -= transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
+tms_H += transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
 
 
 # Exact diagonalization
 if do_ED:
-    E, wf = tms_H.diagonalize(k=10, symm=symm) # need to fix the number of states being requested
+    E, wf = tms_H.diagonalize(k=15, symm=symm) # need to fix the number of states being requested
     print("Exact spectrum: ", E)
 
     proj_mask = GetLzSymmetryProjector(L, N, lz, symm=symm, nflav=2)
@@ -177,15 +180,14 @@ else:
 # start NN training
 net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
-if model_type == "DetBackflow":
-    model = qtx.model.DetBackflow(net, U0=U, d=d)
-elif model_type == "PfBackflow":
+
+if pf_backflow:
     U_pf = jnp.zeros((2*L, 2*L))
     for i in range(N):
         U_pf = U_pf.at[:,2*i].add(U[:,i])
     model = qtx.model.PfBackflow(net, U0=U_pf, d=d)
 else:
-    print("Model not implemented")
+    model = qtx.model.DetBackflow(net, U0=U, d=d)
 
 
 state = qtx.state.Variational(model, symm=symm, max_parallel=16384)
@@ -207,7 +209,7 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"sampler: DipoleCons\n")
   f.write(f"nbr. samples NN: {nsamples}\n")
   f.write(f"reweight: {rw}\n")
-  f.write(f"model: {model_type}\n")
+  f.write(f"model: {"PfBackflow" if pf_backflow else "DetBackflow"}\n")
   f.write(f"net: Transformer\n")
   f.write(f"nbr. blocks: {nb}\n")
   f.write(f"nbr. heads: {nh}\n")
