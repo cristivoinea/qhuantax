@@ -19,5 +19,5 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["qhuantax"]
+packages = ["qhuantax", "qhuantax.nes"]
 package-dir = { "qhuantax" = "src" }
