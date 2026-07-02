@@ -6,6 +6,7 @@ from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolT
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
 from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, diagonalize_lz_multiplet, read_meta_file
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
+from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 
 from datetime import datetime
 from pathlib import Path
@@ -135,22 +136,12 @@ tms_H -= transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
 
 # Exact diagonalization
 if do_ED:
-    E, wf = tms_H.diagonalize(k=10, symm=symm) # need to fix the number of states being requested
+    dense_symm = LzUserBasisSymmetry(lz, z2)
+    E, wf = tms_H.diagonalize(k=15, symm=dense_symm) # need to fix the number of states being requested
     print("Exact spectrum: ", E)
 
-    proj_mask = GetLzSymmetryProjector(L, N, lz, symm=symm, nflav=2)
-    if lz == 0:
-        wf_exact = wf[:,0]
-    else:
-        ind = 2
-        mask = np.isclose(E, E[ind])
-        lz_vals, wf_lz = diagonalize_lz_multiplet(
-                wf[:, mask],
-                L=L,
-                nflav=2,
-                symm=symm,)
-        wf_exact = wf_lz[:,2*lz]
-        print("Target state norm = ",np.dot(wf_exact[proj_mask], wf_exact[proj_mask]))
+    wf_exact = wf[:,0]
+    print("Target state norm = ",np.vdot(wf_exact, wf_exact))
 
 
 startTime = datetime.now()
@@ -233,14 +224,11 @@ for i in range(nsweeps):
         np.savetxt(f"{path}/data_LmLp_{run_id}.txt", np.vstack((LmLp_tracer.time, LmLp_tracer.data, LmLp_var_tracer.data)).T)
     
     if do_ED:
-        dense = state.todense(symm).normalize()
-        new = dense.psi.value().at[:].set(0)
-        norm = np.sqrt(dense.psi.value()[proj_mask] @ dense.psi.value()[proj_mask])
-        new = qtx.state.DenseState(new.at[proj_mask].set(dense.psi.value()[proj_mask] / norm), symm)
+        dense = state.todense(dense_symm).normalize()
 
-        overlap.append(abs( (new @ wf_exact)**2 ))
-        exact_energy.append((new @ tms_H @ new))
-        exact_variance.append(((new @ tms_H @ tms_H @ new) - (new @ tms_H @ new)**2))
+        overlap.append(abs( (dense @ wf_exact)**2 ))
+        exact_energy.append((dense @ tms_H @ dense))
+        exact_variance.append(((dense @ tms_H @ tms_H @ dense) - (dense @ tms_H @ dense)**2))
 
         np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.vstack((exact_energy.time, exact_energy.data, exact_variance.data, overlap.data)).T)
 

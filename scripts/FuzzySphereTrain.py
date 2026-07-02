@@ -6,6 +6,7 @@ from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolT
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
 from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, diagonalize_lz_multiplet
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
+from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,11 @@ parser.add_argument("--ph-sect", action="store", default=0,
 
 parser.add_argument("--mean-field", action="store_true", default=False,
                     help="use mean-field ansatz as initial starting point")
+parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
+		    help="number of iterations for the MF optimization")
+parser.add_argument("--lr-mf", action="store", default=1e-2,
+		    help="starting value of the learning rate for the MF optimization")
+
 parser.add_argument("--exact-diag", action="store_true", default=False,
                     help="perform exact diagonalization and track energy, energy variance and overlap with ground state")
 parser.add_argument("--lmlp-coeff", action="store", default=0,
@@ -72,6 +78,9 @@ path = str(args["path"])
 run_id = f"n_{N}_2s_{L-1}_lz_{lz}_z2_{z2}_ph_{ph}_id0{id}"
 
 do_MF = bool(args["mean_field"])
+nsweeps_MF = int(args["nbr_sweeps_mf"])
+lr_MF = int(args["lr_mf"])
+
 do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
 LmLp_freq = float(args["lmlp_freq"])
@@ -112,22 +121,12 @@ tms_H += transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
 
 # Exact diagonalization
 if do_ED:
-    E, wf = tms_H.diagonalize(k=15, symm=symm) # need to fix the number of states being requested
+    dense_symm = LzUserBasisSymmetry(lz, z2)
+    E, wf = tms_H.diagonalize(k=15, symm=dense_symm) # need to fix the number of states being requested
     print("Exact spectrum: ", E)
 
-    proj_mask = GetLzSymmetryProjector(L, N, lz, symm=symm, nflav=2)
-    if lz == 0:
-        wf_exact = wf[:,0]
-    else:
-        ind = 0
-        mask = np.isclose(E, E[ind])
-        lz_vals, wf_lz = diagonalize_lz_multiplet(
-                wf[:, mask],
-                L=L,
-                nflav=2,
-                symm=symm,)
-        wf_exact = wf_lz[:,2*lz]
-        print("Target state norm = ",np.dot(wf_exact[proj_mask], wf_exact[proj_mask]))
+    wf_exact = wf[:,0]
+    print("Target state norm = ",np.vdot(wf_exact, wf_exact))
 
 
 tms_Lp = GetLpTerms(L, 2)
@@ -137,12 +136,13 @@ if LmLp_coeff:
     tms_H = tms_H + LmLp_coeff * tms_LmLp
 
 
-# MF pre training
+# MF pre training & load orbitals
 if do_MF:
-    path_MF = Path(f"{path}/data_MF_{run_id}.txt")
-    nsweeps_MF = 1000
-    lr_MF = 1e-3
-    if path_MF.exists() is False:
+    path_MF = Path(f"{path}/state_MF_{run_id}.txt")
+    if path_MF.exists():
+        print(f"File already exists: {path}/state_MF_{run_id}.txt")
+        U = np.loadtxt(f"{path}/state_MF_{run_id}.txt")[:2*L,:]
+    else:
         energy_MF = qtx.utils.DataTracer()
 
         t = 1.0
@@ -155,27 +155,22 @@ if do_MF:
         model_MF = qtx.model.MultiDet(ndets = 2, U=U, coeffs = jnp.array([1, z2]))
         state_MF = qtx.state.MultiDetState(model_MF)
 
-        for i in range(nsweeps_MF):
+        for i in range(nsweeps):
             step = state_MF.get_step(tms_H)
             state_MF.update(step * lr_MF)
             energy_MF.append(state_MF.energy)
 
             np.savetxt(f"{path}/data_MF_{run_id}.txt", np.vstack((energy_MF.time, energy_MF.data)).T)
             np.savetxt(f"{path}/state_MF_{run_id}.txt", np.vstack((state_MF.model.U_full[0,:,:], state_MF.model.U_full[1,:,:])))
-
-print("Mean-field optimization completed.")
-
-startTime = datetime.now()
-
-# initial guess for orbitals
-if do_MF:
-    U = np.loadtxt(f"{path}/state_MF_{run_id}.txt")[:2*L,:]
 else:
     U = np.zeros((2*L, N))
     U[:N,:N] = np.eye(N)
     if lz != 0:
         U[0,0] = 0
         U[N,lz] = 1
+
+startTime = datetime.now()
+
 
 # start NN training
 net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
@@ -246,14 +241,11 @@ for i in range(nsweeps):
         np.savetxt(f"{path}/data_LmLp_{run_id}.txt", np.vstack((LmLp_tracer.time, LmLp_tracer.data, LmLp_var_tracer.data)).T)
     
     if do_ED:
-        dense = state.todense(symm).normalize()
-        new = dense.psi.value().at[:].set(0)
-        norm = np.sqrt(dense.psi.value()[proj_mask] @ dense.psi.value()[proj_mask])
-        new = qtx.state.DenseState(new.at[proj_mask].set(dense.psi.value()[proj_mask] / norm), symm)
+        dense = state.todense(dense_symm).normalize()
 
-        overlap.append(abs( (new @ wf_exact)**2 ))
-        exact_energy.append((new @ tms_H @ new))
-        exact_variance.append(((new @ tms_H @ tms_H @ new) - (new @ tms_H @ new)**2))
+        overlap.append(abs( (dense @ wf_exact)**2 ))
+        exact_energy.append((dense @ tms_H @ dense))
+        exact_variance.append(((dense @ tms_H @ tms_H @ dense) - (dense @ tms_H @ dense)**2))
 
         np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.vstack((exact_energy.time, exact_energy.data, exact_variance.data, overlap.data)).T)
 
