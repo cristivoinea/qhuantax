@@ -13,6 +13,7 @@ dependencies = [
     "equinox",
     "numpy",
     "scipy",
+    "sympy",
     "quspin==1.0.0",
     "matplotlib",
     "jaxtyping",
