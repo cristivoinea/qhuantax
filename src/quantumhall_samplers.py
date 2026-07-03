@@ -407,7 +407,7 @@ def _get_site_neighbors(n_neighbor: Union[int, Sequence[int]]) -> jax.Array:
     neighbor_matrix = jnp.asarray(neighbor_matrix, dtype=jnp.bool_)
     fn = jax.vmap(lambda x: jnp.flatnonzero(x, size=max_neighbors, fill_value=-1))
     neighbors = fn(neighbor_matrix)
-    neighbors = jnp.asarray(neighbors, dtype=jnp.int32, device=qtx.utils.get_replicate_sharding())
+    neighbors = jnp.asarray(neighbors, dtype=jnp.int32, device=qtx.utils.get_replicated_sharding())
 
     if sites.particle_type == qtx.PARTICLE_TYPE.spinful_fermion:
         neighbors_spin = jnp.where(neighbors == -1, -1, neighbors + sites.Nsites)

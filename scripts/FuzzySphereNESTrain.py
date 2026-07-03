@@ -3,10 +3,13 @@ from datetime import datetime
 from pathlib import Path
 
 import jax.numpy as jnp
+
 import numpy as np
 import quantax as qtx
+from qhuantax.quantumhall_transformer import Transformer
 
 from qhuantax.nes import NaturalExcitedAdamSR, NaturalLzDetSampler, NaturalStateSet
+from qhuantax.nes.optimizer import _scaled_psi_matrix
 from qhuantax.quantumhall_operators import (
     GetLpTerms,
     GetSpinfulDenIntTerms,
@@ -27,7 +30,7 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2
     if orbital_noise > 0:
         U_state = U_state + orbital_noise * rng.normal(size=U_state.shape)
 
-    net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
     if pf_backflow:
         U_pf = jnp.zeros((2 * L, 2 * L))
         for i in range(N):
@@ -36,7 +39,7 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2
     else:
         model = qtx.model.DetBackflow(net, U0=U_state, d=d)
 
-    return qtx.state.Variational(model, symm=symm, max_parallel=16384)
+    return qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
 
 
 
@@ -86,7 +89,6 @@ parser.add_argument("--lr", action="store", default=1e-2,
 		    help="starting value of the learning rate")
 parser.add_argument("--reweight", action="store", default=2.0,
 		    help="reweight factor for training sampling")
-
 parser.add_argument("--run-id", action="store", default=1,
                     help="")
 parser.add_argument("--path", action="store", required=True,
@@ -188,8 +190,9 @@ else:
 
 start_time = datetime.now()
 
+print(U)
 member_states = tuple(
-    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U)
+    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=(0 if index==1 else 1e-1))
     for index in range(nstates)
 )
 state_set = NaturalStateSet(member_states)
@@ -211,7 +214,7 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"sampler: DipoleCons\n")
   f.write(f"nbr. samples NN: {nsamples}\n")
   f.write(f"reweight: {rw}\n")
-  f.write(f"model: {"PfBackflow" if pf_backflow else "DetBackflow"}\n")
+  f.write(f"model: {'PfBackflow' if pf_backflow else 'DetBackflow'}\n")
   f.write(f"net: Transformer\n")
   f.write(f"nbr. blocks: {nb}\n")
   f.write(f"nbr. heads: {nh}\n")
@@ -241,7 +244,6 @@ for i in range(nsweeps):
     step = optimizer.get_step(samples)
     lr = adaptive_learning_rate(lr0, delay, decay, baseline, i)
     state_set.update(state_set.split_step(step * lr))
-
     energy.append(optimizer.energy)
     VarE.append(optimizer.VarE)
 

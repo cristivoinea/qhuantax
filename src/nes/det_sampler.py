@@ -15,7 +15,7 @@ from quantax.utils import (
     PsiArray,
     filter_tree_map,
     rand_states,
-    to_distribute_array,
+    to_distributed_array,
 )
 
 from ..quantumhall_samplers import (
@@ -129,7 +129,7 @@ class NaturalDetSampler(NaturalDetAbstractSampler):
                 initial_spins = jnp.tile(initial_spins, (self.nsamples, self.Nstates, 1))
             else:
                 initial_spins = initial_spins.reshape(self.nsamples, self.Nstates, self.Nmodes)
-            self._spins = to_distribute_array(initial_spins.astype(jnp.int8))
+            self._spins = to_distributed_array(initial_spins.astype(jnp.int8))
 
         if self._thermal_steps > 0:
             self.sweep(self._thermal_steps)

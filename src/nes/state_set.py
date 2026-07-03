@@ -121,6 +121,14 @@ class NaturalStateSet:
         return self._states[0].symm
 
     @property
+    def dtype(self):
+        return self._states[0].dtype
+
+    @property
+    def vs_type(self):
+        return self._states[0].vs_type
+
+    @property
     def nparams_per_state(self) -> tuple[Optional[int], ...]:
         return tuple(getattr(state, "nparams", None) for state in self._states)
 

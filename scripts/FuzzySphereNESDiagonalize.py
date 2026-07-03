@@ -1,4 +1,5 @@
 import quantax as qtx
+from qhuantax.quantumhall_transformer import Transformer
 import jax.numpy as jnp
 import numpy as np
 import scipy as sp
@@ -106,7 +107,7 @@ if lz != 0:
 
 states = []
 for index in range(nstates):
-    net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
     if pf_backflow:
         U_pf = jnp.zeros((2*L, 2*L))

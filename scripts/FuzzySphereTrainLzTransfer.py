@@ -1,4 +1,5 @@
 import quantax as qtx
+from qhuantax.quantumhall_transformer import Transformer
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
@@ -154,7 +155,7 @@ if LmLp_coeff:
 
 
 # start NN training
-net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
 U = np.zeros((2*L, N))
 if model_type == "DetBackflow":

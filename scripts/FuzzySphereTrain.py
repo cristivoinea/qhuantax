@@ -1,4 +1,5 @@
 import quantax as qtx
+from qhuantax.quantumhall_transformer import Transformer
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
@@ -173,7 +174,7 @@ startTime = datetime.now()
 
 
 # start NN training
-net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
 
 if pf_backflow:
@@ -185,7 +186,7 @@ else:
     model = qtx.model.DetBackflow(net, U0=U, d=d)
 
 
-state = qtx.state.Variational(model, symm=symm, max_parallel=16384)
+state = qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
 
 
 with open(f"{path}/meta_{run_id}.txt", "w") as f:

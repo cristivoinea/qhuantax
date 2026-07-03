@@ -18,10 +18,8 @@ from quantax.symmetry import Symmetry, Identity
 from quantax.nn import RefModel, fermion_idx, fermion_inverse_sign, exp_by_log
 from quantax.utils import (
     chunk_map,
-    shard_vmap,
-    chunk_shard_vmap,
-    to_distribute_array,
-    filter_replicate,
+    jit_chunk_vmap,
+    to_distributed_array,
     filter_tree_map,
     array_extend,
     tree_fully_flatten,
@@ -34,7 +32,7 @@ from quantax.utils import (
 )
 from quantax.global_defs import get_default_dtype, is_default_cpl, get_sites, get_subkeys
 from quantax.operator.operator import _get_conn_size, _get_conn, Operator
-from quantax.utils import chunk_map, to_distribute_array, array_extend
+from quantax.utils import chunk_map, to_distributed_array, array_extend
 from quspin.basis import spinless_fermion_basis_1d, spinful_fermion_basis_1d
 
 from .quantumhall_symmetries import FuzzySphereSymmetry
@@ -216,42 +214,62 @@ class OperatedState(Variational):
             return (action * psi).astype(get_default_dtype())
 
         self._single_forward = single_forward
-        self._batch_forward = shard_vmap(single_forward, in_axes=(None, 0), out_axes=0)
+        self._batch_forward = eqx.filter_jit(
+            eqx.filter_vmap(single_forward, in_axes=(None, 0))
+        )
         self._direct_forward = chunk_map(
             self._batch_forward, in_axes=(None, 0), chunk_size=self.forward_chunk
         )
-        self._fulljit_forward = chunk_shard_vmap(
-            single_forward, in_axes=(None, 0), out_axes=0, chunk_size=self.forward_chunk
+        self._fulljit_forward = jit_chunk_vmap(
+            single_forward,
+            in_axes=(None, 0),
+            out_axes=0,
+            chunk_size=self.forward_chunk,
+            shard_batch=True,
         )
 
         def init_internal(model, s):
             s_symm = self._base_symm.get_symm_spins(s)
-            return jax.vmap(model.init_internal)(s_symm)
-
-        init_internal = chunk_shard_vmap(
-            init_internal, in_axes=(None, 0), out_axes=0, chunk_size=self.ref_chunk
-        )
-        self._init_internal = eqx.filter_jit(init_internal)
-
-        def ref_forward_with_updates(model, s, s_old, nflips, internal):
-            s_symm = self._base_symm.get_symm_spins(s)
-            s_old_symm = self._base_symm.get_symm_spins(s_old)
-            forward = partial(model.ref_forward, return_update=True)
-            forward = eqx.filter_vmap(forward, in_axes=(0, 0, None, 0))
-            psi, internal = forward(s_symm, s_old_symm, nflips, internal)
-
+            psi, internal = jax.vmap(model.init_internal)(s_symm)
             psi = self._base_symm.symmetrize(psi, s)
             action = self._operator.apply_diag(s[None, :])[0]
             return (action * psi).astype(get_default_dtype()), internal
 
-        self._ref_forward_with_updates = chunk_shard_vmap(
-            ref_forward_with_updates,
-            in_axes=(None, 0, 0, None, 0),
-            out_axes=(0, 0),
+        init_internal = jit_chunk_vmap(
+            init_internal,
+            in_axes=(None, 0),
+            out_axes=0,
             chunk_size=self.ref_chunk,
+            shard_batch=True,
+        )
+        self._init_internal = eqx.filter_jit(init_internal)
+
+        def ref_forward(model, s, s_old, update_mode, internal, return_update):
+            s_symm = self._base_symm.get_symm_spins(s)
+            s_old_symm = self._base_symm.get_symm_spins(s_old)
+            forward = eqx.filter_vmap(model.ref_forward, in_axes=(0, 0, None, 0, None))
+            out = forward(s_symm, s_old_symm, update_mode, internal, return_update)
+
+            if return_update:
+                psi, internal = out
+                psi = self._base_symm.symmetrize(psi, s)
+                action = self._operator.apply_diag(s[None, :])[0]
+                return (action * psi).astype(get_default_dtype()), internal
+
+            psi = out
+            psi = self._base_symm.symmetrize(psi, s)
+            action = self._operator.apply_diag(s[None, :])[0]
+            return (action * psi).astype(get_default_dtype())
+
+        self._ref_forward = jit_chunk_vmap(
+            ref_forward,
+            in_axes=(None, 0, 0, None, 0, None),
+            out_axes=0,
+            chunk_size=self.ref_chunk,
+            shard_batch=True,
         )
 
-        def ref_forward(model, s, s_old, nflips, idx_segment, internal):
+        def segment_ref_forward(model, s, s_old, update_mode, idx_segment, internal):
             s_symm = self._base_symm.get_symm_spins(s)
             s_old = s_old[idx_segment]
             s_old_symm = self._base_symm.get_symm_spins(s_old)
@@ -259,20 +277,17 @@ class OperatedState(Variational):
 
             forward = partial(model.ref_forward, return_update=False)
             forward = eqx.filter_vmap(forward, in_axes=(0, 0, None, 0))
-            psi = forward(s_symm, s_old_symm, nflips, internal)
+            psi = forward(s_symm, s_old_symm, update_mode, internal)
 
             psi = self._base_symm.symmetrize(psi, s)
             action = self._operator.apply_diag(s[None, :])[0]
             return (action * psi).astype(get_default_dtype())
 
-        self._batch_ref_forward = shard_vmap(
-            ref_forward,
-            in_axes=(None, 0, None, None, 0, None),
-            out_axes=0,
-            shard_axes=(None, 0, 0, None, 0, 0),
+        self._batch_segment_ref_forward = eqx.filter_jit(
+            eqx.filter_vmap(segment_ref_forward, in_axes=(None, 0, None, None, 0, None))
         )
-        self._ref_forward = chunk_map(
-            self._batch_ref_forward,
+        self._segment_ref_forward = chunk_map(
+            self._batch_segment_ref_forward,
             in_axes=(None, 0, None, None, 0, None),
             chunk_size=self.forward_chunk,
         )
@@ -338,8 +353,12 @@ class OperatedState(Variational):
 
             return grad.astype(get_default_dtype())
 
-        self._grad_vmap = chunk_shard_vmap(
-            grad_fn, in_axes=(None, 0), out_axes=0, chunk_size=self.backward_chunk
+        self._grad_vmap = jit_chunk_vmap(
+            grad_fn,
+            in_axes=(None, 0),
+            out_axes=0,
+            chunk_size=self.backward_chunk,
+            shard_batch=True,
         )
 
 
@@ -422,12 +441,18 @@ class OffDiagonalOperatedState(Variational):
             return out.astype(get_default_dtype())
 
         self._single_forward = single_forward
-        self._batch_forward = shard_vmap(single_forward, in_axes=(None, 0), out_axes=0)
+        self._batch_forward = eqx.filter_jit(
+            eqx.filter_vmap(single_forward, in_axes=(None, 0))
+        )
         self._direct_forward = chunk_map(
             self._batch_forward, in_axes=(None, 0), chunk_size=self.forward_chunk
         )
-        self._fulljit_forward = chunk_shard_vmap(
-            single_forward, in_axes=(None, 0), out_axes=0, chunk_size=self.forward_chunk
+        self._fulljit_forward = jit_chunk_vmap(
+            single_forward,
+            in_axes=(None, 0),
+            out_axes=0,
+            chunk_size=self.forward_chunk,
+            shard_batch=True,
         )
 
     def _init_backward(self) -> None:
@@ -491,6 +516,10 @@ class OffDiagonalOperatedState(Variational):
 
             return grad.astype(get_default_dtype())
 
-        self._grad_vmap = chunk_shard_vmap(
-            grad_fn, in_axes=(None, 0), out_axes=0, chunk_size=self.backward_chunk
+        self._grad_vmap = jit_chunk_vmap(
+            grad_fn,
+            in_axes=(None, 0),
+            out_axes=0,
+            chunk_size=self.backward_chunk,
+            shard_batch=True,
         )

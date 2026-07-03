@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import quantax as qtx
 from quantax.global_defs import get_default_dtype, is_default_cpl
 from quantax.operator.operator import _get_conn_size, _get_conn, _get_Olocx
+from quantax.optimizer import EnergyGrad, OverlapGrad
 from quantax.utils import chunk_map, ints_to_array
 
 
@@ -41,7 +42,7 @@ class ERDipoleCons(qtx.optimizer.QNGD):
             Symmetry used to construct the Hilbert space, default to be the symmetry
             of the variational state.
         """
-        super().__init__(state, imag_time, solver)
+        super().__init__(state, EnergyGrad(hamiltonian), imag_time=imag_time, solver=solver)
 
         self._hamiltonian = hamiltonian
         self._energy = None
@@ -114,7 +115,7 @@ class ERDipoleCons(qtx.optimizer.QNGD):
         psi /= jnp.linalg.norm(psi)
         Ebar = self.get_Ebar(psi)
         Obar = self.get_Obar(psi)
-        step = self.solve(Obar, Ebar)
+        step, self._buffers = self.solve(Obar, Ebar, self._buffers)
         return step
 
 
@@ -125,7 +126,7 @@ class FuzzySphereSupervised(qtx.optimizer.QNGD):
         target_state: qtx.state.State,
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
     ):
-        super().__init__(state, solver=solver)
+        super().__init__(state, OverlapGrad(target_state), solver=solver)
         self._target_state = target_state
 
         self._loss_mean = None
@@ -166,7 +167,7 @@ class Supervised_KL_Sign(qtx.optimizer.QNGD):
         sign_weight: float,
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
     ):
-        super().__init__(state, solver=solver)
+        super().__init__(state, OverlapGrad(target_state), solver=solver)
         self._target_state = target_state
         self._sign_weight = sign_weight
 
@@ -220,7 +221,7 @@ class Supervised_KL_Sign(qtx.optimizer.QNGD):
 
 
 
-class SupervisedExact_KL_Sign(qtx.optimizer.Supervised_exact):
+class SupervisedExact_KL_Sign(qtx.optimizer.SupervisedExact):
     def __init__(
         self,
         state: qtx.state.Variational,
@@ -232,7 +233,13 @@ class SupervisedExact_KL_Sign(qtx.optimizer.Supervised_exact):
     ):
         self._sign_weight = sign_weight
 
-        super().__init__(state, target_state, solver, symm, restricted_to)
+        super().__init__(state, target_state, solver=solver, symm=symm)
+        if restricted_to is None:
+            restricted_to = jnp.arange(self._Ns)
+        self._resctricted_to = restricted_to
+        self._target_psi = jnp.asarray(target_state.todense(self._symm).psi)[
+            self._resctricted_to
+        ]
 
     @property
     def loss_fn(self) -> Optional[float]:
@@ -319,7 +326,9 @@ class _SqueezedEnergyMixin:
                 segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
                 if internal is None:
                     internal = state.init_internal(spins)
-                psi_conn = state.ref_forward(s_conn, spins, nflips, segment, internal)
+                psi_conn = state.segment_ref_forward(
+                    s_conn, spins, {"nflips": nflips}, segment, internal
+                )
                 return _get_Olocx(psi, segment, psi_conn, H_conn)
 
             in_axes = (0, 0, 0, 0, None) if internal is None else 0

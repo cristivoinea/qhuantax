@@ -126,7 +126,7 @@ class FuzzySphereActionSymmetry (FuzzySphereSymmetry):
 
         spins_symm = self.get_symm_spins(spins)
         spins_symm = spins_symm.reshape(-1, self.Nmodes)
-        spins_symm = qtx.utils.to_distribute_array(qtx.utils.array_extend(spins_symm, jax.device_count()))
+        spins_symm = qtx.utils.to_distributed_array(qtx.utils.array_extend(spins_symm, jax.device_count()))
         action = self._operator.apply_diag(spins_symm)
                 
         return (psi * character * action).sum()
