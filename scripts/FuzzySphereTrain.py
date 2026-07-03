@@ -8,6 +8,7 @@ from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetr
 from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, diagonalize_lz_multiplet
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
+from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
 
 from datetime import datetime
 from pathlib import Path
@@ -44,8 +45,11 @@ parser.add_argument("--lmlp-coeff", action="store", default=0,
 parser.add_argument("--lmlp-freq", action="store", default=5,
                     help="measurement frequency of L^- L^+ term")
 
+parser.add_argument("--multi", action="store", default=1,
+                    help="Change the ansatz to a MultiDetBackflow ansatz (default) or MultiPfBackflow (if --pf-backflow)")
 parser.add_argument("--pf-backflow", action="store_true", default=False,
                     help="change the ansatz structure from PfBackflow to DetBackflow")
+
 parser.add_argument("--nbr-heads", action="store", default=4,
                     help="number of attention heads in the transformer")
 parser.add_argument("--attn-dim", action="store", default=16,
@@ -86,6 +90,7 @@ do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
 LmLp_freq = float(args["lmlp_freq"])
 
+nterms = int(args["multi"])
 pf_backflow = bool(args["pf_backflow"])
 nsweeps = int(args["nbr_sweeps"])
 nsamples = int(args["nbr_samples"])
@@ -174,16 +179,39 @@ startTime = datetime.now()
 
 
 # start NN training
-net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+if nterms > 1:
+    net = tuple(
+    Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+    for _ in range(nterms))
+else:
+    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
 
 if pf_backflow:
-    U_pf = jnp.zeros((2*L, 2*L))
-    for i in range(N):
-        U_pf = U_pf.at[:,2*i].add(U[:,i])
-    model = qtx.model.PfBackflow(net, U0=U_pf, d=d)
+    U0s = []
+    for alpha in range(nterms):
+        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+
+        U_pf = jnp.zeros((2 * L, 2 * L))
+        for i in range(N):
+            U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
+
+        U0s.append(U_pf)
+
+    if nterms > 1:
+        model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
+    else:
+        model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
 else:
-    model = qtx.model.DetBackflow(net, U0=U, d=d)
+    U0s = []
+    for alpha in range(nterms):
+        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+        U0s.append(U_alpha)
+
+    if nterms > 1:
+        model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
+    else:
+        model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
 
 
 state = qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
