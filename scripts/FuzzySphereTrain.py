@@ -168,6 +168,7 @@ if do_MF:
 
             np.savetxt(f"{path}/data_MF_{run_id}.txt", np.vstack((energy_MF.time, energy_MF.data)).T)
             np.savetxt(f"{path}/state_MF_{run_id}.txt", np.vstack((state_MF.model.U_full[0,:,:], state_MF.model.U_full[1,:,:])))
+        U = U[0, :, :]
 else:
     U = np.zeros((2*L, N))
     U[:N,:N] = np.eye(N)

@@ -135,4 +135,4 @@ var = np.zeros(nmeas)
 for i in range(nmeas):
     samples = sampler.sweep()
     expval[i], var[i] = O.expectation(state, samples, return_var=True)
-    np.savetxt(f"{path}/meastest_{meas_op}_nsamples_{nsamples}_{run_id}.txt", np.vstack((expval, var)).T)
+    np.savetxt(f"{path}/meas_{meas_op}_nsamples_{nsamples}_{run_id}.txt", np.vstack((expval, var)).T)
