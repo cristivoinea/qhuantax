@@ -1,4 +1,5 @@
 import quantax as qtx
+from qhuantax.quantumhall_transformer import Transformer
 import equinox as eqx
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -8,6 +9,7 @@ from qhuantax.quantumhall_operators import GetSpinlessDenIntTerms, GetSpinfulDen
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzDenseProjector
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, read_meta_file
+from qhuantax.quantumhall_models import MultiPfBackflow, MultiDetBackflow
 from quspin.basis import spinful_fermion_basis_1d
 
 from datetime import datetime
@@ -72,20 +74,47 @@ else:
 
 
 # initialize NQS
+nterms = int(meta_dict["nterms"])
 nb = int(meta_dict["nbr. blocks"])
 nh = int(meta_dict["nbr. heads"])
 d = int(meta_dict["attndim"])
-net = qtx.model.Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+
+
+# start NN training
+if nterms > 1:
+    net = tuple(
+    Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+    for _ in range(nterms))
+else:
+    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
 
 U = np.zeros((2*L, N))
 
 if pf_backflow:
-    U_pf = jnp.zeros((2*L, 2*L))
-    for i in range(N):
-        U_pf = U_pf.at[:,2*i].add(U[:,i])
-    model = qtx.model.PfBackflow(net, U0=U_pf, d=d)
+    U0s = []
+    for alpha in range(nterms):
+        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+
+        U_pf = jnp.zeros((2 * L, 2 * L))
+        for i in range(N):
+            U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
+
+        U0s.append(U_pf)
+
+    if nterms > 1:
+        model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
+    else:
+        model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
 else:
-    model = qtx.model.DetBackflow(net, U0=U, d=d)
+    U0s = []
+    for alpha in range(nterms):
+        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+        U0s.append(U_alpha)
+
+    if nterms > 1:
+        model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
+    else:
+        model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
 
 
 state = qtx.state.Variational(model, symm=symm, max_parallel=16384, param_file=f"{path}/state_{run_id}.eqx")

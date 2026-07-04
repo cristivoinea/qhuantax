@@ -234,6 +234,7 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nbr. samples NN: {nsamples}\n")
   f.write(f"reweight: {rw}\n")
   f.write(f"model: {"PfBackflow" if pf_backflow else "DetBackflow"}\n")
+  f.write(f"nterms: {nterms}\n")
   f.write(f"net: Transformer\n")
   f.write(f"nbr. blocks: {nb}\n")
   f.write(f"nbr. heads: {nh}\n")
