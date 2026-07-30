@@ -21,16 +21,17 @@ SX = np.array([[0,1],[1,0]])
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("-N", action="store", required=True,
-	                    help="number of particles")
-parser.add_argument("-L", action="store", required=True,
-                    help="number of flux quanta")
+parser.add_argument("-n", action="store", required=True,
+                    help="number of particles")
+parser.add_argument("-s", action="store", required=True,
+                    help="number of orbitals in the system (2s)")
 parser.add_argument("--lz-sect", action="store", required=True,
                     help="Lz symmetry sector")
 parser.add_argument("--z2-sect", action="store", default=0,
                     help="Z2 symmetry sector")
 parser.add_argument("--ph-sect", action="store", default=0,
                     help="PH symmetry sector (without spin flip)")
+
 parser.add_argument("--run-id", action="store", default=1,
                     help="")
 parser.add_argument("--path", action="store", required=True,
@@ -42,8 +43,8 @@ parser.add_argument("--pf-backflow", action="store_true", default=False,
 
 args = vars(parser.parse_args())
 
-N = int(args["N"])
-L = int(args["L"])
+N = int(args["n"])
+L = int(args["s"])+1
 lz = int(args["lz_sect"])
 z2 = int(args["z2_sect"])
 ph = int(args["ph_sect"])
