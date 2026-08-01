@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Optional, Union
 
 import jax
@@ -183,17 +183,21 @@ class NaturalStateSet:
         values = self.amplitudes(tuple_spins.reshape(-1, self.Nmodes))
         return values.reshape((*batch_shape, self.Nstates, self.Nstates))
 
-    def jacobians(self, spins: Union[jnp.ndarray, jax.Array]) -> tuple[jax.Array, ...]:
+    def jacobians(self, spins: Union[jnp.ndarray, jax.Array]) -> Iterator[jax.Array]:
         r"""
         Evaluate per-state logarithmic Jacobians on the same configurations.
 
         This is available only for member states that implement Quantax's
         ``jacobian`` method, such as ``qtx.state.Variational`` and compatible
         qhuantax subclasses.
+
+        Yielded lazily: each Jacobian is ``(nsamples * Nstates, nparams)``, so
+        returning them as a tuple keeps all ``Nstates`` of them resident at once.
         """
         spins = jnp.asarray(spins)
         flat_spins = spins.reshape(-1, self.Nmodes)
-        return tuple(state.jacobian(flat_spins) for state in self._states)
+        for state in self._states:
+            yield state.jacobian(flat_spins)
 
     def update(self, steps: Sequence[jax.Array]) -> None:
         """Apply one parameter update to each updatable member state."""

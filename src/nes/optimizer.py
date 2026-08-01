@@ -171,11 +171,18 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
         jacobians = self.states.jacobians(tuple_spins)
         blocks = []
         for index, jacobian in enumerate(jacobians):
-            jacobian = jacobian.reshape(nsamples, Nstates, -1)
             coeff = Ainv[:, index, :] * A_scaled[:, :, index]
-            blocks.append(jnp.einsum("ni,nip->np", coeff, jacobian))
+            blocks.append(
+                jnp.einsum(
+                    "ni,nip->np", coeff, jacobian.reshape(nsamples, Nstates, -1)
+                )
+            )
+            # Drop the reference before the generator computes the next Jacobian,
+            # otherwise two of them overlap on device.
+            del jacobian
 
         Omat = jnp.concatenate(blocks, axis=-1)
+        del blocks
         if samples.reweight_factor is None:
             reweight = jnp.ones(samples.nsamples)
         else:
