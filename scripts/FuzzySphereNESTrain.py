@@ -6,9 +6,15 @@ import jax.numpy as jnp
 
 import numpy as np
 import quantax as qtx
+import scipy as sp
 from qhuantax.quantumhall_transformer import Transformer
 
-from qhuantax.nes import NaturalExcitedAdamSR, NaturalLzDetSampler, NaturalStateSet
+from qhuantax.nes import (
+    NaturalExcitedAdamSR,
+    NaturalLzDetSampler,
+    NaturalStateSet,
+    dense_reduced_matrices,
+)
 from qhuantax.nes.optimizer import _scaled_psi_matrix
 from qhuantax.quantumhall_operators import (
     GetLpTerms,
@@ -62,8 +68,11 @@ parser.add_argument("--ph-sect", action="store", default=0,
 
 parser.add_argument("--init-state-file", action="store", default=None,
                     help="path to a .eqx state used as starting parameters of the ground state")
-parser.add_argument("--freeze-init-state", action="store_true", default=False,
-                    help="hold the seeded state's parameters fixed during training")
+parser.add_argument("--incremental", action="store_true", default=False,
+                    help="grow the state set one state at a time, training --nbr-sweeps per stage")
+parser.add_argument("--warmup-sweeps", action="store", default=None,
+                    help="opening sweeps of each stage with already-trained states held fixed; "
+                         "defaults to --nbr-sweeps//2")
 parser.add_argument("--mean-field", action="store_true", default=False,
                     help="use mean-field ansatz as initial starting point")
 parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
@@ -113,9 +122,9 @@ path = str(args["path"])
 run_id = f"nes_n_{N}_2s_{L-1}_lz_{lz}_z2_{z2}_ph_{ph}_id0{id}"
 
 init_state_file = args["init_state_file"]
-freeze_init_state = bool(args["freeze_init_state"])
-if freeze_init_state and init_state_file is None:
-    parser.error("--freeze-init-state requires --init-state-file")
+incremental = bool(args["incremental"])
+if incremental and init_state_file is None:
+    parser.error("--incremental requires --init-state-file for the K=1 state")
 do_MF = bool(args["mean_field"])
 nsweeps_MF = int(args["nbr_sweeps_mf"])
 lr_MF = int(args["lr_mf"])
@@ -138,6 +147,27 @@ delay = nsweeps//5
 decay = 2*np.log(2)/delay
 rw = float(args["reweight"])
 model_type = "DetBackflow"
+
+warmup_sweeps = nsweeps // 2 if args["warmup_sweeps"] is None else int(args["warmup_sweeps"])
+
+
+def stage_phases(K):
+    """[(trainable_mask, nsweeps), ...] for a stage holding K member states.
+
+    Already-trained states are pinned for the opening `warmup_sweeps`, then everything 
+    iis released.
+    """
+    nfrozen = (K - 1) if incremental else (1 if init_state_file else 0)
+    if nfrozen == 0:                       # nothing trained yet to protect
+        return [((True,) * K, nsweeps)]
+
+    warm = min(warmup_sweeps, nsweeps)
+    phases = []
+    if warm > 0:
+        phases.append(((False,) * nfrozen + (True,) * (K - nfrozen), warm))
+    if nsweeps - warm > 0:
+        phases.append(((True,) * K, nsweeps - warm))
+    return phases
 
 
 Path(path).mkdir(parents=True, exist_ok=True)
@@ -206,14 +236,13 @@ def init_args(index):
         return dict(orbital_noise=0, param_file=init_state_file)
     return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)
 
-member_states = tuple(
+member_states = [
     build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, **init_args(index))
     for index in range(nstates)
-)
-trainable = tuple(
-    not (freeze_init_state and index == 0) for index in range(nstates)
-)
-state_set = NaturalStateSet(member_states, trainable=trainable)
+]
+# The last phase of the last stage holds every state, so this is the set the meta block
+# and the downstream scripts describe.
+state_set = NaturalStateSet(member_states, trainable=stage_phases(nstates)[-1][0])
 
 
 with open(f"{path}/meta_{run_id}.txt", "w") as f:
@@ -239,43 +268,75 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"attndim: {d}\n")
   f.write(f"nbr. params per state: {state_set.states[0].nparams}\n")
   f.write(f"nbr. states: {nstates}\n")
-  f.write(f"nbr. trained params: {state_set.nparams}\n")
   f.write(f"init state file: {init_state_file}\n")
-  f.write(f"frozen states: {[i for i, t in enumerate(state_set.trainable) if not t]}\n")
+  f.write(f"incremental: {incremental}\n")
+  f.write(f"warmup sweeps: {warmup_sweeps}\n")
 
-
-init_configs = generate_spin_configs(L, N, lz, nsamples * nstates)
-init_configs = init_configs.reshape(nsamples, nstates, 2 * L)
-
-sampler = NaturalLzDetSampler(
-    state_set,
-    nsamples,
-    n_neighbor=np.arange(1, 3),
-    initial_spins=init_configs,
-    reweight=rw)
-
-optimizer = NaturalExcitedAdamSR(state_set, tms_H)
 
 energy = qtx.utils.DataTracer()
 VarE = qtx.utils.DataTracer()
 LmLp_tracer = qtx.utils.DataTracer()
 LmLp_var_tracer = qtx.utils.DataTracer()
 
-for i in range(nsweeps):
-    samples = sampler.sweep()
-    step = optimizer.get_step(samples)
-    lr = adaptive_learning_rate(lr0, delay, decay, baseline, i)
-    state_set.update(state_set.split_step(step * lr))
-    energy.append(optimizer.energy)
-    VarE.append(optimizer.VarE)
 
-    np.savetxt(
-        f"{path}/data_energy_{run_id}.txt",
-        np.vstack((energy.time, energy.data, VarE.data)).T,
-    )
-    
-    for index, state in enumerate(state_set.states):
-        state.save(f"{path}/state{index}_{run_id}.eqx")
+def train_stage(stage_set, nsweeps_phase, sweep0):
+    """Train one phase, appending to the shared tracers.
+
+    The sampler and the optimizer are rebuilt per phase: the sampler bakes ``Nstates``
+    into its chain shape, and Quantax sizes the Adam buffers from ``stage_set.nparams``,
+    which counts trainable states only. ``sweep0`` keeps the learning-rate schedule
+    continuous across the phases of a stage.
+    """
+    init_configs = generate_spin_configs(
+        L, N, lz, nsamples * stage_set.Nstates).reshape(nsamples, stage_set.Nstates, 2 * L)
+
+    sampler = NaturalLzDetSampler(
+        stage_set,
+        nsamples,
+        n_neighbor=np.arange(1, 3),
+        initial_spins=init_configs,
+        reweight=rw)
+
+    optimizer = NaturalExcitedAdamSR(stage_set, tms_H)
+
+    for i in range(nsweeps_phase):
+        samples = sampler.sweep()
+        step = optimizer.get_step(samples)
+        lr = adaptive_learning_rate(lr0, delay, decay, baseline, sweep0 + i)
+        stage_set.update(stage_set.split_step(step * lr))
+        energy.append(optimizer.energy)
+        VarE.append(optimizer.VarE)
+
+        np.savetxt(
+            f"{path}/data_energy_{run_id}.txt",
+            np.vstack((energy.time, energy.data, VarE.data)).T,
+        )
+
+        for index, state in enumerate(stage_set.states):
+            state.save(f"{path}/state{index}_{run_id}.eqx")
+
+
+def record_spectrum(K):
+    """Diagonalize the reduced (S, H) pencil in the span of the first K states.
+    """
+    if not do_ED:
+        return
+    span = NaturalStateSet(member_states[:K])
+    S, H_reduced = dense_reduced_matrices(span, tms_H, lz, z2)
+    eigval = sp.linalg.eigh(H_reduced, S, eigvals_only=True)
+    with open(f"{path}/data_spectrum_{run_id}.txt", "a") as f:
+        f.write(" ".join(str(x) for x in (K, *np.sort(eigval))) + "\n")
+
+
+for K in range(2 if incremental else nstates, nstates + 1):
+    sweep0 = 0
+    for mask, nsweeps_phase in stage_phases(K):
+        stage_set = NaturalStateSet(member_states[:K], trainable=mask)
+        print(f"stage K={K}, {nsweeps_phase} sweeps: training {stage_set.nparams} of "
+              f"{sum(stage_set.nparams_per_state)} parameters", flush=True)
+        train_stage(stage_set, nsweeps_phase, sweep0)
+        sweep0 += nsweeps_phase
+    record_spectrum(K)
 
 print("NES training completed in: ", datetime.now() - start_time)
 
