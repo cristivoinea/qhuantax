@@ -336,7 +336,7 @@ for K in range(2 if incremental else nstates, nstates + 1):
               f"{sum(stage_set.nparams_per_state)} parameters", flush=True)
         train_stage(stage_set, nsweeps_phase, sweep0)
         sweep0 += nsweeps_phase
-    record_spectrum(K)
+        record_spectrum(K)
 
 print("NES training completed in: ", datetime.now() - start_time)
 
