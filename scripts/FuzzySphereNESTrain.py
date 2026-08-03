@@ -25,7 +25,7 @@ SX = np.array([[0, 1], [1, 0]])
 
 
 
-def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2, rng=np.random.default_rng()):
+def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None):
     U_state = U.copy()
     if orbital_noise > 0:
         U_state = U_state + orbital_noise * rng.normal(size=U_state.shape)
@@ -39,7 +39,9 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2
     else:
         model = qtx.model.DetBackflow(net, U0=U_state, d=d)
 
-    return qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
+    # `param_file` replaces every leaf of the model, U0 included, so the orbital noise
+    # above is irrelevant whenever one is given.
+    return qtx.state.Variational(model, param_file=param_file, symm=symm, max_parallel=16384, use_ref=False)
 
 
 
@@ -58,6 +60,10 @@ parser.add_argument("--z2-sect", action="store", default=0,
 parser.add_argument("--ph-sect", action="store", default=0,
                     help="PH symmetry sector (without spin flip)")
 
+parser.add_argument("--init-state-file", action="store", default=None,
+                    help="path to a .eqx state used as starting parameters of the ground state")
+parser.add_argument("--freeze-init-state", action="store_true", default=False,
+                    help="hold the seeded state's parameters fixed during training")
 parser.add_argument("--mean-field", action="store_true", default=False,
                     help="use mean-field ansatz as initial starting point")
 parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
@@ -106,6 +112,10 @@ id = int(args["run_id"])
 path = str(args["path"])
 run_id = f"nes_n_{N}_2s_{L-1}_lz_{lz}_z2_{z2}_ph_{ph}_id0{id}"
 
+init_state_file = args["init_state_file"]
+freeze_init_state = bool(args["freeze_init_state"])
+if freeze_init_state and init_state_file is None:
+    parser.error("--freeze-init-state requires --init-state-file")
 do_MF = bool(args["mean_field"])
 nsweeps_MF = int(args["nbr_sweeps_mf"])
 lr_MF = int(args["lr_mf"])
@@ -191,11 +201,19 @@ else:
 
 start_time = datetime.now()
 
+def init_args(index):
+    if init_state_file is not None and index == 0:
+        return dict(orbital_noise=0, param_file=init_state_file)
+    return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)
+
 member_states = tuple(
-    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=(0 if index==1 else 1e-1))
+    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, **init_args(index))
     for index in range(nstates)
 )
-state_set = NaturalStateSet(member_states)
+trainable = tuple(
+    not (freeze_init_state and index == 0) for index in range(nstates)
+)
+state_set = NaturalStateSet(member_states, trainable=trainable)
 
 
 with open(f"{path}/meta_{run_id}.txt", "w") as f:
@@ -220,6 +238,10 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nbr. heads: {nh}\n")
   f.write(f"attndim: {d}\n")
   f.write(f"nbr. params per state: {state_set.states[0].nparams}\n")
+  f.write(f"nbr. states: {nstates}\n")
+  f.write(f"nbr. trained params: {state_set.nparams}\n")
+  f.write(f"init state file: {init_state_file}\n")
+  f.write(f"frozen states: {[i for i, t in enumerate(state_set.trainable) if not t]}\n")
 
 
 init_configs = generate_spin_configs(L, N, lz, nsamples * nstates)

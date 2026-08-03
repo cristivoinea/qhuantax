@@ -106,12 +106,16 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
             raise TypeError("NaturalExcitedAdamSR expects a NaturalStateSet.")
         if states.nparams is None:
             raise TypeError(
-                "NaturalExcitedAdamSR requires all member states to expose `nparams`."
+                "NaturalExcitedAdamSR requires all trainable member states to expose "
+                "`nparams`."
             )
         for index, state in enumerate(states.states):
-            if not hasattr(state, "jacobian"):
+            # Frozen states never contribute a Jacobian block, so they are allowed to
+            # be any state type; everything else must be consistent across the set,
+            # since all members share the psi matrix.
+            if states.trainable[index] and not hasattr(state, "jacobian"):
                 raise TypeError(
-                    "NaturalExcitedAdamSR requires variational member states with "
+                    "NaturalExcitedAdamSR requires trainable member states with "
                     f"`jacobian`; state {index} has none."
                 )
             if not hasattr(state, "vs_type"):
@@ -155,7 +159,18 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
         return self._grad.ebar(self.states, samples)
 
     def get_Obar(self, samples: Samples) -> jax.Array:
-        r"""Compute determinant logarithmic Jacobians in member-state parameter order."""
+        r"""
+        Compute determinant logarithmic Jacobians in member-state parameter order.
+
+        For :math:`A[i, a] = \psi_a(s_i)`, the derivative with respect to state ``a``'s
+        parameters is :math:`\sum_i (A^{-1})_{ai} A_{ia} O_a(s_i)`, with :math:`O_a` the
+        state's own logarithmic Jacobian. Only trainable states contribute a column
+        block, but the :math:`A^{-1}` prefactor is built from the *full*
+        ``Nstates`` x ``Nstates`` matrix -- the members are coupled through the
+        determinant, so a frozen state still shapes the coefficients of the trainable
+        blocks. Freezing therefore drops columns from :math:`\bar O` without altering
+        the ansatz or approximating the remaining gradients.
+        """
         tuple_spins = jnp.asarray(samples.spins)
         nsamples, Nstates, Nmodes = tuple_spins.shape
         if Nstates != self.states.Nstates or Nmodes != self.states.Nmodes:
@@ -168,9 +183,14 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
         A_scaled, _ = _scaled_psi_matrix(self.states, tuple_spins)
         Ainv = _pinv_scaled_matrix(A_scaled)
 
-        jacobians = self.states.jacobians(tuple_spins)
+        # `jacobians` skips frozen states, so the yield order is not the member-state
+        # order: pair each Jacobian with its own index in the full set.
+        trainable_indices = [
+            index for index, flag in enumerate(self.states.trainable) if flag
+        ]
+
         blocks = []
-        for index, jacobian in enumerate(jacobians):
+        for index, jacobian in zip(trainable_indices, self.states.jacobians(tuple_spins)):
             coeff = Ainv[:, index, :] * A_scaled[:, :, index]
             blocks.append(
                 jnp.einsum(
