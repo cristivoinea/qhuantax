@@ -31,14 +31,22 @@ def _scaled_psi_matrix(
     return scaled, row_shift
 
 
-def _pinv_scaled_matrix(A_scaled: jax.Array) -> jax.Array:
-    real_dtype = jnp.finfo(A_scaled.real.dtype).dtype
-    rtol = jnp.asarray(jnp.finfo(real_dtype).eps ** 0.5, dtype=real_dtype)
-    return jnp.linalg.pinv(A_scaled, rtol=rtol)
-
-
 class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
     """"""
+
+    _Eloc_max_dev = None
+
+    @property
+    def Eloc_max_dev(self) -> Optional[jax.Array]:
+        r"""
+        :math:`\max_s |E_{loc}(s) - \bar E|` over the last batch.
+
+        Compared against ``sqrt(VarE)``, this says whether :math:`\bar \epsilon` is
+        dominated by a single sample -- the SR right-hand side is used one realization at
+        a time, not in expectation, so a lone outlier translates directly into a step.
+        """
+        return self._Eloc_max_dev
+
     def local_energy(self, states: NaturalStateSet, samples: Samples) -> jax.Array:
         tuple_spins = jnp.asarray(samples.spins)
         nsamples, Nstates, Nmodes = tuple_spins.shape
@@ -75,6 +83,8 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         self._energy = Emean.real
         Evar = jnp.abs(Eloc - Emean) ** 2
         self._VarE = jnp.mean(Evar * reweight_factor).real
+        # Free: `Evar` is already materialized, so the max is one more reduction over it.
+        self._Eloc_max_dev = jnp.sqrt(jnp.max(Evar))
 
         Eloc -= jnp.mean(Eloc)
         Eloc *= jnp.sqrt(reweight_factor / samples.nsamples)
@@ -83,12 +93,18 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
 
 class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
     r"""
-    AdamSR optimizer for natural excited state determinants.
+    SR optimizer for natural excited state determinants.
 
-    The Quantax stochastic optimizer stack still owns the SR equation solve, Adam
+    The Quantax stochastic optimizer stack still owns the SR equation solve, updater
     buffers, solver defaults, checkpointing, and non-holomorphic bookkeeping. This
     class provides only the NES-specific centered local-energy vector and
     determinant logarithmic Jacobian.
+
+    .. note::
+
+        The name is a historical misnomer: ``updater`` defaults to Adam, but any Quantax
+        `~quantax.optimizer.Updater` may be injected, including ``PlainUpdater`` for
+        plain SR.
     """
 
     def __init__(
@@ -97,11 +113,26 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
         hamiltonian: qtx.operator.Operator,
         imag_time: bool = True,
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
-        mu: float = 0.95,
-        beta: float = 0.995,
-        norm_clip: Optional[float] = None,
         file: Union[None, str, Path, BinaryIO] = None,
+        updater: Optional[qtx.optimizer.Updater] = None,
+        diagnostics: bool = False,
+        diagnostics_every: int = 5,
     ):
+        r"""
+        :param updater:
+            The update strategy, default to `~quantax.optimizer.PlainUpdater`, i.e. plain
+            SR. Pass a configured `~quantax.optimizer.Adam` to get the AdamSR behaviour;
+            its hyperparameters belong on that object rather than here, since they are
+            meaningless for the other updaters.
+
+        :param diagnostics:
+            Whether to record solve-conditioning scalars in
+            `~qhuantax.nes.NaturalExcitedAdamSR.diagnostics`. Inert by default.
+
+        :param diagnostics_every:
+            How often to refresh the expensive entries (the Jacobian Gram spectrum).
+            The cheap entries refresh every step.
+        """
         if not isinstance(states, NaturalStateSet):
             raise TypeError("NaturalExcitedAdamSR expects a NaturalStateSet.")
         if states.nparams is None:
@@ -135,7 +166,8 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
                 )
 
         grad = NaturalTraceEnergyGrad(hamiltonian)
-        updater = qtx.optimizer.Adam(mu, beta, norm_clip)
+        if updater is None:
+            updater = qtx.optimizer.PlainUpdater()
         super().__init__(
             states,
             grad,
@@ -145,6 +177,10 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
             file=file,
         )
         self._Omean = None
+        self._diagnostics_enabled = diagnostics
+        self._diagnostics_every = diagnostics_every
+        self._diagnostics_calls = 0
+        self._diagnostics = {}
 
     @property
     def states(self) -> NaturalStateSet:
@@ -153,6 +189,71 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
     @property
     def Omean(self) -> Optional[jax.Array]:
         return self._Omean
+
+    @property
+    def Eloc_max_dev(self) -> Optional[jax.Array]:
+        r"""Largest deviation of a single sample's local energy, see the gradient source."""
+        return getattr(self._grad, "Eloc_max_dev", None)
+
+    # Gram eigenvalues below this fraction of the largest are treated as unresolved.
+    # Comfortably above the float32 eigensolver noise floor (~1e-8 relative), while still
+    # a tight rank criterion.
+    _RANK_RTOL = 1e-6
+
+    @property
+    def diagnostics(self) -> dict:
+        r"""
+        Conditioning scalars for the last `~NaturalExcitedAdamSR.get_Obar`, empty unless
+        ``diagnostics`` was enabled.
+
+        ``obar_fro2`` refreshes every step; ``sigma_max``, ``sigma_min`` and ``rank_eff``
+        only every ``diagnostics_every`` steps, since they need the Jacobian Gram matrix.
+        """
+        return dict(self._diagnostics)
+
+    def _record_diagnostics(self, Obar: jax.Array) -> None:
+        r"""
+        Measure how well conditioned the SR system is.
+
+        :math:`\bar O` is ``(nsamples, nparams)`` with ``nsamples << nparams``, so the
+        solve runs through the ``nsamples x nsamples`` Gram matrix
+        :math:`T = \bar O \bar O^\dagger`, whose eigenvalues are the squared singular
+        values. ``Tr(T) = \|\bar O\|_F^2`` also sets the solver's diagonal shift, so it is
+        recorded every step; the spectrum itself costs an extra Gram formation
+        (``O(nsamples^2 nparams)``) and is therefore sampled.
+
+        The analytic gain bound ``1/(2 sqrt(eps))`` is not a substitute: Adam's second
+        ``core_solve`` runs on ``Obar / V``, so its trace, shift and bound all differ, and
+        ``V`` is exactly the quantity under suspicion.
+
+        .. note::
+
+            :math:`\bar O` is centered, so its column sums vanish and the all-ones vector
+            is *exactly* a left null vector -- one Gram eigenvalue is zero by construction.
+            The rank threshold is therefore relative to the largest eigenvalue, and
+            ``sigma_min`` reports the smallest direction above it. An absolute threshold
+            would sit below the eigensolver's noise floor and pin ``rank_eff`` at
+            ``nsamples`` in every run.
+        """
+        self._diagnostics["obar_fro2"] = jnp.sum(jnp.abs(Obar) ** 2)
+
+        refresh = self._diagnostics_calls % self._diagnostics_every == 0
+        self._diagnostics_calls += 1
+        if not refresh:
+            # Cleared rather than left stale: a repeated value would read as "measured and
+            # unchanged" instead of "not measured".
+            self._diagnostics.update(
+                sigma_max=float("nan"), sigma_min=float("nan"), rank_eff=float("nan")
+            )
+            return
+
+        eigvals = jnp.linalg.eigvalsh(Obar @ Obar.conj().T)
+        eigvals = jnp.clip(eigvals, 0.0)  # tiny negatives are roundoff
+        resolved = eigvals > self._RANK_RTOL * eigvals[-1]
+        rank_eff = jnp.count_nonzero(resolved)
+        self._diagnostics["sigma_max"] = jnp.sqrt(eigvals[-1])
+        self._diagnostics["sigma_min"] = jnp.sqrt(eigvals[-rank_eff])
+        self._diagnostics["rank_eff"] = rank_eff
 
     def get_Ebar(self, samples: Samples) -> jax.Array:
         r"""Compute Quantax-style centered/scaled local energies for the NES determinant."""
@@ -181,7 +282,7 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
             )
 
         A_scaled, _ = _scaled_psi_matrix(self.states, tuple_spins)
-        Ainv = _pinv_scaled_matrix(A_scaled)
+        Ainv = jnp.linalg.pinv(A_scaled)
 
         # `jacobians` skips frozen states, so the yield order is not the member-state
         # order: pair each Jacobian with its own index in the full set.
@@ -209,4 +310,7 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
             reweight = samples.reweight_factor
         self._Omean = jnp.mean(Omat * reweight[:, None], axis=0)
         factor = jnp.sqrt(reweight / samples.nsamples)[:, None]
-        return (Omat - jnp.mean(Omat, axis=0, keepdims=True)) * factor
+        Obar = (Omat - jnp.mean(Omat, axis=0, keepdims=True)) * factor
+        if self._diagnostics_enabled:
+            self._record_diagnostics(Obar)
+        return Obar

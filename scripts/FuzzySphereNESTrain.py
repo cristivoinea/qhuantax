@@ -73,6 +73,10 @@ parser.add_argument("--incremental", action="store_true", default=False,
 parser.add_argument("--warmup-sweeps", action="store", default=None,
                     help="opening sweeps of each stage with already-trained states held fixed; "
                          "defaults to --nbr-sweeps//2")
+parser.add_argument("--diagnostics", action="store_true", default=False,
+                    help="write per-sweep step norms and SR conditioning to data_diagnostics_*.txt")
+parser.add_argument("--diagnostics-every", action="store", default=5,
+                    help="how often to refresh the Jacobian Gram spectrum in the diagnostics file")
 parser.add_argument("--mean-field", action="store_true", default=False,
                     help="use mean-field ansatz as initial starting point")
 parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
@@ -149,6 +153,8 @@ rw = float(args["reweight"])
 model_type = "DetBackflow"
 
 warmup_sweeps = nsweeps // 2 if args["warmup_sweeps"] is None else int(args["warmup_sweeps"])
+diagnostics = bool(args["diagnostics"])
+diagnostics_every = int(args["diagnostics_every"])
 
 
 def stage_phases(K):
@@ -279,6 +285,40 @@ LmLp_tracer = qtx.utils.DataTracer()
 LmLp_var_tracer = qtx.utils.DataTracer()
 
 
+DIAGNOSTICS_COLUMNS = (
+    "sweep",          # matches the first column of data_energy_*.txt
+    "step_norm",      # norm of the solve output, before the learning rate
+    "step_max",       # is that norm concentrated in a few parameters or spread out
+    "obar_fro2",      # Tr(Obar Obar^H); sets the solver's diagonal shift
+    "eloc_max_dev",   # max|Eloc - Emean|; vs sqrt(VarE), is Ebar one-sample-dominated
+    "sigma_max",      # largest singular value of Obar
+    "sigma_min",      # smallest *resolved* one; Obar is centered so one is exactly zero
+    "rank_eff",       # resolved directions, at most nsamples - 1
+)
+
+
+def append_diagnostics(sweep, step, optimizer):
+    """Append one line to the diagnostics file.
+
+    Every entry is either the loop counter or a reduction over an array already in hand.
+    The last three columns need the Jacobian Gram matrix, so they only refresh every
+    ``--diagnostics-every`` sweeps and read `nan` in between.
+    """
+    diag = optimizer.diagnostics
+    row = (
+        sweep,
+        float(jnp.linalg.norm(step)),
+        float(jnp.max(jnp.abs(step))),
+        float(diag.get("obar_fro2", np.nan)),
+        float(optimizer.Eloc_max_dev),
+        float(diag.get("sigma_max", np.nan)),
+        float(diag.get("sigma_min", np.nan)),
+        float(diag.get("rank_eff", np.nan)),
+    )
+    with open(f"{path}/data_diagnostics_{run_id}.txt", "a") as f:
+        f.write(" ".join(repr(value) for value in row) + "\n")
+
+
 def train_stage(stage_set, nsweeps_phase, sweep0):
     """Train one phase, appending to the shared tracers.
 
@@ -297,11 +337,24 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         initial_spins=init_configs,
         reweight=rw)
 
-    optimizer = NaturalExcitedAdamSR(stage_set, tms_H)
+    optimizer = NaturalExcitedAdamSR(
+        stage_set,
+        tms_H,
+        diagnostics=diagnostics,
+        diagnostics_every=diagnostics_every)
 
     for i in range(nsweeps_phase):
         samples = sampler.sweep()
         step = optimizer.get_step(samples)
+
+        # Checked before `update` so the saved checkpoints remain the last good state.
+        if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
+            raise RuntimeError(
+                f"Non-finite update at sweep {len(energy.data)} (K={stage_set.Nstates}, "
+                f"{stage_set.nparams} trainable params); energy={optimizer.energy}, "
+                f"VarE={optimizer.VarE}."
+            )
+
         lr = adaptive_learning_rate(lr0, delay, decay, baseline, sweep0 + i)
         stage_set.update(stage_set.split_step(step * lr))
         energy.append(optimizer.energy)
@@ -311,6 +364,8 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
             f"{path}/data_energy_{run_id}.txt",
             np.vstack((energy.time, energy.data, VarE.data)).T,
         )
+        if diagnostics:
+            append_diagnostics(len(energy.data) - 1, step, optimizer)
 
         for index, state in enumerate(stage_set.states):
             state.save(f"{path}/state{index}_{run_id}.eqx")
@@ -324,9 +379,16 @@ def record_spectrum(K):
     span = NaturalStateSet(member_states[:K])
     S, H_reduced = dense_reduced_matrices(span, tms_H, lz, z2)
     eigval = sp.linalg.eigh(H_reduced, S, eigvals_only=True)
+    print("Measured eigenvalues: ", np.sort(eigval))
     with open(f"{path}/data_spectrum_{run_id}.txt", "a") as f:
         f.write(" ".join(str(x) for x in (K, *np.sort(eigval))) + "\n")
 
+
+if diagnostics:
+    with open(f"{path}/data_diagnostics_{run_id}.txt", "w") as f:
+        f.write("# " + " ".join(DIAGNOSTICS_COLUMNS) + "\n")
+        f.write(f"# sigma_max sigma_min rank_eff refresh every {diagnostics_every} sweeps, "
+                "nan otherwise\n")
 
 for K in range(2 if incremental else nstates, nstates + 1):
     sweep0 = 0
