@@ -22,7 +22,7 @@ from qhuantax.quantumhall_operators import (
     GetSpinfulPolTerms,
 )
 from qhuantax.quantumhall_symmetries import FlavourPermQH, IdentityQH, ParticleHoleQH
-from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs
+from qhuantax.quantumhall_utils import adaptive_learning_rate_inv, generate_spin_configs
 
 
 S1 = np.array([[1, 0], [0, 0]])
@@ -152,9 +152,7 @@ nh = int(args["nbr_heads"])
 d = int(args["attn_dim"])
 
 lr0 = float(args["lr"])
-baseline = lr0/5
-delay = nsweeps//5
-decay = 2*np.log(2)/delay
+t0 = N
 rw = float(args["reweight"])
 model_type = "DetBackflow"
 
@@ -275,9 +273,8 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"norm clip: {norm_clip}\n")
   f.write(f"nbr. iter.: {nsweeps}\n")
   f.write(f"learning rate: {lr0}\n")
-  f.write(f"decay: {decay}\n")
-  f.write(f"delay: {delay}\n")
-  f.write(f"baseline: {baseline}\n")
+  f.write(f"lr schedule: inv\n")
+  f.write(f"t0: {t0}\n")
   f.write(f"sampler: DipoleCons\n")
   f.write(f"nbr. samples NN: {nsamples}\n")
   f.write(f"reweight: {rw}\n")
@@ -378,7 +375,7 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
             applied = jnp.where(step_norm > norm_clip,
                                 step * (norm_clip / step_norm), step)
 
-        lr = adaptive_learning_rate(lr0, delay, decay, baseline, sweep0 + i)
+        lr = adaptive_learning_rate_inv(lr0, t0, sweep0 + i)
         stage_set.update(stage_set.split_step(applied * lr))
         energy.append(optimizer.energy)
         VarE.append(optimizer.VarE)

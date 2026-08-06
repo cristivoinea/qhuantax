@@ -159,19 +159,43 @@ class FuzzySphereSupervised(qtx.optimizer.QNGD):
 
 
 
-class Supervised_KL_Sign(qtx.optimizer.QNGD):
+class Supervised_KL_Sign(qtx.optimizer.StochasticQNGD):
+    """Supervised loss on log-amplitude + sign, in the spirit of arXiv:2507.13322.
+
+    Base class note: this must derive from ``StochasticQNGD``, not ``QNGD`` --
+    ``get_Obar`` and ``get_step`` are defined on ``StochasticQNGD``, so with ``QNGD``
+    as the base the optimizer has no ``get_step`` at all and cannot run.
+
+    The local loss is
+        2*(log|psi| - log|phi|)  +  sign_weight * |sign(psi) - sign(phi)|^2
+    and ``get_Ebar`` centers it, so the *unsquared* log term is the KL-divergence
+    estimator D_KL(|psi|^2 || |phi|^2): centering cancels the arbitrary additive
+    constant coming from psi and phi being unnormalized, which is why the unsquared
+    form needs no explicit normalization handling. (The paper's Eq. 2 instead uses the
+    *squared* log-ratio, which is not offset-invariant -- see
+    ``Supervised_LogSq_Sign`` for that variant, where the mean log-ratio must be
+    subtracted before squaring.)
+    """
+
     def __init__(
         self,
         state: qtx.state.Variational,
         target_state: qtx.state.State,
         sign_weight: float,
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
+        zero_penalty: float = 4.0,
     ):
         super().__init__(state, OverlapGrad(target_state), solver=solver)
         self._target_state = target_state
         self._sign_weight = sign_weight
+        self._zero_penalty = zero_penalty
+        self._frac_offsupport = None
 
-    
+    @property
+    def frac_offsupport(self) -> Optional[float]:
+        """Fraction of sampled configs where the target is exactly zero."""
+        return self._frac_offsupport
+
     @property
     def loss_total(self) -> Optional[float]:
         """Loss function for the current step."""
@@ -194,31 +218,132 @@ class Supervised_KL_Sign(qtx.optimizer.QNGD):
 
 
     def get_Ebar(self, samples: qtx.sampler.Samples) -> jax.Array:
-        target = self._target_state(samples.spins)
-        target_logabs = jnp.log(jnp.abs(target))
+        target = jnp.asarray(self._target_state(samples.spins))
         target_sign = jnp.sign(target)
+
+        # The Laughlin model state is supported only on its squeezed set, so the
+        # target is EXACTLY zero on many sampled configs and log|phi| = -inf there.
+        # Mask the log term to the support; off-support configs instead take a flat
+        # `zero_penalty`, which through the score-function route pushes probability
+        # weight off them -- i.e. "train the non-squeezed configs toward zero".
+        on_support = jnp.abs(target) > 0
+        safe_logabs = jnp.where(on_support, jnp.log(jnp.abs(jnp.where(
+            on_support, target, 1.0))), 0.0)
 
         psi_logabs = samples.psi.logabs
         psi_sign = samples.psi.sign
 
-        kl_div = 2*(psi_logabs - target_logabs)
+        kl_div = jnp.where(on_support, 2 * (psi_logabs - safe_logabs),
+                           self._zero_penalty)
         sign_div = jnp.abs(psi_sign - target_sign)**2
 
         loss = kl_div + self._sign_weight * sign_div
         reweight = samples.reweight_factor
+        if reweight is None:
+            reweight = 1.0
 
         loss_mean = jnp.mean(loss * reweight)
 
         self._loss_total = loss_mean
-        self._loss_density = jnp.mean(kl_div * reweight)
+        self._loss_density = jnp.mean(
+            jnp.where(on_support, kl_div, 0.0) * reweight)
         self._loss_sign = jnp.mean(sign_div * reweight)
+        self._frac_offsupport = jnp.mean((~on_support).astype(jnp.float32))
         loss_var = jnp.abs(loss - loss_mean) ** 2
-        self._loss_var = jnp.mean(loss_var * samples.reweight_factor).real
+        self._loss_var = jnp.mean(loss_var * reweight).real
 
         loss = loss - loss_mean
         Ebar = loss * jnp.sqrt(reweight / samples.nsamples)
         return Ebar
 
+
+
+class Supervised_LogSq_Sign(qtx.optimizer.StochasticQNGD):
+    r"""The paper's density loss (arXiv:2507.13322 Eq. 2) adapted to real amplitudes:
+
+        L_rho = E_{|psi|^2} [ ( ln|psi|^2 - ln|phi|^2 - c )^2 ],
+        L_sign = E_{|psi|^2} [ |sign(psi) - sign(phi)|^2 ],
+        L = L_rho + sign_weight * L_sign
+
+    The offset ``c`` is the sample mean of the log-ratio. It is *required*: psi and phi
+    are unnormalized, so ln|psi|^2 - ln|phi|^2 carries an arbitrary additive constant.
+    Without removing it the squared loss penalizes the overall normalization rather
+    than the shape, and the minimum is not at psi proportional to phi. (For the unsquared/KL form in
+    ``Supervised_KL_Sign`` the constant cancels automatically when ``get_Ebar``
+    centers, which is why that variant does not need this.)
+
+    Since ``sign()`` is piecewise constant, the sign term contributes no ordinary
+    derivative; it acts here only through the score-function (REINFORCE) route implicit
+    in the QNGD covariance estimator, i.e. by moving probability weight off
+    sign-mismatched configurations rather than by flipping signs directly.
+    """
+
+    def __init__(
+        self,
+        state: qtx.state.Variational,
+        target_state: qtx.state.State,
+        sign_weight: float,
+        solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
+        zero_penalty: float = 4.0,
+    ):
+        super().__init__(state, OverlapGrad(target_state), solver=solver)
+        self._target_state = target_state
+        self._sign_weight = sign_weight
+        self._zero_penalty = zero_penalty
+        self._loss_total = self._loss_density = self._loss_sign = None
+        self._frac_offsupport = None
+
+    @property
+    def frac_offsupport(self):
+        return self._frac_offsupport
+
+    @property
+    def loss_total(self):
+        return self._loss_total
+
+    @property
+    def loss_density(self):
+        return self._loss_density
+
+    @property
+    def loss_sign(self):
+        return self._loss_sign
+
+    def get_Ebar(self, samples: qtx.sampler.Samples) -> jax.Array:
+        target = jnp.asarray(self._target_state(samples.spins))
+        target_sign = jnp.sign(target)
+
+        # target is exactly zero off the squeezed set -> log|phi| = -inf there; mask
+        # the density term to the support and penalize off-support configs flatly.
+        on_support = jnp.abs(target) > 0
+        safe_logabs = jnp.where(on_support, jnp.log(jnp.abs(jnp.where(
+            on_support, target, 1.0))), 0.0)
+
+        psi_logabs = samples.psi.logabs
+        psi_sign = samples.psi.sign
+
+        reweight = samples.reweight_factor
+        if reweight is None:
+            reweight = 1.0
+
+        log_ratio = 2 * (psi_logabs - safe_logabs)
+        # offset kills the arbitrary normalization; average over the SUPPORT only
+        w_sup = on_support.astype(log_ratio.dtype)
+        offset = (jnp.sum(log_ratio * w_sup * reweight)
+                  / jnp.clip(jnp.sum(w_sup * reweight), 1e-12, None))
+        density = jnp.where(on_support, (log_ratio - offset) ** 2,
+                            self._zero_penalty)
+        sign_div = jnp.abs(psi_sign - target_sign) ** 2
+
+        loss = density + self._sign_weight * sign_div
+        loss_mean = jnp.mean(loss * reweight)
+        self._loss_total = loss_mean
+        self._loss_density = jnp.mean(jnp.where(on_support, density, 0.0) * reweight)
+        self._loss_sign = jnp.mean(sign_div * reweight)
+        self._frac_offsupport = jnp.mean((~on_support).astype(jnp.float32))
+
+        Ebar = (loss - loss_mean) * jnp.sqrt(reweight / samples.nsamples)
+        return Ebar
 
 
 class SupervisedExact_KL_Sign(qtx.optimizer.SupervisedExact):

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from qhuantax.quantumhall_operators import GetSpinlessDenIntTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzDenseProjector
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
-from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, read_meta_file
+from qhuantax.quantumhall_utils import adaptive_learning_rate_exp, generate_spin_configs, read_meta_file
 from qhuantax.quantumhall_models import MultiPfBackflow, MultiDetBackflow
 from quspin.basis import spinful_fermion_basis_1d
 

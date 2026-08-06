@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
-from qhuantax.quantumhall_utils import adaptive_learning_rate, generate_spin_configs, diagonalize_lz_multiplet, read_meta_file
+from qhuantax.quantumhall_utils import adaptive_learning_rate_exp, generate_spin_configs, diagonalize_lz_multiplet, read_meta_file
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 
@@ -213,7 +213,7 @@ if do_ED:
 for i in range(nsweeps):
     samples = sampler.sweep()
     step = optimizer.get_step(samples)
-    state.update(step * adaptive_learning_rate(lr0, delay, decay, baseline, i))
+    state.update(step * adaptive_learning_rate_exp(lr0, delay, decay, baseline, i))
 
     energy.append(optimizer.energy)
     VarE.append(optimizer.VarE)
