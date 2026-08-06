@@ -91,7 +91,7 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         return Eloc
 
 
-class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
+class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
     r"""
     SR optimizer for natural excited state determinants.
 
@@ -99,12 +99,6 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
     buffers, solver defaults, checkpointing, and non-holomorphic bookkeeping. This
     class provides only the NES-specific centered local-energy vector and
     determinant logarithmic Jacobian.
-
-    .. note::
-
-        The name is a historical misnomer: ``updater`` defaults to Adam, but any Quantax
-        `~quantax.optimizer.Updater` may be injected, including ``PlainUpdater`` for
-        plain SR.
     """
 
     def __init__(
@@ -127,17 +121,17 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
 
         :param diagnostics:
             Whether to record solve-conditioning scalars in
-            `~qhuantax.nes.NaturalExcitedAdamSR.diagnostics`. Inert by default.
+            `~qhuantax.nes.NaturalExcitedSR.diagnostics`. Inert by default.
 
         :param diagnostics_every:
             How often to refresh the expensive entries (the Jacobian Gram spectrum).
             The cheap entries refresh every step.
         """
         if not isinstance(states, NaturalStateSet):
-            raise TypeError("NaturalExcitedAdamSR expects a NaturalStateSet.")
+            raise TypeError("NaturalExcitedSR expects a NaturalStateSet.")
         if states.nparams is None:
             raise TypeError(
-                "NaturalExcitedAdamSR requires all trainable member states to expose "
+                "NaturalExcitedSR requires all trainable member states to expose "
                 "`nparams`."
             )
         for index, state in enumerate(states.states):
@@ -146,12 +140,12 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
             # since all members share the psi matrix.
             if states.trainable[index] and not hasattr(state, "jacobian"):
                 raise TypeError(
-                    "NaturalExcitedAdamSR requires trainable member states with "
+                    "NaturalExcitedSR requires trainable member states with "
                     f"`jacobian`; state {index} has none."
                 )
             if not hasattr(state, "vs_type"):
                 raise TypeError(
-                    "NaturalExcitedAdamSR requires member states with Quantax "
+                    "NaturalExcitedSR requires member states with Quantax "
                     f"`vs_type`; state {index} has none."
                 )
             if state.vs_type != states.vs_type:
@@ -203,7 +197,7 @@ class NaturalExcitedAdamSR(qtx.optimizer.StochasticQNGD):
     @property
     def diagnostics(self) -> dict:
         r"""
-        Conditioning scalars for the last `~NaturalExcitedAdamSR.get_Obar`, empty unless
+        Conditioning scalars for the last `~NaturalExcitedSR.get_Obar`, empty unless
         ``diagnostics`` was enabled.
 
         ``obar_fro2`` refreshes every step; ``sigma_max``, ``sigma_min`` and ``rank_eff``

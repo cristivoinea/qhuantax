@@ -1,7 +1,7 @@
 """Natural excited state utilities."""
 
 from .det_sampler import NaturalDetAbstractSampler, NaturalDetSampler, NaturalLzDetSampler
-from .optimizer import NaturalExcitedAdamSR
+from .optimizer import NaturalExcitedSR
 from .state_set import NaturalStateSet
 from .subspace import (
     dense_reduced_matrices,
@@ -12,6 +12,6 @@ __all__ = [
     "NaturalDetAbstractSampler",
     "NaturalDetSampler",
     "NaturalLzDetSampler",
-    "NaturalExcitedAdamSR",
+    "NaturalExcitedSR",
     "dense_reduced_matrices",
 ]

@@ -10,7 +10,7 @@ import scipy as sp
 from qhuantax.quantumhall_transformer import Transformer
 
 from qhuantax.nes import (
-    NaturalExcitedAdamSR,
+    NaturalExcitedSR,
     NaturalLzDetSampler,
     NaturalStateSet,
     dense_reduced_matrices,
@@ -73,6 +73,12 @@ parser.add_argument("--incremental", action="store_true", default=False,
 parser.add_argument("--warmup-sweeps", action="store", default=None,
                     help="opening sweeps of each stage with already-trained states held fixed; "
                          "defaults to --nbr-sweeps//2")
+parser.add_argument("--updater", action="store", default="plain",
+                    choices=("plain", "adam", "spring", "march"),
+                    help="SR update strategy; the learning rate does not transfer between these")
+parser.add_argument("--norm-clip", action="store", default=None,
+                    help="cap on the norm of the step accumulated into momentum; needs an "
+                         "updater with momentum, so not available for --updater plain")
 parser.add_argument("--diagnostics", action="store_true", default=False,
                     help="write per-sweep step norms and SR conditioning to data_diagnostics_*.txt")
 parser.add_argument("--diagnostics-every", action="store", default=5,
@@ -155,6 +161,18 @@ model_type = "DetBackflow"
 warmup_sweeps = nsweeps // 2 if args["warmup_sweeps"] is None else int(args["warmup_sweeps"])
 diagnostics = bool(args["diagnostics"])
 diagnostics_every = int(args["diagnostics_every"])
+
+updater_name = str(args["updater"])
+norm_clip = None if args["norm_clip"] is None else float(args["norm_clip"])
+if updater_name == "plain":
+    if norm_clip is not None:
+        parser.error("--norm-clip needs an updater with momentum: adam, spring or march")
+    updater = qtx.optimizer.PlainUpdater()
+elif updater_name == "spring":
+    updater = qtx.optimizer.Spring(norm_clip=norm_clip)
+else:
+    updater = {"adam": qtx.optimizer.Adam,
+               "march": qtx.optimizer.March}[updater_name](norm_clip=norm_clip)
 
 
 def stage_phases(K):
@@ -258,7 +276,8 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"exact diagonalization: {do_ED}\n")
   f.write(f"L^- L^+ coeff: {LmLp_coeff}\n")
   f.write(f"L^- L^+ meas. frequency: {LmLp_freq}\n")
-  f.write(f"optimizer: AdamSR\n")
+  f.write(f"optimizer: {updater_name}\n")
+  f.write(f"norm clip: {norm_clip}\n")
   f.write(f"nbr. iter.: {nsweeps}\n")
   f.write(f"learning rate: {lr0}\n")
   f.write(f"decay: {decay}\n")
@@ -337,9 +356,10 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         initial_spins=init_configs,
         reweight=rw)
 
-    optimizer = NaturalExcitedAdamSR(
+    optimizer = NaturalExcitedSR(
         stage_set,
         tms_H,
+        updater=updater,
         diagnostics=diagnostics,
         diagnostics_every=diagnostics_every)
 
