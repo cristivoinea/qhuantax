@@ -164,15 +164,10 @@ diagnostics_every = int(args["diagnostics_every"])
 
 updater_name = str(args["updater"])
 norm_clip = None if args["norm_clip"] is None else float(args["norm_clip"])
-if updater_name == "plain":
-    if norm_clip is not None:
-        parser.error("--norm-clip needs an updater with momentum: adam, spring or march")
-    updater = qtx.optimizer.PlainUpdater()
-elif updater_name == "spring":
-    updater = qtx.optimizer.Spring(norm_clip=norm_clip)
-else:
-    updater = {"adam": qtx.optimizer.Adam,
-               "march": qtx.optimizer.March}[updater_name](norm_clip=norm_clip)
+updater = {"plain": qtx.optimizer.PlainUpdater,
+           "adam": qtx.optimizer.Adam,
+           "spring": qtx.optimizer.Spring,
+           "march": qtx.optimizer.March}[updater_name]()
 
 
 def stage_phases(K):
@@ -375,8 +370,16 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
                 f"VarE={optimizer.VarE}."
             )
 
+        # Cap what actually moves the parameters. The updaters' own `norm_clip` bounds
+        # only the momentum input, not the emitted step, so it cannot do this.
+        applied = step
+        if norm_clip is not None:
+            step_norm = jnp.linalg.norm(step)
+            applied = jnp.where(step_norm > norm_clip,
+                                step * (norm_clip / step_norm), step)
+
         lr = adaptive_learning_rate(lr0, delay, decay, baseline, sweep0 + i)
-        stage_set.update(stage_set.split_step(step * lr))
+        stage_set.update(stage_set.split_step(applied * lr))
         energy.append(optimizer.energy)
         VarE.append(optimizer.VarE)
 
