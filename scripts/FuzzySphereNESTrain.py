@@ -193,7 +193,7 @@ nh = int(args["nbr_heads"])
 d = int(args["attn_dim"])
 
 lr0 = float(args["lr"])
-t0 = N
+t0 = 10*N
 rw = float(args["reweight"])
 model_type = "DetBackflow"
 
