@@ -28,7 +28,27 @@ from sympy import Rational
 from qhuantax.quantumhall_operators import get_int_matrix
 
 
-DEFAULT_WEIGHT = 0.3
+# A (0,0) mode is a *rigid rotation* of every flavour spinor: with M = lam*I the chart gives every
+# column the spinor v_minus + lam*v_plus = sqrt(1+lam^2) * (cos(theta'/2), sin(theta'/2)) with
+# theta' = theta + 2*arctan(lam), since (v_minus, v_plus) is an orthonormal frame. Such a reference
+# is therefore just the canted vacuum at another angle, and lam is only the stereographic
+# coordinate on that circle -- which is why these slots are optimised in the angle instead.
+ANGLE_BOUND = np.pi - 1e-3
+r"""Search bound on an angle slot. ``lam = tan(delta/2)`` is a bijection from
+:math:`(-\pi,\pi)` onto :math:`\mathbb{R}`, so this excludes nothing the unbounded chart
+coordinate reached -- it only removes the coordinate's divergence."""
+
+ANGLE_SCAN = np.pi / 2
+r"""Grid half-width, used only when every reference is a bare canted vacuum (``Mbase = 0``), where
+it is complete: :math:`Z_2` is the flavour flip, so it identifies :math:`\theta` with
+:math:`\pi-\theta`, the distinct states are :math:`\theta\in[0,\pi/2]`, and
+:math:`[\theta_0-\pi/2,\theta_0+\pi/2]` contains that for any :math:`\theta_0\in(0,\pi/2)`. On a
+stretched base the same slot is not a canting angle, so no such argument applies and the grid is
+skipped."""
+
+ANGLE_GRID = 9        # coarse scan per angle; only picks the basin, Nelder-Mead then refines to tol
+EXCITON_SEED = 0.9
+EXCITON_MAX = 10.0
 
 
 @dataclass(frozen=True)
@@ -195,25 +215,30 @@ def mode_references(vac: HFVacuum, spec: str, L: int):
     mumax = max((abs(mu) for _, mu in stretched), default=0)
     lmax = max((ell for ell, _ in stretched), default=0)
 
-    refs, ndets, nfree = [], 0, 0
+    refs, ndets = [], 0
     if stretched:
-        refs.append(dict(kind="plain", ell=0, kbeta=1, free=0, mmax=mumax))
+        # The stretched base is the monomial itself; giving it a weight would blur that.
+        refs.append(dict(kind="plain", ell=0, kbeta=1, slots=(), mmax=mumax))
         ndets += 1
     for ell, _, kb in entries[i:]:
         if ell == 0:
             if kb != 1:
                 raise ValueError(f"(0,0,{kb}) makes no sense: N00 is a scalar, already exact-L")
-            first = not refs
-            refs.append(dict(kind="plain", ell=0, kbeta=1, free=0 if first else 1, mmax=mumax))
-            nfree += 0 if first else 1
+            refs.append(dict(kind="plain", ell=0, kbeta=1, slots=("angle",), mmax=mumax))
             ndets += 1
         else:
-            refs.append(dict(kind="proj", ell=ell, kbeta=kb, free=2, mmax=max(lmax, ell)))
-            nfree += 2
+            refs.append(dict(kind="proj", ell=ell, kbeta=kb, slots=("exciton", "angle"),
+                             mmax=max(lmax, ell)))
             ndets += kb
     if not refs:
         raise ValueError("mode spec produced no references")
-    return refs, Mbase, ndets, nfree
+    if len(refs) == 1 and refs[0]["slots"] == ("angle",):
+        # One canted vacuum, and `hf_vacuum` already returns the angle that extremises its
+        # (projected) energy in closed form, so there is nothing left to search.
+        refs[0]["slots"] = ()
+    for r in refs:
+        r["free"] = len(r["slots"])
+    return refs, Mbase, ndets, sum(r["free"] for r in refs)
 
 
 def mode_stack(vac: HFVacuum, refs, Mbase, params, L: int):
@@ -223,18 +248,21 @@ def mode_stack(vac: HFVacuum, refs, Mbase, params, L: int):
         ``(U0, W)`` of shapes ``(ndets, 2*nm, nm)`` and ``(ndets, nrefs)``, with ``W`` holding the
         fixed quadrature weights so that reference ``r`` is ``sum_d W[d, r] |Phi(U0[d])>``. A plain
         reference occupies one row of ``W``, a projected one its ``kbeta`` rows.
+
+    ``"angle"`` slots hold a canting-angle offset in radians, converted here to the chart
+    coordinate by ``lam = tan(delta/2)``; ``"exciton"`` slots hold the multipole amplitude directly.
     """
     nm = vac.nm
     Us, cols, p = [], [], 0
     for r in refs:
         if r["kind"] == "plain":
             lam = 0.0
-            if r["free"]:
-                lam, p = params[p], p + 1
+            if "angle" in r["slots"]:
+                lam, p = np.tan(params[p] / 2), p + 1
             Us.append(chart(vac, Mbase + lam * np.eye(nm)))
             cols.append(([len(Us) - 1], [1.0]))
         else:
-            c, lam = params[p], params[p + 1]
+            c, lam = params[p], np.tan(params[p + 1] / 2)
             p += 2
             T = multipole_tensor(nm, r["ell"], 0)
             idx, wts = [], []
@@ -371,19 +399,32 @@ def solve_modes(
 ):
     r"""Optimise a mode spec and diagonalise it in the :math:`(L_z, z_2)` sector.
 
-    The free weights are tuned on the state-averaged trace of the lowest ``nstates`` roots;
+    The free parameters are tuned on the state-averaged trace of the lowest ``nstates`` roots;
     minimising the leading root alone would trade the excited references away. Rayleigh-Ritz is
     solved in the *reference* basis, with the quadrature weights held fixed, which is what keeps
     each root an (almost) definite-:math:`L` state. ``cond(S)`` is returned because it, not physics,
     limits how many references can be stacked, and parameters exceeding ``cond_max`` are rejected --
     beyond it the objective is round-off, which a variational search will happily exploit.
 
+    Every :math:`\mathcal{N}_{00}` reference is a canted vacuum at its own angle (see ``ANGLE_MAX``),
+    so an all-``(0,0)`` spec is a set of angles on a bounded interval: those are scanned on a coarse
+    grid and the best basins refined, rather than searched in the unbounded chart coordinate. Note
+    ``cond(S)`` is *not* scale-invariant -- it includes the ratio of the references' norms, so two
+    parameter sets describing the same states through different representatives can report very
+    different values. For sensitivity, use :math:`\|c\|/\sqrt{c^\dagger Sc}` on the returned vectors.
+
     :return:
         A dict with ``U0`` ``(ndets, 2*nm, nm)``, ``coeffs`` ``(nstates, ndets)`` -- one
-        determinant-level vector per state -- plus ``energies``, ``residual``
+        determinant-level vector per state -- plus ``weights`` ``(ndets, nrefs)``, the fixed
+        quadrature weights, whose column ``r`` is reference ``r`` on its own determinants and zero
+        elsewhere. Both bases span the same space and give the same roots: ``coeffs`` makes the
+        states mutually orthogonal, ``weights`` keeps each state on its own reference's
+        determinants. Also ``energies``, ``residual``
         (:math:`|\langle L^2\rangle-L(L{+}1)|` per state, if ``l2_terms`` is given), ``cond``,
-        ``params``, ``ndets``, ``nrefs`` and ``kphi``.
+        ``cond_rel``, ``params``, ``slots``, ``ndets``, ``nrefs`` and ``kphi``.
     """
+    from itertools import combinations
+
     from scipy.optimize import minimize
 
     refs, Mbase, ndets, nfree = mode_references(vac, spec, L)
@@ -417,22 +458,45 @@ def solve_modes(
             return np.inf
         return float(np.sum(e[:nstates]))
 
+    slot_kinds = [s for r in refs for s in r["slots"]]
+    bounds = [(-ANGLE_BOUND, ANGLE_BOUND) if s == "angle" else (-EXCITON_MAX, EXCITON_MAX)
+              for s in slot_kinds]
+
     best = (np.inf, np.zeros(nfree))
     if nfree:
-        # Seed each slot by what it is, staggered within its kind: two references of the same kind
-        # differ only by these weights, so equal seeds would start at a rank-deficient point.
-        seed0, kp, kj = [], 0, 0
-        for r in refs:
-            if r["free"] == 1:
-                seed0.append(-DEFAULT_WEIGHT * (1.0 + 0.8 * kp))
-                kp += 1
-            elif r["free"] == 2:
-                seed0 += [0.9 * (1.0 + 0.5 * kj), DEFAULT_WEIGHT * (1.0 + 0.8 * kj)]
-                kj += 1
-        # The seed and its negation: the two signs cant the vacuum up and down from theta*, which
-        # are physically distinct references, so this is genuine exploration of the other basin.
-        for x0 in (np.array(seed0), -np.array(seed0)):
-            r = minimize(objective, x0, method="Nelder-Mead", options=dict(xatol=tol, fatol=tol))
+        starts = []
+        pure_angles = all(s == "angle" for s in slot_kinds) and not Mbase.any()
+        if pure_angles and nfree <= 3:
+            # Every reference is a canted vacuum, so this is a set of angles on an interval that
+            # ANGLE_SCAN covers completely -- scan it. Only strictly increasing tuples: the plain
+            # references are an unordered set, so permutations are the same reference, and increasing
+            # tuples also skip the coincident angles where S is singular.
+            grid = np.linspace(-ANGLE_SCAN, ANGLE_SCAN, ANGLE_GRID)
+            scored = sorted((objective(np.array(c)), c)
+                            for c in combinations(grid, nfree))
+            starts = [np.array(c) for f, c in scored[:2] if np.isfinite(f)]
+        if not starts:
+            # Fallback for specs carrying exciton amplitudes, where a grid is not affordable. Seed
+            # each slot by what it is and spread it *within its own kind*: two references of the same
+            # kind differ only by these parameters, so seeds that are close start near a
+            # rank-deficient point and the search stays there. The projected references keep the
+            # weights that worked before the reparameterisation, written as the equivalent angles.
+            nplain = sum(len(r["slots"]) for r in refs if r["kind"] == "plain")
+            plain = np.linspace(-0.35, 0.25, max(nplain, 1))
+            seed0, ka, kj = [], 0, 0
+            for r in refs:
+                for s in r["slots"]:
+                    if r["kind"] == "plain":
+                        seed0.append(plain[ka]); ka += 1
+                    elif s == "exciton":
+                        seed0.append(EXCITON_SEED * (1.0 + 0.5 * kj))
+                    else:
+                        seed0.append(2 * np.arctan(0.3 * (1.0 + 0.8 * kj))); kj += 1
+            starts = [np.array(seed0), -np.array(seed0)]
+
+        for x0 in starts:
+            r = minimize(objective, x0, method="Nelder-Mead", bounds=bounds,
+                         options=dict(xatol=tol, fatol=tol))
             if r.fun < best[0]:
                 best = (float(r.fun), np.asarray(r.x, dtype=float))
         if not np.isfinite(best[0]):
@@ -441,6 +505,13 @@ def solve_modes(
     params = best[1]
     energies, C, cond, U0, W = roots(params)
     coeffs = np.array([(W @ C[:, k]).real for k in range(nstates)])
+
+    # Scale-invariant companion to `cond`: the guard above needs the raw spectrum of S (it is a
+    # numerical-rank test), but that number also contains the ratio of the references' norms, so it
+    # says little about how ill-conditioned the *states* are. Normalising the diagonal away does.
+    _, S_ref, _, _ = reduced(params, hamiltonian)
+    dS = np.sqrt(np.abs(np.diag(S_ref)))
+    cond_rel = float(np.linalg.cond(S_ref / np.outer(dS, dS)))
 
     residual = None
     if l2_terms is not None:
@@ -451,9 +522,9 @@ def solve_modes(
             for k in range(nstates)
         ]
 
-    return dict(U0=U0, coeffs=coeffs, energies=energies[:nstates], cond=cond,
-                params=[float(v) for v in params], ndets=ndets, nrefs=nrefs,
-                kphi=kphi, residual=residual)
+    return dict(U0=U0, coeffs=coeffs, weights=W.real, energies=energies[:nstates], cond=cond,
+                cond_rel=cond_rel, params=[float(v) for v in params], slots=list(slot_kinds),
+                ndets=ndets, nrefs=nrefs, kphi=kphi, residual=residual)
 
 
 def backflow_coeffs(U0, coeffs):

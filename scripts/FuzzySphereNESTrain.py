@@ -68,15 +68,26 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbit
     if coeffs is not None:
         if pf_backflow:
             raise ValueError("--mean-field builds determinants; drop --pf-backflow")
-        nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_state]
-        model = MultiDetBackflow(
-            nets,
-            U0=jnp.asarray(U_state),
-            # `DetBackflow` divides each determinant by its own std, which would destroy the
-            # relative weights; `backflow_coeffs` undoes exactly that.
-            coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
-            d=d,
-        )
+        # Only the determinants this member actually uses. Carrying the others would give each a
+        # network whose coefficient is zero, so its gradient vanishes identically -- a singular SR
+        # solve, and `ndets` times the parameters. Without --orthogonalize the mean-field driver
+        # writes one reference per state, so this is usually a small subset of the stack.
+        used = np.flatnonzero(np.asarray(coeffs))
+        U_state, coeffs = U_state[used], np.asarray(coeffs)[used]
+
+        if len(used) == 1:
+            net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+            model = qtx.model.DetBackflow(net, U0=jnp.asarray(U_state[0]), d=d)
+        else:
+            nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_state]
+            model = MultiDetBackflow(
+                nets,
+                U0=jnp.asarray(U_state),
+                # `DetBackflow` divides each determinant by its own std, which would destroy the
+                # relative weights; `backflow_coeffs` undoes exactly that.
+                coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
+                d=d,
+            )
         return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
                                      symm=symm, max_parallel=16384, use_ref=False)
 
@@ -292,7 +303,7 @@ start_time = datetime.now()
 # non-zero: the network parameters enter only through `x W^T`, so at zero their gradient vanishes
 # and the SR solve returns nan. Irrelevant for a cold start, where the backflow is the only source
 # of amplitude away from a single configuration.
-MF_BACKFLOW_SCALE = 0.1
+MF_BACKFLOW_SCALE = 0.2
 
 
 def init_args(index):

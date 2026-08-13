@@ -34,6 +34,13 @@ parser.add_argument("--modes", required=True,
                          "L-projection nodes (number of determinants needed); ")
 parser.add_argument("--ndets", default=None,
                     help="number of determinants of each returned state")
+parser.add_argument("--orthogonalize", action="store_true", default=False,
+                    help="give each state its Rayleigh-Ritz vector over the whole determinant "
+                         "stack, making the states mutually orthogonal. Off by default, where "
+                         "state k is reference k and so carries only that reference's "
+                         "determinants -- the same span and the same energies, but one network "
+                         "per determinant of that reference instead of one per determinant of "
+                         "the stack")
 parser.add_argument("--ps-pot", default="4.75,1",
                     help="inter-layer Haldane pseudopotentials V_0,V_1,... ; the ")
 parser.add_argument("--transverse-fld", default=3.16,
@@ -50,6 +57,7 @@ l_target = int(args["l_sect"])
 lz = int(args["lz_sect"])
 z2 = int(args["z2_sect"])
 nstates = int(args["nbr_states"])
+orthogonalize = bool(args["orthogonalize"])
 spec = str(args["modes"])
 tol = float(args["tol"])
 path = Path(str(args["path"]))
@@ -102,19 +110,30 @@ result = solve_modes(
     l2_terms=None if args["no_residual"] else GetL2Terms(L, 2), tol=tol,
 )
 
-print(f"\n  cond(S)={result['cond']:.2e}  kphi={result['kphi']}  weights="
-      + " ".join(f"{v:+.4f}" for v in result["params"]))
+params = " ".join(
+    (f"dtheta={np.degrees(v):+.2f}deg" if s == "angle" else f"c={v:+.4f}")
+    for v, s in zip(result["params"], result["slots"])
+)
+print(f"\n  cond(S)={result['cond']:.2e} (rank guard)  cond_rel={result['cond_rel']:.2f} "
+      f"(scale-invariant)  kphi={result['kphi']}  {params}")
 print(f"  {'state':>5}  {'energy':>14}  residual |<L^2>-L(L+1)|")
 for k in range(nstates):
     res = "n/a" if result["residual"] is None else f"{result['residual'][k]:.2e}"
     print(f"  {k:>5}  {result['energies'][k]:14.6f}  {res}")
+
+# Both bases span the same references, so the energies above hold either way; they differ only in
+# how many determinants -- hence networks -- each trained state carries.
+coeffs = result["coeffs"] if orthogonalize else result["weights"].T[:nstates]
+print(f"  basis: {'Rayleigh-Ritz (orthogonal states)' if orthogonalize else 'one state per reference'}"
+      f", determinants per state " + ",".join(str(int(np.count_nonzero(c))) for c in coeffs))
 
 name = f"meanfield_n_{N}_2s_{L-1}_l_{l_target}_lz_{lz}_z2_{z2}.npz"
 path.mkdir(parents=True, exist_ok=True)
 meta = dict(N=N, nm=L, L=l_target, lz=lz, z2=z2, nstates=nstates, modes=spec,
             ndets=ndets, nrefs=result["nrefs"], kphi=result["kphi"], theta=float(vac.theta),
             ps_pot=[float(v) for v in pspot_inter], transverse_fld=transverse_fld,
-            params=result["params"], cond=result["cond"],
+            params=result["params"], slots=result["slots"], orthogonalize=orthogonalize,
+            cond=result["cond"], cond_rel=result["cond_rel"],
             energies=[float(e) for e in result["energies"]],
             residual=None if result["residual"] is None else [float(r) for r in result["residual"]])
-np.savez(path / name, U0=result["U0"], coeffs=result["coeffs"], meta=json.dumps(meta))
+np.savez(path / name, U0=result["U0"], coeffs=coeffs, meta=json.dumps(meta))
