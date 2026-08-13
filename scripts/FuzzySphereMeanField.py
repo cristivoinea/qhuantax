@@ -31,16 +31,14 @@ parser.add_argument("--z2-sect", default=1, help="Z2 symmetry sector")
 parser.add_argument("--nbr-states", default=1, help="number of states to solve for")
 parser.add_argument("--modes", required=True,
                     help="one (L,Lz[,kbeta]) entry per state, kbeta being that reference's "
-                         "L-projection nodes (number of determinants needed); ")
-parser.add_argument("--ndets", default=None,
-                    help="number of determinants of each returned state")
+                         "L-projection nodes (number of terms needed); ")
+parser.add_argument("--nbr-terms", default=None,
+                    help="number of terms of each returned state, either one value for all of "
+                         "them or one per state. Set by --modes and --orthogonalize, so this is "
+                         "only cross-checked against them")
 parser.add_argument("--orthogonalize", action="store_true", default=False,
-                    help="give each state its Rayleigh-Ritz vector over the whole determinant "
-                         "stack, making the states mutually orthogonal. Off by default, where "
-                         "state k is reference k and so carries only that reference's "
-                         "determinants -- the same span and the same energies, but one network "
-                         "per determinant of that reference instead of one per determinant of "
-                         "the stack")
+                    help="orthogonalize states and return coefficients; "
+                         "increases number of terms per state")
 parser.add_argument("--ps-pot", default="4.75,1",
                     help="inter-layer Haldane pseudopotentials V_0,V_1,... ; the ")
 parser.add_argument("--transverse-fld", default=3.16,
@@ -94,12 +92,24 @@ tms_H -= transverse_fld * GetSpinfulPolTerms(nm=L, mat=SX)
 # z2 makes this variation *after* projection: the sampler always projects, so the angle that
 # extremises the projected energy is the right one, not the one extremising E_HF.
 vac = hf_vacuum(L, 2 * pspot_inter, transverse_fld, z2=z2)
-refs, _, ndets, nfree = mode_references(vac, spec, l_target)
-if args["ndets"] is not None and int(args["ndets"]) != ndets:
-    parser.error(f"--modes implies {ndets} determinants, but --ndets={args['ndets']}")
+refs, _, nterms, nfree = mode_references(vac, spec, l_target)
+if nstates > len(refs):
+    parser.error(f"cannot provide {nstates} states with only {len(refs)} references")
 
 
-print(f"  -> {ndets} determinants, {len(refs)} references, {nfree} free weights, "
+terms_per_state = ([nterms] * nstates if orthogonalize
+                   else [r["kbeta"] for r in refs[:nstates]])
+if args["nbr_terms"] is not None:
+    want = [int(v) for v in str(args["nbr_terms"]).replace(",", " ").split()]
+    if len(want) not in (1, nstates):
+        parser.error(f"--nbr-terms needs 1 or {nstates} entries, got {len(want)}")
+    want = want * nstates if len(want) == 1 else want
+    if want != terms_per_state:
+        parser.error(f"--modes gives its states {terms_per_state} terms"
+                     f"{' after orthogonalisation' if orthogonalize else ''}, but --nbr-terms "
+                     f"asks for {want}")
+
+print(f"  -> {nterms} terms, {len(refs)} references, {nfree} free weights, "
       f"theta*={np.degrees(vac.theta):.4f} deg")
 for i, r in enumerate(refs):
     kind = "plain" if r["kind"] == "plain" else f"L-projected N{r['ell']}0, K_beta={r['kbeta']}"
@@ -124,19 +134,20 @@ for k in range(nstates):
 # Both bases span the same references, so the energies above hold either way; they differ only in
 # how many determinants -- hence networks -- each trained state carries.
 coeffs = result["coeffs"] if orthogonalize else result["weights"].T[:nstates]
-dets_per_state = [int(np.count_nonzero(c)) for c in coeffs]
+# From the coefficients actually written, rather than the prediction checked above.
+terms_per_state = [int(np.count_nonzero(c)) for c in coeffs]
 print(f"  basis: {'Rayleigh-Ritz (orthogonal states)' if orthogonalize else 'one state per reference'}"
-      f", determinants per state " + ",".join(str(v) for v in dets_per_state))
+      f", terms per state " + ",".join(str(v) for v in terms_per_state))
 
 # The state count is what a training run has to match, so it belongs in the name: two mode specs
 # for the same sector otherwise overwrite each other.
 name = f"meanfield_n_{N}_2s_{L-1}_l_{l_target}_lz_{lz}_z2_{z2}_nstates_{nstates}.npz"
 path.mkdir(parents=True, exist_ok=True)
 meta = dict(N=N, nm=L, L=l_target, lz=lz, z2=z2, nstates=nstates, modes=spec,
-            ndets=ndets, nrefs=result["nrefs"], kphi=result["kphi"], theta=float(vac.theta),
+            nterms=nterms, nrefs=result["nrefs"], kphi=result["kphi"], theta=float(vac.theta),
             ps_pot=[float(v) for v in pspot_inter], transverse_fld=transverse_fld,
             params=result["params"], slots=result["slots"], orthogonalize=orthogonalize,
-            dets_per_state=dets_per_state,
+            terms_per_state=terms_per_state,
             cond=result["cond"], cond_rel=result["cond_rel"],
             energies=[float(e) for e in result["energies"]],
             residual=None if result["residual"] is None else [float(r) for r in result["residual"]])
