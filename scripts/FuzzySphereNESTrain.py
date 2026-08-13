@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import equinox as eqx
 import jax.numpy as jnp
 
 import numpy as np
@@ -34,7 +35,26 @@ SX = np.array([[0, 1], [1, 0]])
 
 
 
-def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None):
+def scale_backflow(model, scale):
+    r"""Shrink the initial backflow weights `W` of every determinant in `model`.
+
+    The backflow enters as :math:`U_0[idx] + x W^T`, and `DetBackflow` first divides `U_0` by
+    its own std. A dense mean-field reference then has entries of order one, so the default
+    `W = lecun_normal/10` perturbs every orbital by ~10% -- enough to destroy the excited
+    references, whose coefficient vectors are near-cancellations between nearly parallel
+    determinants and so amplify a per-determinant perturbation by the Gram conditioning. `W`
+    must stay non-zero: the network parameters enter only through `x W^T`, so at `W = 0` their
+    gradient vanishes identically and the network would never start learning.
+    """
+    if scale == 1.0:
+        return model
+    if hasattr(model, "models"):        # MultiDetBackflow: one `W` per determinant
+        return eqx.tree_at(lambda m: [sub.W for sub in m.models], model,
+                           [scale * sub.W for sub in model.models])
+    return eqx.tree_at(lambda m: m.W, model, scale * model.W)
+
+
+def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None, backflow_scale=1.0):
     """One NES member.
 
     `coeffs` switches on the multi-determinant mean-field reference: `U` is then the determinant
@@ -57,8 +77,8 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbit
             coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
             d=d,
         )
-        return qtx.state.Variational(model, param_file=param_file, symm=symm,
-                                     max_parallel=16384, use_ref=False)
+        return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
+                                     symm=symm, max_parallel=16384, use_ref=False)
 
     net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
     if pf_backflow:
@@ -69,9 +89,10 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbit
     else:
         model = qtx.model.DetBackflow(net, U0=U_state, d=d)
 
-    # `param_file` replaces every leaf of the model, U0 included, so the orbital noise
-    # above is irrelevant whenever one is given.
-    return qtx.state.Variational(model, param_file=param_file, symm=symm, max_parallel=16384, use_ref=False)
+    # `param_file` replaces every leaf of the model, U0 and W included, so the orbital noise
+    # and the backflow scale above are irrelevant whenever one is given.
+    return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
+                                 symm=symm, max_parallel=16384, use_ref=False)
 
 
 
@@ -261,13 +282,27 @@ else:
 
 start_time = datetime.now()
 
+# Factor on the initial backflow weights of a mean-field start. At the quantax default (1.0) the
+# backflow perturbs every orbital of the std-normalised reference enough to cost most of the
+# mean-field energy: exactly 3.1 of 24.9 at N=10 and 6.5 of 35.7 at N=14, and more once the
+# amplitude leaking off the reference's support is counted. Nearly all of the damage is to the
+# *excited* members, which are differences of determinants carrying independent random backflows.
+# At 0.1 the exact loss is 0.08/0.15/0.20 at N=10/12/14, comparable to the scatter between random
+# net draws, with no useful trend in N -- so this needs no size-dependent tuning. It must stay
+# non-zero: the network parameters enter only through `x W^T`, so at zero their gradient vanishes
+# and the SR solve returns nan. Irrelevant for a cold start, where the backflow is the only source
+# of amplitude away from a single configuration.
+MF_BACKFLOW_SCALE = 0.1
+
+
 def init_args(index):
     if mf_coeffs is not None:
         # The members already differ by their Rayleigh-Ritz coefficients, so no noise is needed
         # -- and any would spoil the tuned reference. Checked first because it also fixes the
         # model structure, which `param_file` has to match.
         pf = init_state_file if (init_state_file is not None and index == 0) else None
-        return dict(coeffs=mf_coeffs[index], orbital_noise=0, param_file=pf)
+        return dict(coeffs=mf_coeffs[index], orbital_noise=0, param_file=pf,
+                    backflow_scale=MF_BACKFLOW_SCALE)
     if init_state_file is not None and index == 0:
         return dict(orbital_noise=0, param_file=init_state_file)
     return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)
@@ -305,6 +340,9 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nbr. params per state: {state_set.states[0].nparams}\n")
   f.write(f"nbr. states: {nstates}\n")
   f.write(f"init state file: {init_state_file}\n")
+  f.write(f"mean field file: {mf_file}\n")
+  if mf_coeffs is not None:
+      f.write(f"backflow scale: {MF_BACKFLOW_SCALE}\n")
   f.write(f"incremental: {incremental}\n")
   f.write(f"warmup sweeps: {warmup_sweeps}\n")
 
