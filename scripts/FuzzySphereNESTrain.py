@@ -1,4 +1,5 @@
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from qhuantax.quantumhall_operators import (
     GetSpinfulDenIntTerms,
     GetSpinfulPolTerms,
 )
+from qhuantax.quantumhall_meanfield import backflow_coeffs
+from qhuantax.quantumhall_models import MultiDetBackflow
 from qhuantax.quantumhall_symmetries import FlavourPermQH, IdentityQH, ParticleHoleQH
 from qhuantax.quantumhall_utils import adaptive_learning_rate_inv, generate_spin_configs
 
@@ -31,10 +34,31 @@ SX = np.array([[0, 1], [1, 0]])
 
 
 
-def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None):
+def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None):
+    """One NES member.
+
+    `coeffs` switches on the multi-determinant mean-field reference: `U` is then the determinant
+    stack shared by every member (shape `(ndets, 2L, N)`) and `coeffs` is this member's
+    Rayleigh-Ritz vector, so the members differ by their coefficients rather than by noise.
+    """
     U_state = U.copy()
     if orbital_noise > 0:
         U_state = U_state + orbital_noise * rng.normal(size=U_state.shape)
+
+    if coeffs is not None:
+        if pf_backflow:
+            raise ValueError("--mean-field builds determinants; drop --pf-backflow")
+        nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_state]
+        model = MultiDetBackflow(
+            nets,
+            U0=jnp.asarray(U_state),
+            # `DetBackflow` divides each determinant by its own std, which would destroy the
+            # relative weights; `backflow_coeffs` undoes exactly that.
+            coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
+            d=d,
+        )
+        return qtx.state.Variational(model, param_file=param_file, symm=symm,
+                                     max_parallel=16384, use_ref=False)
 
     net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
     if pf_backflow:
@@ -83,12 +107,10 @@ parser.add_argument("--diagnostics", action="store_true", default=False,
                     help="write per-sweep step norms and SR conditioning to data_diagnostics_*.txt")
 parser.add_argument("--diagnostics-every", action="store", default=5,
                     help="how often to refresh the Jacobian Gram spectrum in the diagnostics file")
-parser.add_argument("--mean-field", action="store_true", default=False,
-                    help="use mean-field ansatz as initial starting point")
-parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
-		    help="number of iterations for the MF optimization")
-parser.add_argument("--lr-mf", action="store", default=1e-2,
-		    help="starting value of the learning rate for the MF optimization")
+parser.add_argument("--mean-field", action="store", default=None,
+                    help="path to a .npz written by FuzzySphereMeanField.py: its determinant "
+                         "stack becomes the shared U0 of every member, and its k-th "
+                         "Rayleigh-Ritz vector initialises member k")
 
 
 parser.add_argument("--exact-diag", action="store_true", default=False,
@@ -135,9 +157,7 @@ init_state_file = args["init_state_file"]
 incremental = bool(args["incremental"])
 if incremental and init_state_file is None:
     parser.error("--incremental requires --init-state-file for the K=1 state")
-do_MF = bool(args["mean_field"])
-nsweeps_MF = int(args["nbr_sweeps_mf"])
-lr_MF = int(args["lr_mf"])
+mf_file = args["mean_field"]
 
 
 do_ED = bool(args["exact_diag"])
@@ -212,33 +232,26 @@ tms_LmLp = tms_Lp.H @ tms_Lp
 if LmLp_coeff:
     tms_H = tms_H + LmLp_coeff * tms_LmLp
 
-# MF pre training & load orbitals
-if do_MF:
-    path_MF = Path(f"{path}/state_MF_{run_id}.txt")
-    if path_MF.exists():
-        print(f"File already exists: {path}/state_MF_{run_id}.txt")
-        U = np.loadtxt(f"{path}/state_MF_{run_id}.txt")[:2*L,:]
-    else:
-        energy_MF = qtx.utils.DataTracer()
-
-        t = 1.0
-        U = np.zeros((2, 2*L, N))
-        U[0, :N,:N] = np.eye(N)*np.cos(t/2)
-        U[0, N:2*N,:N] = np.eye(N)*np.sin(t/2)
-        U[1, :N,:N] = np.eye(N)*np.cos(np.pi/2 - t/2)
-        U[1, N:2*N,:N] = np.eye(N)*np.sin(np.pi/2 - t/2)
-
-        model_MF = qtx.model.MultiDet(ndets = 2, U=U, coeffs = jnp.array([1, z2]))
-        state_MF = qtx.state.MultiDetState(model_MF)
-
-        for i in range(nsweeps_MF):
-            step = state_MF.get_step(tms_H)
-            state_MF.update(step * lr_MF)
-            energy_MF.append(state_MF.energy)
-
-            np.savetxt(f"{path}/data_MF_{run_id}.txt", np.vstack((energy_MF.time, energy_MF.data)).T)
-            np.savetxt(f"{path}/state_MF_{run_id}.txt", np.vstack((state_MF.model.U_full[0,:,:], state_MF.model.U_full[1,:,:])))
-        U = U[0, :, :]
+# Mean-field reference: a determinant stack shared by every member, with one Rayleigh-Ritz
+# coefficient vector per state.
+mf_coeffs = None
+if mf_file is not None:
+    with np.load(mf_file) as mf:
+        U = np.asarray(mf["U0"])
+        mf_coeffs = np.asarray(mf["coeffs"])
+        mf_meta = json.loads(str(mf["meta"]))
+    if (mf_meta["N"], mf_meta["nm"]) != (N, L):
+        raise ValueError(f"{mf_file} was built for N={mf_meta['N']}, 2s+1={mf_meta['nm']}, "
+                         f"but this run is N={N}, 2s+1={L}")
+    if (mf_meta["lz"], mf_meta["z2"]) != (lz, z2):
+        raise ValueError(f"{mf_file} is for sector (lz,z2)=({mf_meta['lz']},{mf_meta['z2']}), "
+                         f"but this run is ({lz},{z2})")
+    if len(mf_coeffs) < nstates:
+        raise ValueError(f"{mf_file} holds {len(mf_coeffs)} states, need {nstates}; rerun "
+                         f"FuzzySphereMeanField.py with a larger --nbr-states and more modes")
+    print(f"mean field: {U.shape[0]} determinants, modes {mf_meta['modes']}, "
+          f"energies {[round(e, 6) for e in mf_meta['energies'][:nstates]]}, "
+          f"residual |<L^2>-L(L+1)| {mf_meta['residual']}")
 else:
     U = np.zeros((2*L, N))
     U[:N,:N] = np.eye(N)
@@ -249,6 +262,12 @@ else:
 start_time = datetime.now()
 
 def init_args(index):
+    if mf_coeffs is not None:
+        # The members already differ by their Rayleigh-Ritz coefficients, so no noise is needed
+        # -- and any would spoil the tuned reference. Checked first because it also fixes the
+        # model structure, which `param_file` has to match.
+        pf = init_state_file if (init_state_file is not None and index == 0) else None
+        return dict(coeffs=mf_coeffs[index], orbital_noise=0, param_file=pf)
     if init_state_file is not None and index == 0:
         return dict(orbital_noise=0, param_file=init_state_file)
     return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)

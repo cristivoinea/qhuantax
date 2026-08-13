@@ -5,39 +5,8 @@ from typing import Optional, Union
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import quantax as qtx
 from quantax.utils import LogArray, PsiArray, ScaleArray
-
-
-def _same_symmetry(left: qtx.symmetry.Symmetry, right: qtx.symmetry.Symmetry) -> bool:
-    if type(left) is not type(right):
-        return False
-
-    attrs = (
-        "Nsites",
-        "Nmodes",
-        "Nparticles",
-        "particle_type",
-        "double_occ",
-        "Z2_inversion",
-    )
-    if any(getattr(left, attr) != getattr(right, attr) for attr in attrs):
-        return False
-
-    if tuple(left._sector) != tuple(right._sector):
-        return False
-
-    array_attrs = ("_generator", "_generator_sign", "_perm", "_character", "_perm_sign")
-    if any(
-        not np.array_equal(
-            np.asarray(getattr(left, attr)), np.asarray(getattr(right, attr))
-        )
-        for attr in array_attrs
-    ):
-        return False
-
-    return getattr(left, "_ph_sign", None) == getattr(right, "_ph_sign", None)
 
 
 def _stack_psi_arrays(values: Sequence[PsiArray], axis: int = -1) -> PsiArray:
@@ -109,14 +78,6 @@ class NaturalStateSet:
         self._states = tuple(states)
         if len(self._states) <= 1:
             raise ValueError("NaturalStateSet requires at least two states.")
-
-        symm = self._states[0].symm
-        for index, state in enumerate(self._states[1:], start=1):
-            if not _same_symmetry(symm, state.symm):
-                raise ValueError(
-                    "All states in a NaturalStateSet must have the same symmetry; "
-                    f"state {index} differs from state 0."
-                )
 
         if trainable is None:
             self._trainable = (True,) * len(self._states)
