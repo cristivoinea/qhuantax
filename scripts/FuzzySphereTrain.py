@@ -5,11 +5,19 @@ import jax.numpy as jnp
 import numpy as np
 from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
-from qhuantax.quantumhall_utils import adaptive_learning_rate_exp, generate_spin_configs, diagonalize_lz_multiplet
+from qhuantax.quantumhall_utils import (
+    MF_BACKFLOW_SCALE,
+    adaptive_learning_rate_inv,
+    generate_spin_configs,
+    diagonalize_lz_multiplet,
+    scale_backflow,
+)
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
+from qhuantax.quantumhall_meanfield import backflow_coeffs
 from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -31,12 +39,11 @@ parser.add_argument("--z2-sect", action="store", default=0,
 parser.add_argument("--ph-sect", action="store", default=0,
                     help="PH symmetry sector (without spin flip)")
 
-parser.add_argument("--mean-field", action="store_true", default=False,
-                    help="use mean-field ansatz as initial starting point")
-parser.add_argument("--nbr-sweeps-mf", action="store", default=500,
-		    help="number of iterations for the MF optimization")
-parser.add_argument("--lr-mf", action="store", default=1e-2,
-		    help="starting value of the learning rate for the MF optimization")
+parser.add_argument("--mean-field", action="store", default=None,
+                    help="path to a .npz written by FuzzySphereMeanField.py; its lowest state "
+                         "becomes the reference of the ansatz, replacing the 0/1 Fock U0. Files "
+                         "holding more than one reference must have been built with "
+                         "--orthogonalize, since only then does the lowest state span them all")
 
 parser.add_argument("--exact-diag", action="store_true", default=False,
                     help="perform exact diagonalization and track energy, energy variance and overlap with ground state")
@@ -45,8 +52,11 @@ parser.add_argument("--lmlp-coeff", action="store", default=0,
 parser.add_argument("--lmlp-freq", action="store", default=5,
                     help="measurement frequency of L^- L^+ term")
 
-parser.add_argument("--multi", action="store", default=1,
-                    help="Change the ansatz to a MultiDetBackflow ansatz (default) or MultiPfBackflow (if --pf-backflow)")
+parser.add_argument("--multi", action="store", default=None,
+                    help="number of terms of the ansatz, i.e. MultiDetBackflow (or MultiPfBackflow "
+                         "if --pf-backflow) rather than a single determinant; defaults to 1. With "
+                         "--mean-field the count comes from the file instead, and this is only "
+                         "cross-checked against it")
 parser.add_argument("--pf-backflow", action="store_true", default=False,
                     help="change the ansatz structure from PfBackflow to DetBackflow")
 
@@ -82,15 +92,20 @@ id = int(args["run_id"])
 path = str(args["path"])
 run_id = f"n_{N}_2s_{L-1}_lz_{lz}_z2_{z2}_ph_{ph}_id0{id}"
 
-do_MF = bool(args["mean_field"])
-nsweeps_MF = int(args["nbr_sweeps_mf"])
-lr_MF = int(args["lr_mf"])
+mf_file = args["mean_field"]
 
 do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
 LmLp_freq = float(args["lmlp_freq"])
 
-nterms = int(args["multi"])
+# None means "unset", which `--mean-field` fills in from the file; the cold start defaults to 1.
+# A list is accepted for symmetry with FuzzySphereNESTrain, but only one state is trained here.
+nterms_arg = (None if args["multi"] is None
+              else [int(v) for v in str(args["multi"]).replace(",", " ").split()])
+if nterms_arg is not None and len(nterms_arg) != 1:
+    parser.error(f"--multi takes a single value here, got {len(nterms_arg)}; this script trains "
+                 "one state, so use FuzzySphereNESTrain for a per-state list")
+nterms = 1 if nterms_arg is None else nterms_arg[0]
 pf_backflow = bool(args["pf_backflow"])
 nsweeps = int(args["nbr_sweeps"])
 nsamples = int(args["nbr_samples"])
@@ -99,9 +114,7 @@ nh = int(args["nbr_heads"])
 d = int(args["attn_dim"])
 
 lr0 = float(args["lr"])
-baseline = lr0/5
-delay = nsweeps//5
-decay = 2*np.log(2)/delay
+t0 = N
 rw = float(args["reweight"])
 model_type = "DetBackflow"
 
@@ -142,33 +155,39 @@ if LmLp_coeff:
     tms_H = tms_H + LmLp_coeff * tms_LmLp
 
 
-# MF pre training & load orbitals
-if do_MF:
-    path_MF = Path(f"{path}/state_MF_{run_id}.txt")
-    if path_MF.exists():
-        print(f"File already exists: {path}/state_MF_{run_id}.txt")
-        U = np.loadtxt(f"{path}/state_MF_{run_id}.txt")[:2*L,:]
-    else:
-        energy_MF = qtx.utils.DataTracer()
-
-        t = 1.0
-        U = np.zeros((2, 2*L, N))
-        U[0, :N,:N] = np.eye(N)*np.cos(t/2)
-        U[0, N:2*N,:N] = np.eye(N)*np.sin(t/2)
-        U[1, :N,:N] = np.eye(N)*np.cos(np.pi/2 - t/2)
-        U[1, N:2*N,:N] = np.eye(N)*np.sin(np.pi/2 - t/2)
-
-        model_MF = qtx.model.MultiDet(ndets = 2, U=U, coeffs = jnp.array([1, z2]))
-        state_MF = qtx.state.MultiDetState(model_MF)
-
-        for i in range(nsweeps):
-            step = state_MF.get_step(tms_H)
-            state_MF.update(step * lr_MF)
-            energy_MF.append(state_MF.energy)
-
-            np.savetxt(f"{path}/data_MF_{run_id}.txt", np.vstack((energy_MF.time, energy_MF.data)).T)
-            np.savetxt(f"{path}/state_MF_{run_id}.txt", np.vstack((state_MF.model.U_full[0,:,:], state_MF.model.U_full[1,:,:])))
-        U = U[0, :, :]
+# Mean-field reference, or the cold-start Fock matrix
+mf_coeffs = None
+if mf_file is not None:
+    with np.load(mf_file) as mf:
+        U = np.asarray(mf["U0"])
+        mf_coeffs = np.asarray(mf["coeffs"])
+        mf_meta = json.loads(str(mf["meta"]))
+    if (mf_meta["N"], mf_meta["nm"]) != (N, L):
+        raise ValueError(f"{mf_file} was built for N={mf_meta['N']}, 2s+1={mf_meta['nm']}, "
+                         f"but this run is N={N}, 2s+1={L}")
+    if (mf_meta["lz"], mf_meta["z2"]) != (lz, z2):
+        raise ValueError(f"{mf_file} is for sector (lz,z2)=({mf_meta['lz']},{mf_meta['z2']}), "
+                         f"but this run is ({lz},{z2})")
+    if mf_meta["nrefs"] > 1 and not mf_meta.get("orthogonalize", True):
+        # Only NES cares about the span. Here the single member *is* the state, and without
+        # --orthogonalize state 0 is reference 0 alone -- a valid state, but above the root the
+        # file reports, which belongs to the whole span.
+        raise ValueError(
+            f"{mf_file} holds {mf_meta['nrefs']} references and was built without "
+            f"--orthogonalize, so its lowest state is reference 0 on its own rather than the "
+            f"{mf_meta['energies'][0]:.6f} it reports. Rerun FuzzySphereMeanField.py with "
+            f"--orthogonalize, or with a single-reference mode spec"
+        )
+    mf_coeffs = mf_coeffs[0]
+    # The term count is fixed by the mode spec of the mean-field solve, so --multi can only ever
+    # agree with it or disagree; treat it as an assertion rather than an input.
+    nterms = int(np.count_nonzero(mf_coeffs))
+    if nterms_arg is not None and nterms_arg[0] != nterms:
+        raise ValueError(f"{mf_file} gives its lowest state {nterms} determinants, but "
+                         f"--multi asks for {nterms_arg[0]}; the mode spec sets this, so drop "
+                         f"--multi")
+    print(f"mean field: {nterms} of {U.shape[0]} determinants, modes {mf_meta['modes']}, "
+          f"starting energy {mf_meta['energies'][0]:.6f}")
 else:
     U = np.zeros((2*L, N))
     U[:N,:N] = np.eye(N)
@@ -180,39 +199,64 @@ startTime = datetime.now()
 
 
 # start NN training
-if nterms > 1:
-    net = tuple(
-    Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-    for _ in range(nterms))
-else:
-    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+if mf_coeffs is not None:
+    if pf_backflow:
+        raise ValueError("--mean-field builds determinants; drop --pf-backflow")
+    # Only the determinants this state actually uses. Carrying the others would give each a network
+    # whose coefficient is zero, so its gradient vanishes identically -- a singular SR solve, and
+    # `ndets` times the parameters. Without --orthogonalize the mean-field driver writes one
+    # reference per state, so this is usually a small subset of the stack.
+    used = np.flatnonzero(mf_coeffs)
+    U_mf, c_mf = U[used], mf_coeffs[used]
 
-
-if pf_backflow:
-    U0s = []
-    for alpha in range(nterms):
-        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-
-        U_pf = jnp.zeros((2 * L, 2 * L))
-        for i in range(N):
-            U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
-
-        U0s.append(U_pf)
-
-    if nterms > 1:
-        model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
+    if len(used) == 1:
+        net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+        model = qtx.model.DetBackflow(net, U0=jnp.asarray(U_mf[0]), d=d)
     else:
-        model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
-else:
-    U0s = []
-    for alpha in range(nterms):
-        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-        U0s.append(U_alpha)
+        net = tuple(Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_mf)
+        model = MultiDetBackflow(
+            nets=net,
+            U0=jnp.asarray(U_mf),
+            # `DetBackflow` divides each determinant by its own std, which would destroy the
+            # relative weights; `backflow_coeffs` undoes exactly that.
+            coeffs=jnp.asarray(backflow_coeffs(U_mf, c_mf)),
+            d=d,
+        )
+    model = scale_backflow(model, MF_BACKFLOW_SCALE)
 
+else:
     if nterms > 1:
-        model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
+        net = tuple(
+        Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+        for _ in range(nterms))
     else:
-        model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
+        net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+
+    if pf_backflow:
+        U0s = []
+        for alpha in range(nterms):
+            U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+
+            U_pf = jnp.zeros((2 * L, 2 * L))
+            for i in range(N):
+                U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
+
+            U0s.append(U_pf)
+
+        if nterms > 1:
+            model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
+        else:
+            model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
+    else:
+        U0s = []
+        for alpha in range(nterms):
+            U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
+            U0s.append(U_alpha)
+
+        if nterms > 1:
+            model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
+        else:
+            model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
 
 
 state = qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
@@ -228,9 +272,8 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"optimizer: AdamSR\n")
   f.write(f"nbr. iter.: {nsweeps}\n")
   f.write(f"learning rate: {lr0}\n")
-  f.write(f"decay: {decay}\n")
-  f.write(f"delay: {delay}\n")
-  f.write(f"baseline: {baseline}\n")
+  f.write(f"lr schedule: inv\n")
+  f.write(f"t0: {t0}\n")
   f.write(f"sampler: DipoleCons\n")
   f.write(f"nbr. samples NN: {nsamples}\n")
   f.write(f"reweight: {rw}\n")
@@ -241,6 +284,9 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nbr. heads: {nh}\n")
   f.write(f"attndim: {d}\n")
   f.write(f"nbr. params: {state.nparams}\n")
+  f.write(f"mean field file: {mf_file}\n")
+  if mf_coeffs is not None:
+      f.write(f"backflow scale: {MF_BACKFLOW_SCALE}\n")
 
 
 init_configs = generate_spin_configs(L, N, lz, nsamples)
@@ -260,7 +306,7 @@ if do_ED:
 for i in range(nsweeps):
     samples = sampler.sweep()
     step = optimizer.get_step(samples)
-    state.update(step * adaptive_learning_rate_exp(lr0, delay, decay, baseline, i))
+    state.update(step * adaptive_learning_rate_inv(lr0, t0, i))
 
     energy.append(optimizer.energy)
     VarE.append(optimizer.VarE)

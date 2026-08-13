@@ -3,7 +3,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import equinox as eqx
 import jax.numpy as jnp
 
 import numpy as np
@@ -24,9 +23,14 @@ from qhuantax.quantumhall_operators import (
     GetSpinfulPolTerms,
 )
 from qhuantax.quantumhall_meanfield import backflow_coeffs
-from qhuantax.quantumhall_models import MultiDetBackflow
+from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
 from qhuantax.quantumhall_symmetries import FlavourPermQH, IdentityQH, ParticleHoleQH
-from qhuantax.quantumhall_utils import adaptive_learning_rate_inv, generate_spin_configs
+from qhuantax.quantumhall_utils import (
+    MF_BACKFLOW_SCALE,
+    adaptive_learning_rate_inv,
+    generate_spin_configs,
+    scale_backflow,
+)
 
 
 S1 = np.array([[1, 0], [0, 0]])
@@ -35,31 +39,13 @@ SX = np.array([[0, 1], [1, 0]])
 
 
 
-def scale_backflow(model, scale):
-    r"""Shrink the initial backflow weights `W` of every determinant in `model`.
-
-    The backflow enters as :math:`U_0[idx] + x W^T`, and `DetBackflow` first divides `U_0` by
-    its own std. A dense mean-field reference then has entries of order one, so the default
-    `W = lecun_normal/10` perturbs every orbital by ~10% -- enough to destroy the excited
-    references, whose coefficient vectors are near-cancellations between nearly parallel
-    determinants and so amplify a per-determinant perturbation by the Gram conditioning. `W`
-    must stay non-zero: the network parameters enter only through `x W^T`, so at `W = 0` their
-    gradient vanishes identically and the network would never start learning.
-    """
-    if scale == 1.0:
-        return model
-    if hasattr(model, "models"):        # MultiDetBackflow: one `W` per determinant
-        return eqx.tree_at(lambda m: [sub.W for sub in m.models], model,
-                           [scale * sub.W for sub in model.models])
-    return eqx.tree_at(lambda m: m.W, model, scale * model.W)
-
-
-def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None, backflow_scale=1.0):
+def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None, backflow_scale=1.0, nterms=1):
     """One NES member.
 
     `coeffs` switches on the multi-determinant mean-field reference: `U` is then the determinant
-    stack shared by every member (shape `(ndets, 2L, N)`) and `coeffs` is this member's
-    Rayleigh-Ritz vector, so the members differ by their coefficients rather than by noise.
+    stack shared by every member (shape `(ndets, 2L, N)`) and `coeffs` is this member's vector over
+    it, so the members differ by their coefficients rather than by noise, and the term count comes
+    from that vector. Without it, `nterms` sets how many perturbed copies of `U` this member sums.
     """
     U_state = U.copy()
     if orbital_noise > 0:
@@ -91,14 +77,27 @@ def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbit
         return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
                                      symm=symm, max_parallel=16384, use_ref=False)
 
-    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+    # One perturbed copy of the reference per term. The copies must differ, or the terms are
+    # identical and the sum is rank deficient; `orbital_noise` above separates the *members*, not
+    # the terms within one.
+    U0s = [U_state if nterms == 1 else U_state + 1e-2 * rng.normal(size=U_state.shape)
+           for _ in range(nterms)]
     if pf_backflow:
-        U_pf = jnp.zeros((2 * L, 2 * L))
-        for i in range(N):
-            U_pf = U_pf.at[:, 2 * i].add(U_state[:, i])
-        model = qtx.model.PfBackflow(net, U0=U_pf, d=d)
+        for k, U_alpha in enumerate(U0s):
+            U_pf = jnp.zeros((2 * L, 2 * L))
+            for i in range(N):
+                U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
+            U0s[k] = U_pf
+
+    nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U0s]
+    if nterms > 1:
+        multi = MultiPfBackflow if pf_backflow else MultiDetBackflow
+        model = multi(nets=nets, U0=jnp.stack([jnp.asarray(u) for u in U0s]),
+                      coeffs=jnp.ones(nterms) / nterms, d=d)
+    elif pf_backflow:
+        model = qtx.model.PfBackflow(nets[0], U0=U0s[0], d=d)
     else:
-        model = qtx.model.DetBackflow(net, U0=U_state, d=d)
+        model = qtx.model.DetBackflow(nets[0], U0=U0s[0], d=d)
 
     # `param_file` replaces every leaf of the model, U0 and W included, so the orbital noise
     # and the backflow scale above are irrelevant whenever one is given.
@@ -152,6 +151,12 @@ parser.add_argument("--lmlp-coeff", action="store", default=0,
 parser.add_argument("--lmlp-freq", action="store", default=5,
                     help="measurement frequency of L^- L^+ term")
 
+parser.add_argument("--multi", action="store", default=None,
+                    help="number of determinants each state is built from, either one value for "
+                         "all of them or one per state, e.g. '1,1,2' -- which is what a mean-field "
+                         "file written without --orthogonalize gives, since there each state "
+                         "carries only its own reference. Set by the mode spec, so this is only "
+                         "cross-checked against the file")
 parser.add_argument("--pf-backflow", action="store_true", default=False,
                     help="change the ansatz structure from PfBackflow to DetBackflow")
 parser.add_argument("--nbr-heads", action="store", default=4,
@@ -196,6 +201,14 @@ do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
 LmLp_freq = float(args["lmlp_freq"])
 
+# "2" means every state, "1,1,2" one entry per state. Without --mean-field this builds that many
+# determinants per state; with one it is only cross-checked against the file.
+nterms_arg = (None if args["multi"] is None
+              else [int(v) for v in str(args["multi"]).replace(",", " ").split()])
+if nterms_arg is not None and len(nterms_arg) not in (1, nstates):
+    parser.error(f"--multi needs 1 or {nstates} entries, got {len(nterms_arg)}")
+nterms = ([1] * nstates if nterms_arg is None
+          else nterms_arg * nstates if len(nterms_arg) == 1 else list(nterms_arg))
 pf_backflow = bool(args["pf_backflow"])
 nsweeps = int(args["nbr_sweeps"])
 nsamples = int(args["nbr_samples"])
@@ -281,7 +294,15 @@ if mf_file is not None:
     if len(mf_coeffs) < nstates:
         raise ValueError(f"{mf_file} holds {len(mf_coeffs)} states, need {nstates}; rerun "
                          f"FuzzySphereMeanField.py with a larger --nbr-states and more modes")
-    print(f"mean field: {U.shape[0]} determinants, modes {mf_meta['modes']}, "
+    # Members keep only the determinants their own coefficient vector uses, so the term count is
+    # per state and set by the mode spec. --multi can only agree or disagree: an assertion.
+    mf_nterms = [int(np.count_nonzero(c)) for c in mf_coeffs[:nstates]]
+    if nterms_arg is not None and nterms != mf_nterms:
+        raise ValueError(f"{mf_file} gives its states {mf_nterms} determinants, but --multi "
+                         f"asks for {nterms}; the mode spec sets this, so drop --multi")
+    nterms = mf_nterms
+    print(f"mean field: {U.shape[0]} determinants, {nterms} per state, "
+          f"modes {mf_meta['modes']}, "
           f"energies {[round(e, 6) for e in mf_meta['energies'][:nstates]]}, "
           f"residual |<L^2>-L(L+1)| {mf_meta['residual']}")
 else:
@@ -292,19 +313,6 @@ else:
         U[N,lz] = 1
 
 start_time = datetime.now()
-
-# Factor on the initial backflow weights of a mean-field start. At the quantax default (1.0) the
-# backflow perturbs every orbital of the std-normalised reference enough to cost most of the
-# mean-field energy: exactly 3.1 of 24.9 at N=10 and 6.5 of 35.7 at N=14, and more once the
-# amplitude leaking off the reference's support is counted. Nearly all of the damage is to the
-# *excited* members, which are differences of determinants carrying independent random backflows.
-# At 0.1 the exact loss is 0.08/0.15/0.20 at N=10/12/14, comparable to the scatter between random
-# net draws, with no useful trend in N -- so this needs no size-dependent tuning. It must stay
-# non-zero: the network parameters enter only through `x W^T`, so at zero their gradient vanishes
-# and the SR solve returns nan. Irrelevant for a cold start, where the backflow is the only source
-# of amplitude away from a single configuration.
-MF_BACKFLOW_SCALE = 0.2
-
 
 def init_args(index):
     if mf_coeffs is not None:
@@ -319,7 +327,8 @@ def init_args(index):
     return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)
 
 member_states = [
-    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, **init_args(index))
+    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, nterms=nterms[index],
+                **init_args(index))
     for index in range(nstates)
 ]
 # The last phase of the last stage holds every state, so this is the set the meta block
@@ -348,7 +357,8 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nbr. blocks: {nb}\n")
   f.write(f"nbr. heads: {nh}\n")
   f.write(f"attndim: {d}\n")
-  f.write(f"nbr. params per state: {state_set.states[0].nparams}\n")
+  f.write(f"nbr. params per state: {state_set.nparams_per_state}\n")
+  f.write(f"nterms per state: {nterms}\n")
   f.write(f"nbr. states: {nstates}\n")
   f.write(f"init state file: {init_state_file}\n")
   f.write(f"mean field file: {mf_file}\n")

@@ -124,15 +124,19 @@ for k in range(nstates):
 # Both bases span the same references, so the energies above hold either way; they differ only in
 # how many determinants -- hence networks -- each trained state carries.
 coeffs = result["coeffs"] if orthogonalize else result["weights"].T[:nstates]
+dets_per_state = [int(np.count_nonzero(c)) for c in coeffs]
 print(f"  basis: {'Rayleigh-Ritz (orthogonal states)' if orthogonalize else 'one state per reference'}"
-      f", determinants per state " + ",".join(str(int(np.count_nonzero(c))) for c in coeffs))
+      f", determinants per state " + ",".join(str(v) for v in dets_per_state))
 
-name = f"meanfield_n_{N}_2s_{L-1}_l_{l_target}_lz_{lz}_z2_{z2}.npz"
+# The state count is what a training run has to match, so it belongs in the name: two mode specs
+# for the same sector otherwise overwrite each other.
+name = f"meanfield_n_{N}_2s_{L-1}_l_{l_target}_lz_{lz}_z2_{z2}_nstates_{nstates}.npz"
 path.mkdir(parents=True, exist_ok=True)
 meta = dict(N=N, nm=L, L=l_target, lz=lz, z2=z2, nstates=nstates, modes=spec,
             ndets=ndets, nrefs=result["nrefs"], kphi=result["kphi"], theta=float(vac.theta),
             ps_pot=[float(v) for v in pspot_inter], transverse_fld=transverse_fld,
             params=result["params"], slots=result["slots"], orthogonalize=orthogonalize,
+            dets_per_state=dets_per_state,
             cond=result["cond"], cond_rel=result["cond_rel"],
             energies=[float(e) for e in result["energies"]],
             residual=None if result["residual"] is None else [float(r) for r in result["residual"]])

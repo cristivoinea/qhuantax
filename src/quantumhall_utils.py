@@ -7,6 +7,23 @@ import quantax as qtx
 from pathlib import Path
 
 
+MF_BACKFLOW_SCALE = 0.1
+r"""Factor on the initial backflow weights of a mean-field start.
+"""
+
+
+def scale_backflow(model, scale: float):
+    r"""Shrink the initial backflow weights ``W`` of every determinant in ``model``."""
+    import equinox as eqx
+
+    if scale == 1.0:
+        return model
+    if hasattr(model, "models"):        # MultiDetBackflow: one `W` per determinant
+        return eqx.tree_at(lambda m: [sub.W for sub in m.models], model,
+                           [scale * sub.W for sub in model.models])
+    return eqx.tree_at(lambda m: m.W, model, scale * model.W)
+
+
 def adaptive_learning_rate_exp(lr0, delay, decay, baseline, iteration):
     if iteration < delay:
         return lr0
