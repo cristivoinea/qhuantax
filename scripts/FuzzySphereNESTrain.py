@@ -16,7 +16,6 @@ from qhuantax.nes import (
     NaturalStateSet,
     dense_reduced_matrices,
 )
-from qhuantax.nes.optimizer import _scaled_psi_matrix
 from qhuantax.quantumhall_operators import (
     GetLpTerms,
     GetSpinfulDenIntTerms,
@@ -147,9 +146,11 @@ parser.add_argument("--mean-field", action="store", default=None,
 parser.add_argument("--exact-diag", action="store_true", default=False,
                     help="perform exact diagonalization and track energy, energy variance and overlap with ground state")
 parser.add_argument("--lmlp-coeff", action="store", default=0,
-                    help="coefficient in front of L^- L^+ term")
-parser.add_argument("--lmlp-freq", action="store", default=5,
-                    help="measurement frequency of L^- L^+ term")
+                    help="coefficient in front of the L^- L^+ term added to the Hamiltonian")
+parser.add_argument("--lmlp-freq", action="store", default=1,
+                    help="how often to resolve <H> and <L^- L^+> separately rather than only "
+                         "their optimized sum; 1 (every sweep) costs the ~10-20% overhead of a "
+                         "second Oloc call, and the gradient is the same either way")
 
 parser.add_argument("--multi", action="store", default=None,
                     help="number of determinants each state is built from, either one value for "
@@ -199,7 +200,7 @@ mf_file = args["mean_field"]
 
 do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
-LmLp_freq = float(args["lmlp_freq"])
+LmLp_freq = int(args["lmlp_freq"])
 
 # "2" means every state, "1,1,2" one entry per state. Without --mean-field this builds that many
 # determinants per state; with one it is only cross-checked against the file.
@@ -272,10 +273,11 @@ tms_H = GetSpinfulDenIntTerms(nm = L, ps_pot=2*pspot_inter, mat_a = S1, mat_b = 
 tms_H += transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
 
 
+# Kept out of `tms_H`: the optimizer takes it as a separate operator, so <H> and
+# <L^- L^+> come back separately at every step for the same cost as the sum, and the
+# spectrum readout below stays on the unshifted Hamiltonian.
 tms_Lp = GetLpTerms(L, 2)
 tms_LmLp = tms_Lp.H @ tms_Lp
-if LmLp_coeff:
-    tms_H = tms_H + LmLp_coeff * tms_LmLp
 
 # Mean-field reference: a determinant stack shared by every member, with one Rayleigh-Ritz
 # coefficient vector per state.
@@ -368,8 +370,13 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"warmup sweeps: {warmup_sweeps}\n")
 
 
+# `energy`/`VarE` describe tr(S^-1 (H + lambda L^- L^+)), the quantity the optimizer
+# actually minimizes; `energy_H` is the physical tr(S^-1 H) to compare against ED, and
+# reads nan on the sweeps --lmlp-freq skips. The three coincide with the old two-column
+# output when --lmlp-coeff is 0.
 energy = qtx.utils.DataTracer()
 VarE = qtx.utils.DataTracer()
+energy_H = qtx.utils.DataTracer()
 LmLp_tracer = qtx.utils.DataTracer()
 LmLp_var_tracer = qtx.utils.DataTracer()
 
@@ -430,6 +437,9 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         stage_set,
         tms_H,
         updater=updater,
+        penalty=tms_LmLp,
+        penalty_coeff=LmLp_coeff,
+        penalty_every=LmLp_freq,
         diagnostics=diagnostics,
         diagnostics_every=diagnostics_every)
 
@@ -457,10 +467,18 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         stage_set.update(stage_set.split_step(applied * lr))
         energy.append(optimizer.energy)
         VarE.append(optimizer.VarE)
+        energy_H.append(optimizer.energy_H)
+        LmLp_tracer.append(optimizer.penalty_value)
+        LmLp_var_tracer.append(optimizer.VarPenalty)
 
+        # Columns 0-2 are unchanged, so the existing readers keep working; the penalty
+        # columns are appended. `LmLp` is sum_k L_k(L_k+1) over the members, i.e. 0 once
+        # every state is L = 0.
         np.savetxt(
             f"{path}/data_energy_{run_id}.txt",
-            np.vstack((energy.time, energy.data, VarE.data)).T,
+            np.vstack((energy.time, energy.data, VarE.data, energy_H.data,
+                       LmLp_tracer.data, LmLp_var_tracer.data)).T,
+            header="sweep E_total VarE E_H LmLp VarLmLp",
         )
         if diagnostics:
             append_diagnostics(len(energy.data) - 1, step, optimizer)
