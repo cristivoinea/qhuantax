@@ -147,10 +147,13 @@ parser.add_argument("--exact-diag", action="store_true", default=False,
                     help="perform exact diagonalization and track energy, energy variance and overlap with ground state")
 parser.add_argument("--lmlp-coeff", action="store", default=0,
                     help="coefficient in front of the L^- L^+ term added to the Hamiltonian")
-parser.add_argument("--lmlp-freq", action="store", default=1,
-                    help="how often to resolve <H> and <L^- L^+> separately rather than only "
-                         "their optimized sum; 1 (every sweep) costs the ~10-20% overhead of a "
-                         "second Oloc call, and the gradient is the same either way")
+parser.add_argument("--lmlp-freq", action="store", default=None,
+                    help="how often to measure <L^- L^+>, and with it the unpenalized <H>; "
+                         "0 never does and costs nothing, 1 does it every sweep for the ~20% "
+                         "overhead of a second Oloc call. Independent of --lmlp-coeff: 0 with a "
+                         "coefficient penalizes without measuring, a frequency without a "
+                         "coefficient labels the states by L(L+1) without biasing them. "
+                         "Defaults to 1 with a coefficient and 0 without")
 
 parser.add_argument("--multi", action="store", default=None,
                     help="number of determinants each state is built from, either one value for "
@@ -200,7 +203,10 @@ mf_file = args["mean_field"]
 
 do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
-LmLp_freq = int(args["lmlp_freq"])
+# A penalized run needs the split to report a physical energy at all, so it is on by
+# default there; an unpenalized one gets the plain single-operator cost it had before.
+LmLp_freq = ((1 if LmLp_coeff else 0) if args["lmlp_freq"] is None
+             else int(args["lmlp_freq"]))
 
 # "2" means every state, "1,1,2" one entry per state. Without --mean-field this builds that many
 # determinants per state; with one it is only cross-checked against the file.
@@ -377,6 +383,7 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
 energy = qtx.utils.DataTracer()
 VarE = qtx.utils.DataTracer()
 energy_H = qtx.utils.DataTracer()
+VarE_H = qtx.utils.DataTracer()
 LmLp_tracer = qtx.utils.DataTracer()
 LmLp_var_tracer = qtx.utils.DataTracer()
 
@@ -390,6 +397,7 @@ DIAGNOSTICS_COLUMNS = (
     "sigma_max",      # largest singular value of Obar
     "sigma_min",      # smallest *resolved* one; Obar is centered so one is exactly zero
     "rank_eff",       # resolved directions, at most nsamples - 1
+    "nonfinite",      # samples dropped for an overflowed Eloc, see NaturalTraceEnergyGrad.ebar
 )
 
 
@@ -410,6 +418,7 @@ def append_diagnostics(sweep, step, optimizer):
         float(diag.get("sigma_max", np.nan)),
         float(diag.get("sigma_min", np.nan)),
         float(diag.get("rank_eff", np.nan)),
+        float(optimizer.nonfinite),
     )
     with open(f"{path}/data_diagnostics_{run_id}.txt", "a") as f:
         f.write(" ".join(repr(value) for value in row) + "\n")
@@ -448,11 +457,18 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         step = optimizer.get_step(samples)
 
         # Checked before `update` so the saved checkpoints remain the last good state.
+        # Single overflowed samples no longer reach this -- the optimizer drops them and
+        # reports the count -- so anything that does is a genuine blow-up.
         if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
+            # The tracers below are never reached on this sweep, so without this the
+            # failing sweep leaves no row in either output file.
+            if diagnostics:
+                append_diagnostics(len(energy.data), step, optimizer)
             raise RuntimeError(
                 f"Non-finite update at sweep {len(energy.data)} (K={stage_set.Nstates}, "
                 f"{stage_set.nparams} trainable params); energy={optimizer.energy}, "
-                f"VarE={optimizer.VarE}."
+                f"VarE={optimizer.VarE}, "
+                f"{optimizer.nonfinite} of {nsamples} samples dropped."
             )
 
         # Cap what actually moves the parameters. The updaters' own `norm_clip` bounds
@@ -468,17 +484,19 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
         energy.append(optimizer.energy)
         VarE.append(optimizer.VarE)
         energy_H.append(optimizer.energy_H)
+        VarE_H.append(optimizer.VarE_H)
         LmLp_tracer.append(optimizer.penalty_value)
         LmLp_var_tracer.append(optimizer.VarPenalty)
 
-        # Columns 0-2 are unchanged, so the existing readers keep working; the penalty
-        # columns are appended. `LmLp` is sum_k L_k(L_k+1) over the members, i.e. 0 once
-        # every state is L = 0.
+        # Columns 0-2 are unchanged, so the existing readers keep working; the rest are
+        # appended. `LmLp` is sum_k L_k(L_k+1) over the members, i.e. 0 once every state
+        # is L = 0, and `VarE_H` is the variance that has to vanish at convergence --
+        # `VarE` cannot, since it also carries lambda^2 Var(L^- L^+).
         np.savetxt(
             f"{path}/data_energy_{run_id}.txt",
-            np.vstack((energy.time, energy.data, VarE.data, energy_H.data,
+            np.vstack((energy.time, energy.data, VarE.data, energy_H.data, VarE_H.data,
                        LmLp_tracer.data, LmLp_var_tracer.data)).T,
-            header="sweep E_total VarE E_H LmLp VarLmLp",
+            header="sweep E_total VarE E_H VarE_H LmLp VarLmLp",
         )
         if diagnostics:
             append_diagnostics(len(energy.data) - 1, step, optimizer)
