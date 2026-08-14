@@ -398,6 +398,7 @@ DIAGNOSTICS_COLUMNS = (
     "sigma_min",      # smallest *resolved* one; Obar is centered so one is exactly zero
     "rank_eff",       # resolved directions, at most nsamples - 1
     "nonfinite",      # samples dropped for an overflowed Eloc, see NaturalTraceEnergyGrad.ebar
+    "nonfinite_grad", # samples dropped for a divergent log-derivative, see get_Obar
 )
 
 
@@ -419,6 +420,7 @@ def append_diagnostics(sweep, step, optimizer):
         float(diag.get("sigma_min", np.nan)),
         float(diag.get("rank_eff", np.nan)),
         float(optimizer.nonfinite),
+        float(optimizer.nonfinite_grad),
     )
     with open(f"{path}/data_diagnostics_{run_id}.txt", "a") as f:
         f.write(" ".join(repr(value) for value in row) + "\n")
@@ -468,7 +470,8 @@ def train_stage(stage_set, nsweeps_phase, sweep0):
                 f"Non-finite update at sweep {len(energy.data)} (K={stage_set.Nstates}, "
                 f"{stage_set.nparams} trainable params); energy={optimizer.energy}, "
                 f"VarE={optimizer.VarE}, "
-                f"{optimizer.nonfinite} of {nsamples} samples dropped."
+                f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc, "
+                f"{optimizer.nonfinite_grad} for the log-derivative."
             )
 
         # Cap what actually moves the parameters. The updaters' own `norm_clip` bounds

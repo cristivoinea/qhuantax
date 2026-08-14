@@ -425,6 +425,8 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
             file=file,
         )
         self._Omean = None
+        self._nonfinite_grad = 0
+        self._finite_grad = True
         self._diagnostics_enabled = diagnostics
         self._diagnostics_every = diagnostics_every
         self._diagnostics_calls = 0
@@ -445,8 +447,24 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
 
     @property
     def nonfinite(self) -> Optional[jax.Array]:
-        r"""Samples discarded from the last batch, see the gradient source."""
+        r"""Samples discarded for a non-finite local energy, see the gradient source."""
         return getattr(self._grad, "nonfinite", None)
+
+    @property
+    def nonfinite_grad(self) -> jax.Array:
+        r"""
+        Samples discarded from the last `~NaturalExcitedSR.get_Obar` for a non-finite
+        logarithmic derivative.
+
+        Counted separately from `~NaturalExcitedSR.nonfinite` because the two mean
+        different things: that one says a local energy overflowed, this one says a
+        member state was sampled close enough to a node for its log-derivative to
+        diverge while its amplitude stayed representable. This one is the more
+        informative of the two -- it rises with the peakedness of the Jacobian
+        spectrum, so a run where it climbs is a run whose learning rate is outpacing
+        the ansatz.
+        """
+        return self._nonfinite_grad
 
     @property
     def energy_H(self) -> Optional[jax.Array]:
@@ -588,9 +606,48 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
             reweight = jnp.ones(samples.nsamples)
         else:
             reweight = samples.reweight_factor
+
+        # The same near-node configurations that `ebar` guards against, reaching the
+        # solve by the other side -- and this side has no cancellation to rely on.
+        # `Oloc * psi` keeps a local energy finite however small the amplitude gets, but
+        # Obar *is* the logarithmic derivative: ``d log|psi| / d theta`` grows like the
+        # reciprocal distance to the node while the amplitude only shrinks. So a tuple
+        # can give a perfectly finite `Eloc` and a non-finite Jacobian row on the same
+        # sweep, and the centering below then spreads that one row over all of Obar.
+        # Zeroing the row removes the sample from the Gram matrix outright.
+        finite = jnp.all(jnp.isfinite(Omat), axis=1)
+        nfinite = jnp.count_nonzero(finite)
+        self._nonfinite_grad = samples.nsamples - nfinite
+        self._finite_grad = finite
+        Omat = jnp.where(finite[:, None], Omat, 0.0)
+        reweight = jnp.where(finite, reweight, 0.0)
+
         self._Omean = jnp.mean(Omat * reweight[:, None], axis=0)
         factor = jnp.sqrt(reweight / samples.nsamples)[:, None]
-        Obar = (Omat - jnp.mean(Omat, axis=0, keepdims=True)) * factor
+        # Over the surviving rows, as in `ebar`: `jnp.mean` would divide by `nsamples`
+        # and pull the centre towards zero by whatever the discarded rows would have
+        # contributed.
+        Obar = (Omat - jnp.sum(Omat, axis=0, keepdims=True) / nfinite) * factor
         if self._diagnostics_enabled:
             self._record_diagnostics(Obar)
         return Obar
+
+    def get_step(self, samples: Samples) -> jax.Array:
+        r"""
+        Solve the SR equation, reconciling the two sides' discarded samples.
+
+        `get_Obar` can discard a sample that `~NaturalTraceEnergyGrad.ebar` kept, since a
+        node diverges the logarithmic derivative while leaving the local energy finite.
+        A zeroed Obar row already drops that sample from the Gram matrix, but its
+        `Ebar` entry has to go with it, or the solver is asked to account for a residual
+        along a direction it no longer holds.
+
+        `Ebar` keeps the centering `ebar` gave it, computed before this second mask was
+        known. The leftover is a component along the all-ones vector, which Obar's own
+        centering makes an exact left null vector -- so the solve annihilates it.
+        """
+        Ebar = self.get_Ebar(samples)
+        Obar = self.get_Obar(samples)
+        Ebar = jnp.where(self._finite_grad, Ebar, 0.0)
+        step, self._buffers = self.solve(Obar, Ebar, self._buffers)
+        return step
