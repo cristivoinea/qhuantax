@@ -1,17 +1,25 @@
 r"""Build and diagonalise a mean-field reference set for one fuzzy-sphere symmetry sector.
 
-The sector is ``(L, Lz, Z2)`` and the ansatz is set by ``--modes``, one ``(ell,mu[,kbeta])`` entry
-per *reference*, i.e. per obtainable state. ``kbeta`` is the number of Gauss-Legendre nodes that
-entry's L-projection uses, and hence the determinants it costs; it defaults to 1:
+The sector is ``(L, Lz, Z2)`` and the ansatz is set by ``--modes``: one comma-separated entry per
+*reference*, i.e. per obtainable state. A generator is written as bare digits ``ell[mu[kbeta]]``,
+and ``*`` joins generators into a single reference. ``kbeta`` is the number of Gauss-Legendre nodes
+that entry's L-projection uses, and hence the determinants it costs; it defaults to 1.
 
-    --modes "(0,0),(0,0)"                 U_HF + one tuned N00 rotation      2 dets, 2 states
-    --modes "(0,0),(0,0),(1,0,2)"         the same + an L-projected N10      4 dets, 3 states
-    --modes "(0,0),(0,0),(1,0,2),(1,0,2)" two such projected references      6 dets, 4 states
-    --modes "(1,1),(0,0),(0,0)"           stretched L=1 exciton + two N00    3 dets, 3 states
+N00 is implicit -- every reference carries its own canting angle -- so ``0`` is the reference whose
+only content is that angle, and a spec shorter than ``--nbr-states`` is padded with ``0`` entries.
+Exponents are pinned by the L_z projection rather than written down, so ``11`` means N11 at L=1 and
+N11^2 at L=2, and a generator set is rejected only when no monomial of total shift L exists:
+
+    --modes ""        --nbr-states 2   two N00 rotations                    2 dets, 2 states
+    --modes "102"     --nbr-states 3   two N00 + an L-projected N10         4 dets, 3 states
+    --modes "102,102" --nbr-states 4   two N00 + two projected N10          6 dets, 4 states
+    --modes "11,11"   --nbr-states 2   two N11 references (at L=1)          2 dets, 2 states
+    --modes "11,22"   --nbr-states 2   both stretched partitions of 2       2 dets, 2 states
+    --modes "11*22"   --nbr-states 1   one reference, two generators        1 det,  1 state
 
 Example:
     python FuzzySphereMeanField.py -n 12 -s 11 --l-sect 0 --lz-sect 0 --z2-sect 1 \
-        --nbr-states 3 --modes "(0,0),(0,0),(1,0,2)" --path .
+        --nbr-states 3 --modes "102" --path .
 """
 import argparse
 import json
@@ -30,8 +38,10 @@ parser.add_argument("--lz-sect", required=True, help="Lz symmetry sector")
 parser.add_argument("--z2-sect", default=1, help="Z2 symmetry sector")
 parser.add_argument("--nbr-states", default=1, help="number of states to solve for")
 parser.add_argument("--modes", required=True,
-                    help="one (L,Lz[,kbeta]) entry per state, kbeta being that reference's "
-                         "L-projection nodes (number of terms needed); ")
+                    help="one entry per state, each a generator as bare digits ell[mu[kbeta]], "
+                         "with '*' joining generators into one reference; kbeta is that "
+                         "reference's L-projection nodes (the terms it costs). N00 is implicit, so "
+                         "a spec shorter than --nbr-states is padded with '0' references")
 parser.add_argument("--nbr-terms", default=None,
                     help="number of terms of each returned state, either one value for all of "
                          "them or one per state. Set by --modes and --orthogonalize, so this is "
@@ -92,9 +102,10 @@ tms_H -= transverse_fld * GetSpinfulPolTerms(nm=L, mat=SX)
 # z2 makes this variation *after* projection: the sampler always projects, so the angle that
 # extremises the projected energy is the right one, not the one extremising E_HF.
 vac = hf_vacuum(L, 2 * pspot_inter, transverse_fld, z2=z2)
-refs, _, nterms, nfree = mode_references(vac, spec, l_target)
-if nstates > len(refs):
-    parser.error(f"cannot provide {nstates} states with only {len(refs)} references")
+try:
+    refs, nterms, nfree = mode_references(vac, spec, l_target, nstates=nstates)
+except ValueError as exc:
+    parser.error(str(exc))
 
 
 terms_per_state = ([nterms] * nstates if orthogonalize

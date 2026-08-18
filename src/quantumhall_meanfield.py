@@ -161,87 +161,157 @@ def beta_quadrature(kbeta: int, L: int):
     return betas, 0.5 * w * np.cos(betas / 2) ** (2 * L)
 
 
+def _parse_generator(tok: str, spec: str):
+    r"""``'102'`` -> ``(1, 0, 2)``: one digit each to :math:`\ell`, :math:`\mu`, :math:`k_\beta`."""
+    tok = tok.strip()
+    if not tok.isdigit() or not 1 <= len(tok) <= 3:
+        raise ValueError(
+            f"generator {tok!r} in mode spec {spec!r} must be 1-3 digits, one each for ell, mu "
+            "and kbeta (mu and kbeta default to 0 and 1)"
+        )
+    ell, mu, kb = int(tok[0]), int(tok[1]) if len(tok) > 1 else 0, int(tok[2]) if len(tok) > 2 else 1
+    if kb < 1:
+        raise ValueError(f"generator {tok!r} needs kbeta >= 1")
+    if mu > ell:
+        raise ValueError(f"generator {tok!r} has mu > ell, which is not a multipole component")
+    return ell, mu, kb
+
+
 def parse_modes(spec: str):
-    """``'(0,0),(0,0),(1,0,2)'`` -> ``[(0, 0, 1), (0, 0, 1), (1, 0, 2)]``, ``kbeta`` defaulting to 1."""
-    import re
+    r"""Mode spec -> one list of ``(ell, mu, kbeta)`` generators **per reference**.
 
-    groups = re.findall(r"\(([^()]*)\)", spec)
-    if not groups:
-        raise ValueError(f"no (ell,mu[,kbeta]) entries found in mode spec {spec!r}")
-    entries = []
-    for g in groups:
-        try:
-            parts = [int(v) for v in g.replace(",", " ").split()]
-        except ValueError:
-            raise ValueError(f"entry ({g}) in mode spec {spec!r} is not integer") from None
-        if len(parts) == 2:
-            parts = parts + [1]
-        if len(parts) != 3:
-            raise ValueError(f"entry ({g}) must be (ell,mu) or (ell,mu,kbeta)")
-        if parts[2] < 1:
-            raise ValueError(f"entry ({g}) needs kbeta >= 1")
-        entries.append(tuple(parts))
-    return entries
+    One comma-separated entry is one reference, hence one state; ``*`` joins generators into a
+    single reference, whose one determinant is built from the sum of their tensors. A generator is
+    bare digits filling :math:`\ell`, :math:`\mu`, :math:`k_\beta` in that order::
+
+        ""         -> []                                   every reference implicit (see below)
+        "0,0"      -> [[(0,0,1)], [(0,0,1)]]                two N00 references
+        "0,0,102"  -> [[(0,0,1)], [(0,0,1)], [(1,0,2)]]     plus an L-projected N10 at kbeta=2
+        "11,11"    -> [[(1,1,1)], [(1,1,1)]]                two N11 references
+        "11,22"    -> [[(1,1,1)], [(2,2,1)]]                one per stretched partition of 2
+        "11*22"    -> [[(1,1,1), (2,2,1)]]                  one reference, two generators
+
+    An empty spec yields no explicit references; ``mode_references`` then pads with
+    :math:`\mathcal{N}_{00}` up to ``nstates``. Since every field is a single digit, ell, mu and
+    kbeta are capped at 9 -- far above anything these references use.
+    """
+    spec = spec.strip()
+    if not spec:
+        return []
+    out = []
+    for group in spec.split(","):
+        group = group.strip()
+        if not group:
+            raise ValueError(f"empty reference in mode spec {spec!r}")
+        out.append([_parse_generator(t, spec) for t in group.split("*")])
+    return out
 
 
-def mode_references(vac: HFVacuum, spec: str, L: int):
+def _degrees_reachable(mus, L: int) -> bool:
+    r"""Is :math:`\sum_i a_i\mu_i=L` solvable in integers :math:`a_i\ge1`?
+
+    The exponents are not ours to choose: the :math:`L_z` projection keeps exactly the monomials of
+    total shift ``L``, so a generator set is usable in that sector iff at least one such monomial
+    exists. With one generator this is just :math:`\mu\mid L`.
+    """
+    base = sum(mus)
+    if L < base:
+        return False
+    rem = L - base
+    ok = [False] * (rem + 1)
+    ok[0] = True
+    for r in range(1, rem + 1):
+        ok[r] = any(r >= m and ok[r - m] for m in mus)
+    return ok[rem]
+
+
+def mode_references(vac: HFVacuum, spec: str, L: int, nstates: int | None = None):
     r"""Reference descriptors of a mode spec, in Rayleigh-Ritz basis order.
 
+    One comma-separated entry of the spec is one reference, hence one state, and every reference
+    carries its **own** base matrix -- so ``"11,22"`` at :math:`L=2` is the two stretched partitions
+    of 2 side by side, which a single global base could not express. :math:`\mathcal{N}_{00}` is
+    implicit: every reference gets a canting angle, and a bare ``"0"`` entry is the reference whose
+    only content is that angle. If ``nstates`` exceeds the entries given, the spec is padded at the
+    front with ``"0"`` references, so ``""`` at ``nstates=2`` is two :math:`\mathcal{N}_{00}`'s.
+
+    Exponents are pinned by the :math:`L_z` projection rather than written down, so ``"11"`` means
+    :math:`\mathcal{N}_{11}` at :math:`L=1` and :math:`\mathcal{N}_{11}^2` at :math:`L=2`; a
+    generator set is rejected only when no monomial of total shift ``L`` exists at all (which is
+    what makes ``"22"`` illegal at :math:`L=1`).
+
     :return:
-        ``(refs, Mbase, ndets, nfree)``: one dict per basis vector, the stretched base matrix, the
-        determinants the stack will hold, and the free parameters to optimise. Each ref carries
-        ``mmax``, the largest :math:`|\mu|` its own determinants contain, which is all that sets its
-        gauge count -- a plain reference is the unrotated base, while a beta rotation spreads every
-        generator over all :math:`|\mu|\le\ell`.
+        ``(refs, ndets, nfree)``: one dict per basis vector, the determinants the stack will hold,
+        and the free parameters to optimise. Each ref carries its ``Mbase``, and ``mmax``, the
+        largest :math:`|\mu|` its own determinants contain, which is all that sets its gauge count
+        -- a plain reference is the unrotated base, while a beta rotation spreads every generator
+        over all :math:`|\mu|\le\ell`.
     """
     nm = vac.nm
-    entries = parse_modes(spec)
-
-    stretched, i = [], 0
-    while i < len(entries) and entries[i][1] != 0:
-        ell, mu, kb = entries[i]
-        if kb != 1:
-            raise ValueError(f"stretched entry ({ell},{mu},{kb}) cannot carry a projection count")
-        stretched.append((ell, mu))
-        i += 1
-    if any(mu != 0 for _, mu, _ in entries[i:]):
-        raise ValueError("stretched (mu != 0) entries must come first in the mode spec")
-    if sum(mu for _, mu in stretched) != L:
-        raise ValueError(
-            f"stretched entries {stretched} carry Lz={sum(mu for _, mu in stretched)}, "
-            f"but the requested sector is L={L}; at L=0 give no mu!=0 entries"
-        )
-    Mbase = sum((multipole_tensor(nm, ell, mu) for ell, mu in stretched), np.zeros((nm, nm)))
-    mumax = max((abs(mu) for _, mu in stretched), default=0)
-    lmax = max((ell for ell, _ in stretched), default=0)
+    groups = parse_modes(spec)
+    if nstates is not None:
+        if nstates < 1:
+            raise ValueError(f"nstates must be >= 1, got {nstates}")
+        if len(groups) > nstates:
+            raise ValueError(
+                f"mode spec {spec!r} gives {len(groups)} references but only {nstates} states were "
+                "asked for; drop an entry or raise nstates"
+            )
+        groups = [[(0, 0, 1)]] * (nstates - len(groups)) + groups
+    if not groups:
+        raise ValueError("mode spec produced no references; give entries or pass nstates")
 
     refs, ndets = [], 0
-    if stretched:
-        # The stretched base is the monomial itself; giving it a weight would blur that.
-        refs.append(dict(kind="plain", ell=0, kbeta=1, slots=(), mmax=mumax))
-        ndets += 1
-    for ell, _, kb in entries[i:]:
-        if ell == 0:
-            if kb != 1:
-                raise ValueError(f"(0,0,{kb}) makes no sense: N00 is a scalar, already exact-L")
-            refs.append(dict(kind="plain", ell=0, kbeta=1, slots=("angle",), mmax=mumax))
-            ndets += 1
-        else:
-            refs.append(dict(kind="proj", ell=ell, kbeta=kb, slots=("exciton", "angle"),
-                             mmax=max(lmax, ell)))
+    for gens in groups:
+        tag = "*".join(f"{e}{m}{k}" for e, m, k in gens)
+        stretch = [(e, m) for e, m, _ in gens if m > 0]
+        proj = [(e, k) for e, m, k in gens if m == 0 and e > 0]
+        zeros = [g for g in gens if g[0] == 0]
+        if zeros and len(gens) > 1:
+            raise ValueError(
+                f"reference {tag!r}: a 0 generator inside a * group is redundant, every reference "
+                "already carries an N00 angle"
+            )
+        if len(proj) > 1:
+            raise ValueError(f"reference {tag!r} has two mu=0 projected generators; keep one")
+        if any(k != 1 for _, m, k in gens if m > 0):
+            raise ValueError(
+                f"reference {tag!r}: a stretched (mu > 0) generator needs no kbeta -- L_z alone "
+                "makes it exact-L"
+            )
+        if stretch and not _degrees_reachable([m for _, m in stretch], L):
+            raise ValueError(
+                f"reference {tag!r} carries mu = {[m for _, m in stretch]}, which cannot sum to "
+                f"L={L} with every exponent >= 1"
+            )
+        # `parts[0]` is the base; a `mix` amplitude scales each later generator against it. The
+        # overall tensor scale is inert (the L_z projection makes it a pure factor) but the ratio
+        # between two generators is not, so only the extras carry a parameter.
+        parts = [multipole_tensor(nm, e, m) for e, m in stretch]
+        Mbase = parts[0] if parts else np.zeros((nm, nm))
+        mix = ("mix",) * max(len(parts) - 1, 0)
+        if proj:
+            ell, kb = proj[0]
+            refs.append(dict(kind="proj", ell=ell, kbeta=kb, Mbase=Mbase, parts=parts, tag=tag,
+                             slots=mix + ("exciton", "angle"),
+                             mmax=max([ell] + [e for e, _ in stretch])))
             ndets += kb
-    if not refs:
-        raise ValueError("mode spec produced no references")
-    if len(refs) == 1 and refs[0]["slots"] == ("angle",):
-        # One canted vacuum, and `hf_vacuum` already returns the angle that extremises its
-        # (projected) energy in closed form, so there is nothing left to search.
+        else:
+            refs.append(dict(kind="plain", ell=0, kbeta=1, Mbase=Mbase, parts=parts, tag=tag,
+                             slots=mix + ("angle",),
+                             mmax=max((m for _, m in stretch), default=0)))
+            ndets += 1
+    if len(refs) == 1 and refs[0]["kind"] == "plain" and not refs[0]["Mbase"].any():
+        # One *bare* canted vacuum, and `hf_vacuum` already returns the angle that extremises its
+        # (projected) energy in closed form, so there is nothing left to search. This does not
+        # extend to a lone stretched reference, whose best angle is not the bare vacuum's.
         refs[0]["slots"] = ()
     for r in refs:
         r["free"] = len(r["slots"])
-    return refs, Mbase, ndets, sum(r["free"] for r in refs)
+    return refs, ndets, sum(r["free"] for r in refs)
 
 
-def mode_stack(vac: HFVacuum, refs, Mbase, params, L: int):
+def mode_stack(vac: HFVacuum, refs, params, L: int):
     r"""Determinant stack and grouping matrix of a mode spec.
 
     :return:
@@ -249,17 +319,24 @@ def mode_stack(vac: HFVacuum, refs, Mbase, params, L: int):
         fixed quadrature weights so that reference ``r`` is ``sum_d W[d, r] |Phi(U0[d])>``. A plain
         reference occupies one row of ``W``, a projected one its ``kbeta`` rows.
 
-    ``"angle"`` slots hold a canting-angle offset in radians, converted here to the chart
-    coordinate by ``lam = tan(delta/2)``; ``"exciton"`` slots hold the multipole amplitude directly.
+    Each reference is built on its own ``Mbase``. ``"angle"`` slots hold a canting-angle offset in
+    radians, converted here to the chart coordinate by ``lam = tan(delta/2)``; ``"exciton"`` slots
+    hold the multipole amplitude directly, and ``"mix"`` slots rescale the second and later
+    stretched generators relative to the first -- the overall scale is inert under the :math:`L_z`
+    projection, the ratio is not.
     """
     nm = vac.nm
     Us, cols, p = [], [], 0
     for r in refs:
+        M = r["Mbase"]
+        for j in range(r["slots"].count("mix")):
+            M = M + params[p] * r["parts"][j + 1]
+            p += 1
         if r["kind"] == "plain":
             lam = 0.0
             if "angle" in r["slots"]:
                 lam, p = np.tan(params[p] / 2), p + 1
-            Us.append(chart(vac, Mbase + lam * np.eye(nm)))
+            Us.append(chart(vac, M + lam * np.eye(nm)))
             cols.append(([len(Us) - 1], [1.0]))
         else:
             c, lam = params[p], np.tan(params[p + 1] / 2)
@@ -268,7 +345,7 @@ def mode_stack(vac: HFVacuum, refs, Mbase, params, L: int):
             idx, wts = [], []
             for beta, w in zip(*beta_quadrature(r["kbeta"], L)):
                 D = wigner_dy(nm, beta)
-                Us.append(chart(vac, D @ (Mbase + c * T) @ D.T + lam * np.eye(nm)))
+                Us.append(chart(vac, D @ (M + c * T) @ D.T + lam * np.eye(nm)))
                 idx.append(len(Us) - 1)
                 wts.append(w)
             cols.append((idx, wts))
@@ -427,17 +504,12 @@ def solve_modes(
 
     from scipy.optimize import minimize
 
-    refs, Mbase, ndets, nfree = mode_references(vac, spec, L)
+    refs, ndets, nfree = mode_references(vac, spec, L, nstates=nstates)
     nrefs = len(refs)
-    if nstates > nrefs:
-        raise ValueError(
-            f"mode spec gives {nrefs} references, so at most {nrefs} states; asked for {nstates}. "
-            "Add another (0,0) or (ell,0,kbeta) entry."
-        )
     kphi = mode_kphi_list(vac, refs, lz)
 
     def reduced(params, terms):
-        U0, W = mode_stack(vac, refs, Mbase, params, L)
+        U0, W = mode_stack(vac, refs, params, L)
         A, S = reduced_matrices(vac, U0, lz, z2, kphi, terms)
         return W.conj().T @ A @ W, W.conj().T @ S @ W, U0, W
 
@@ -465,7 +537,8 @@ def solve_modes(
     best = (np.inf, np.zeros(nfree))
     if nfree:
         starts = []
-        pure_angles = all(s == "angle" for s in slot_kinds) and not Mbase.any()
+        pure_angles = (all(s == "angle" for s in slot_kinds)
+                       and not any(r["Mbase"].any() for r in refs))
         if pure_angles and nfree <= 3:
             # Every reference is a canted vacuum, so this is a set of angles on an interval that
             # ANGLE_SCAN covers completely -- scan it. Only strictly increasing tuples: the plain
