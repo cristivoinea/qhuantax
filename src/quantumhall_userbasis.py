@@ -98,6 +98,18 @@ def _generate_lz_basis_states(
     return np.ascontiguousarray(states)
 
 
+def _count_flavour_fixed(states: np.ndarray, L: int) -> int:
+    """Number of states left invariant by the up/down flavour flip.
+
+    With the bit convention ``bit_pos = Nmodes - mode - 1`` the up orbitals
+    ``mode = 0, ..., L-1`` occupy the high ``L`` bits and the down orbitals the
+    low ``L`` bits, so a state is invariant iff the two halves agree.
+    """
+    s = states.astype(np.uint64)
+    mask = np.uint64((1 << L) - 1)
+    return int(np.count_nonzero((s >> np.uint64(L)) == (s & mask)))
+
+
 @cfunc(op_sig_32, locals=dict(bit=uint32, occ=uint32, lower=uint32, parity=int32))
 def _fermion_op_32(op_struct_ptr, op_str, site_ind, Nmodes, args):
     op_struct = carray(op_struct_ptr, 1)[0]
@@ -245,17 +257,27 @@ def _flavour_flip_64(s, Nmodes, sign_ptr, args):
 
 
 def _make_pcon_dict(dtype: np.dtype, states: np.ndarray, Nparticles: int) -> dict:
+    Ns_pcon = int(states.size)
+
+    # QuSpin calls next_state once per iteration, including the last one at
+    # counter = Ns - 1, so `_next_precomputed_*` reads args[Ns]. That value is
+    # discarded, but the read has to stay in bounds: pad by one sentinel while
+    # still reporting the true sector size through get_Ns_pcon.
+    next_state_args = np.ascontiguousarray(
+        np.concatenate([states, states[-1:]]), dtype=dtype
+    )
+
     def get_s0_pcon(Nmodes: int, Nparticles: int) -> int:
         return int(states[0])
 
     def get_Ns_pcon(Nmodes: int, Nparticles: int) -> int:
-        return int(states.size)
+        return Ns_pcon
 
     if dtype == np.uint32:
         return {
             "Np": Nparticles,
             "next_state": _next_precomputed_32,
-            "next_state_args": states,
+            "next_state_args": next_state_args,
             "get_Ns_pcon": get_Ns_pcon,
             "get_s0_pcon": get_s0_pcon,
             "count_particles": _count_particles_32,
@@ -265,7 +287,7 @@ def _make_pcon_dict(dtype: np.dtype, states: np.ndarray, Nparticles: int) -> dic
     return {
         "Np": Nparticles,
         "next_state": _next_precomputed_64,
-        "next_state_args": states,
+        "next_state_args": next_state_args,
         "get_Ns_pcon": get_Ns_pcon,
         "get_s0_pcon": get_s0_pcon,
         "count_particles": _count_particles_64,
@@ -314,7 +336,13 @@ def make_lz_user_basis(
 
     if Ns_block_est is None:
         if flavour_eigval is not None:
-            Ns_block_est = max(1, states.size // 2 + 2)
+            # The Z2 block sizes are *not* Ns/2 each. Writing F for the number of
+            # flip-invariant states, the Ns - F remaining states form (Ns - F)/2
+            # orbits contributing one representative to each sector, while all F
+            # invariant states land in whichever single sector matches the
+            # fermionic sign the flip carries on them. Hence the larger sector has
+            # (Ns + F)/2 states, which Ns//2 underestimates whenever F > 0.
+            Ns_block_est = max(1, (states.size + _count_flavour_fixed(states, L)) // 2)
         else:
             Ns_block_est = max(1, states.size)
 
