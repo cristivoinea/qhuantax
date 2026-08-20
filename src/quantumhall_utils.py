@@ -1,6 +1,7 @@
 from typing import Optional
 
 import numpy as np
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import quantax as qtx
@@ -10,6 +11,46 @@ from pathlib import Path
 MF_BACKFLOW_SCALE = 0.1
 r"""Factor on the initial backflow weights of a mean-field start.
 """
+
+
+def check_param_file(model, param_file) -> None:
+    """Refuse a checkpoint that was not written by this model's tree.
+
+    ``eqx.tree_deserialise_leaves`` walks the *target* tree and calls ``jnp.load`` once
+    per leaf, in traversal order, with no check that the arrays coming off the file
+    belong in those slots. Reading a multi-determinant checkpoint into a single
+    determinant therefore succeeds silently: it consumes the first few arrays, leaves the
+    rest of the file unread, and hands back a model assembled from the wrong slots.
+
+    Comparing leaf shapes afterwards catches the misplacement, and requiring the file to
+    be exhausted catches a checkpoint with more leaves than the model. A checkpoint with
+    fewer already fails inside ``jnp.load``.
+    """
+    if not isinstance(param_file, (str, Path)):
+        return  # a file-like object cannot be reopened for the check
+
+    path = Path(param_file)
+    if path.suffix == "":
+        path = path.with_suffix(".eqx")
+
+    with path.open("rb") as f:
+        loaded = eqx.tree_deserialise_leaves(f, model)
+        trailing = f.read(1)
+
+    before = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    after = jax.tree_util.tree_leaves(eqx.filter(loaded, eqx.is_array))
+    bad = [(i, a.shape, b.shape)
+           for i, (a, b) in enumerate(zip(before, after)) if a.shape != b.shape]
+
+    if bad or trailing:
+        detail = (f"leaf {bad[0][0]} expects shape {bad[0][1]} but the file holds "
+                  f"{bad[0][2]}" if bad else
+                  "the file holds more arrays than the model has leaves")
+        raise ValueError(
+            f"{path} does not match the model it is being loaded into: {detail}. "
+            "The ansatz is built from the term count, the network geometry and "
+            "--pf-backflow; one of them differs from the run that wrote this file."
+        )
 
 
 def scale_backflow(model, scale: float):
@@ -170,7 +211,24 @@ def _parse_meta_value(raw_value):
     try:
         return float(value)
     except ValueError:
-        return value
+        pass
+
+    if value.startswith("[") and value.endswith("]"):
+        # Sequences reach the file through `str(list)` or numpy's repr, so the separator
+        # is a comma or bare whitespace. Anything whose entries are not all numbers stays
+        # a string, rather than coming back as a half-converted list.
+        parsed = []
+        for token in value[1:-1].replace(",", " ").split():
+            try:
+                parsed.append(int(token))
+            except ValueError:
+                try:
+                    parsed.append(float(token))
+                except ValueError:
+                    return value
+        return parsed
+
+    return value
 
 
 def read_meta_file(run_id, path="."):

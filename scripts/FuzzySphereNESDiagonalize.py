@@ -1,5 +1,4 @@
 import quantax as qtx
-from qhuantax.quantumhall_transformer import Transformer
 import jax.numpy as jnp
 import numpy as np
 import scipy as sp
@@ -7,6 +6,7 @@ from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolT
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_utils import generate_spin_configs, read_meta_file
+from qhuantax.quantumhall_transformer import transformer_backflow_state
 from qhuantax.nes.subspace import dense_reduced_matrices
 from qhuantax.nes.state_set import NaturalStateSet
 
@@ -23,8 +23,9 @@ parser.add_argument("-n", action="store", required=True,
                     help="number of particles")
 parser.add_argument("-s", action="store", required=True,
                     help="number of orbitals in the system (2s)")
-parser.add_argument("--nbr-states", action="store", default=2,
-                    help="number of NES states")
+parser.add_argument("--nbr-states", action="store", default=None,
+                    help="how many of the run's states to span, defaults to all of them; "
+                         "fewer is a smaller trial subspace and so a different spectrum")
 parser.add_argument("--lz-sect", action="store", required=True,
                     help="Lz symmetry sector")
 parser.add_argument("--z2-sect", action="store", default=0,
@@ -45,7 +46,8 @@ parser.add_argument("--sampling-state-index", action="store", default=0,
 parser.add_argument("--meas-op", action="store", default="H",
                     help="measured operator")
 parser.add_argument("--pf-backflow", action="store_true", default=False,
-                    help="change the ansatz structure from PfBackflow to DetBackflow")
+                    help="assert the run used PfBackflow; the meta file settles it either way, "
+                         "so this only ever agrees or errors")
 
 parser.add_argument("--run-id", action="store", default=1,
                     help="")
@@ -56,7 +58,7 @@ args = vars(parser.parse_args())
 
 N = int(args["n"])
 L = int(args["s"])+1
-nstates = int(args["nbr_states"])
+nstates = None if args["nbr_states"] is None else int(args["nbr_states"])
 lz = int(args["lz_sect"])
 z2 = int(args["z2_sect"])
 ph = int(args["ph_sect"])
@@ -94,10 +96,29 @@ if meas_op == "H":
     tms_O += transverse_fld * GetSpinfulPolTerms(nm=L, mat = SX)
 
 
-# initialize NQS
+# Rebuild the ansatz with exactly the tree it was trained with. Everything that fixes
+# that tree comes from the run's own meta file rather than the command line -- network
+# geometry, determinants per member, and which backflow -- since a mismatch does not
+# raise on load, it quietly fills the model from the wrong slots (see `check_param_file`).
 nb = int(meta_dict["nbr. blocks"])
 nh = int(meta_dict["nbr. heads"])
 d = int(meta_dict["attndim"])
+
+meta_nstates = int(meta_dict["nbr. states"])
+if nstates is None:
+    nstates = meta_nstates
+elif nstates > meta_nstates:
+    parser.error(f"{run_id} holds {meta_nstates} states, cannot span {nstates}")
+
+meta_pf = str(meta_dict.get("model", "DetBackflow")) == "PfBackflow"
+if pf_backflow and not meta_pf:
+    parser.error(f"{run_id} was trained with {meta_dict['model']}; drop --pf-backflow")
+pf_backflow = meta_pf
+
+# Runs that predate the entry are single-determinant; `check_param_file` says so if not.
+nterms = meta_dict.get("nterms per state", [1] * meta_nstates)
+if isinstance(nterms, int):
+    nterms = [nterms] * meta_nstates
 
 U = np.zeros((2*L, N))
 U[:N,:N] = np.eye(N)
@@ -105,27 +126,17 @@ if lz != 0:
     U[0,0] = 0
     U[N,lz] = 1
 
-states = []
-for index in range(nstates):
-    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-
-    if pf_backflow:
-        U_pf = jnp.zeros((2*L, 2*L))
-        for i in range(N):
-            U_pf = U_pf.at[:,2*i].add(U[:,i])
-        model = qtx.model.PfBackflow(net, U0=U_pf, d=d)
-    else:
-        model = qtx.model.DetBackflow(net, U0=U, d=d)
-
-    states.append(
-        qtx.state.Variational(
-            model,
-            symm=symm,
-            max_parallel=16384,
-            param_file=f"{path}/state{index}_{run_id}.eqx",
-        )
-    )
-states = NaturalStateSet(states)
+# `orbital_noise=0`: every leaf is about to be overwritten from the checkpoint, so only
+# the shape of `U` matters here, never its value.
+states = NaturalStateSet([
+    transformer_backflow_state(index, L, N, d, nb, nh, symm, pf_backflow, U,
+                               orbital_noise=0, nterms=nterms[index],
+                               param_file=f"{path}/state{index}_{run_id}.eqx")
+    for index in range(nstates)
+])
+print(f"{nstates} of {meta_nstates} states, "
+      f"{'PfBackflow' if pf_backflow else 'DetBackflow'}, "
+      f"{nterms[:nstates]} terms per state")
 
 startTime = datetime.now()
 if do_ED:

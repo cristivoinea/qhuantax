@@ -184,16 +184,12 @@ def parse_modes(spec: str):
     single reference, whose one determinant is built from the sum of their tensors. A generator is
     bare digits filling :math:`\ell`, :math:`\mu`, :math:`k_\beta` in that order::
 
-        ""         -> []                                   every reference implicit (see below)
+        ""         -> []                                   every reference implicit
         "0,0"      -> [[(0,0,1)], [(0,0,1)]]                two N00 references
         "0,0,102"  -> [[(0,0,1)], [(0,0,1)], [(1,0,2)]]     plus an L-projected N10 at kbeta=2
         "11,11"    -> [[(1,1,1)], [(1,1,1)]]                two N11 references
         "11,22"    -> [[(1,1,1)], [(2,2,1)]]                one per stretched partition of 2
         "11*22"    -> [[(1,1,1), (2,2,1)]]                  one reference, two generators
-
-    An empty spec yields no explicit references; ``mode_references`` then pads with
-    :math:`\mathcal{N}_{00}` up to ``nstates``. Since every field is a single digit, ell, mu and
-    kbeta are capped at 9 -- far above anything these references use.
     """
     spec = spec.strip()
     if not spec:
@@ -227,19 +223,6 @@ def _degrees_reachable(mus, L: int) -> bool:
 
 def mode_references(vac: HFVacuum, spec: str, L: int, nstates: int | None = None):
     r"""Reference descriptors of a mode spec, in Rayleigh-Ritz basis order.
-
-    One comma-separated entry of the spec is one reference, hence one state, and every reference
-    carries its **own** base matrix -- so ``"11,22"`` at :math:`L=2` is the two stretched partitions
-    of 2 side by side, which a single global base could not express. :math:`\mathcal{N}_{00}` is
-    implicit: every reference gets a canting angle, and a bare ``"0"`` entry is the reference whose
-    only content is that angle. If ``nstates`` exceeds the entries given, the spec is padded at the
-    front with ``"0"`` references, so ``""`` at ``nstates=2`` is two :math:`\mathcal{N}_{00}`'s.
-
-    Exponents are pinned by the :math:`L_z` projection rather than written down, so ``"11"`` means
-    :math:`\mathcal{N}_{11}` at :math:`L=1` and :math:`\mathcal{N}_{11}^2` at :math:`L=2`; a
-    generator set is rejected only when no monomial of total shift ``L`` exists at all (which is
-    what makes ``"22"`` illegal at :math:`L=1`).
-
     :return:
         ``(refs, ndets, nfree)``: one dict per basis vector, the determinants the stack will hold,
         and the free parameters to optimise. Each ref carries its ``Mbase``, and ``mmax``, the

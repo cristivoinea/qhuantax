@@ -1,7 +1,6 @@
 import quantax as qtx
-from qhuantax.quantumhall_transformer import Transformer
+from qhuantax.quantumhall_transformer import transformer_backflow_state
 import equinox as eqx
-import jax.numpy as jnp
 import numpy as np
 from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
@@ -10,12 +9,9 @@ from qhuantax.quantumhall_utils import (
     adaptive_learning_rate_inv,
     generate_spin_configs,
     diagonalize_lz_multiplet,
-    scale_backflow,
 )
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
-from qhuantax.quantumhall_meanfield import backflow_coeffs
-from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
 
 import json
 from datetime import datetime
@@ -200,66 +196,18 @@ startTime = datetime.now()
 
 # start NN training
 if mf_coeffs is not None:
-    if pf_backflow:
-        raise ValueError("--mean-field builds determinants; drop --pf-backflow")
-    # Only the determinants this state actually uses. Carrying the others would give each a network
-    # whose coefficient is zero, so its gradient vanishes identically -- a singular SR solve, and
-    # `ndets` times the parameters. Without --orthogonalize the mean-field driver writes one
-    # reference per state, so this is usually a small subset of the stack.
-    used = np.flatnonzero(mf_coeffs)
-    U_mf, c_mf = U[used], mf_coeffs[used]
-
-    if len(used) == 1:
-        net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-        model = qtx.model.DetBackflow(net, U0=jnp.asarray(U_mf[0]), d=d)
-    else:
-        net = tuple(Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_mf)
-        model = MultiDetBackflow(
-            nets=net,
-            U0=jnp.asarray(U_mf),
-            # `DetBackflow` divides each determinant by its own std, which would destroy the
-            # relative weights; `backflow_coeffs` undoes exactly that.
-            coeffs=jnp.asarray(backflow_coeffs(U_mf, c_mf)),
-            d=d,
-        )
-    model = scale_backflow(model, MF_BACKFLOW_SCALE)
-
+    # `U` is the determinant stack and `mf_coeffs` this state's vector over it; the builder
+    # keeps only the determinants the vector actually uses, and shrinks the backflow so the
+    # mean-field reference is what the run opens from.
+    state = transformer_backflow_state(0, L, N, d, nb, nh, symm, pf_backflow, U,
+                                       coeffs=mf_coeffs, orbital_noise=0,
+                                       backflow_scale=MF_BACKFLOW_SCALE)
 else:
-    if nterms > 1:
-        net = tuple(
-        Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-        for _ in range(nterms))
-    else:
-        net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-
-    if pf_backflow:
-        U0s = []
-        for alpha in range(nterms):
-            U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-
-            U_pf = jnp.zeros((2 * L, 2 * L))
-            for i in range(N):
-                U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
-
-            U0s.append(U_pf)
-
-        if nterms > 1:
-            model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
-        else:
-            model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
-    else:
-        U0s = []
-        for alpha in range(nterms):
-            U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-            U0s.append(U_alpha)
-
-        if nterms > 1:
-            model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
-        else:
-            model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
-
-
-state = qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False)
+    # A sum gets its own 1e-2 perturbation per term, so that the terms differ; a single term
+    # has nothing to be separated from and takes the same perturbation as `orbital_noise`.
+    state = transformer_backflow_state(0, L, N, d, nb, nh, symm, pf_backflow, U,
+                                       orbital_noise=(1e-2 if nterms == 1 else 0),
+                                       nterms=nterms)
 
 
 with open(f"{path}/meta_{run_id}.txt", "w") as f:

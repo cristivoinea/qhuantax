@@ -8,7 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 import quantax as qtx
 import scipy as sp
-from qhuantax.quantumhall_transformer import Transformer
 
 from qhuantax.nes import (
     NaturalExcitedSR,
@@ -16,19 +15,17 @@ from qhuantax.nes import (
     NaturalStateSet,
     dense_reduced_matrices,
 )
+from qhuantax.quantumhall_transformer import transformer_backflow_state
 from qhuantax.quantumhall_operators import (
     GetLpTerms,
     GetSpinfulDenIntTerms,
     GetSpinfulPolTerms,
 )
-from qhuantax.quantumhall_meanfield import backflow_coeffs
-from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
 from qhuantax.quantumhall_symmetries import FlavourPermQH, IdentityQH, ParticleHoleQH
 from qhuantax.quantumhall_utils import (
     MF_BACKFLOW_SCALE,
     adaptive_learning_rate_inv,
     generate_spin_configs,
-    scale_backflow,
 )
 
 
@@ -36,72 +33,6 @@ S1 = np.array([[1, 0], [0, 0]])
 S2 = np.array([[0, 0], [0, 1]])
 SX = np.array([[0, 1], [1, 0]])
 
-
-
-def build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, coeffs=None, orbital_noise=5e-2, rng=np.random.default_rng(), param_file=None, backflow_scale=1.0, nterms=1):
-    """One NES member.
-
-    `coeffs` switches on the multi-determinant mean-field reference: `U` is then the determinant
-    stack shared by every member (shape `(ndets, 2L, N)`) and `coeffs` is this member's vector over
-    it, so the members differ by their coefficients rather than by noise, and the term count comes
-    from that vector. Without it, `nterms` sets how many perturbed copies of `U` this member sums.
-    """
-    U_state = U.copy()
-    if orbital_noise > 0:
-        U_state = U_state + orbital_noise * rng.normal(size=U_state.shape)
-
-    if coeffs is not None:
-        if pf_backflow:
-            raise ValueError("--mean-field builds determinants; drop --pf-backflow")
-        # Only the determinants this member actually uses. Carrying the others would give each a
-        # network whose coefficient is zero, so its gradient vanishes identically -- a singular SR
-        # solve, and `ndets` times the parameters. Without --orthogonalize the mean-field driver
-        # writes one reference per state, so this is usually a small subset of the stack.
-        used = np.flatnonzero(np.asarray(coeffs))
-        U_state, coeffs = U_state[used], np.asarray(coeffs)[used]
-
-        if len(used) == 1:
-            net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-            model = qtx.model.DetBackflow(net, U0=jnp.asarray(U_state[0]), d=d)
-        else:
-            nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_state]
-            model = MultiDetBackflow(
-                nets,
-                U0=jnp.asarray(U_state),
-                # `DetBackflow` divides each determinant by its own std, which would destroy the
-                # relative weights; `backflow_coeffs` undoes exactly that.
-                coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
-                d=d,
-            )
-        return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
-                                     symm=symm, max_parallel=16384, use_ref=False)
-
-    # One perturbed copy of the reference per term. The copies must differ, or the terms are
-    # identical and the sum is rank deficient; `orbital_noise` above separates the *members*, not
-    # the terms within one.
-    U0s = [U_state if nterms == 1 else U_state + 1e-2 * rng.normal(size=U_state.shape)
-           for _ in range(nterms)]
-    if pf_backflow:
-        for k, U_alpha in enumerate(U0s):
-            U_pf = jnp.zeros((2 * L, 2 * L))
-            for i in range(N):
-                U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
-            U0s[k] = U_pf
-
-    nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U0s]
-    if nterms > 1:
-        multi = MultiPfBackflow if pf_backflow else MultiDetBackflow
-        model = multi(nets=nets, U0=jnp.stack([jnp.asarray(u) for u in U0s]),
-                      coeffs=jnp.ones(nterms) / nterms, d=d)
-    elif pf_backflow:
-        model = qtx.model.PfBackflow(nets[0], U0=U0s[0], d=d)
-    else:
-        model = qtx.model.DetBackflow(nets[0], U0=U0s[0], d=d)
-
-    # `param_file` replaces every leaf of the model, U0 and W included, so the orbital noise
-    # and the backflow scale above are irrelevant whenever one is given.
-    return qtx.state.Variational(scale_backflow(model, backflow_scale), param_file=param_file,
-                                 symm=symm, max_parallel=16384, use_ref=False)
 
 
 
@@ -122,6 +53,15 @@ parser.add_argument("--ph-sect", action="store", default=0,
 
 parser.add_argument("--init-state-file", action="store", default=None,
                     help="path to a .eqx state used as starting parameters of the ground state")
+parser.add_argument("--cont-run", action="store", default=None,
+                    help="run id under --path to continue from: every member starts from that "
+                         "run's state{k}_*.eqx. The ansatz shape -- state count, terms per "
+                         "state, network geometry -- is read back from its meta file rather "
+                         "than re-specified, so --mean-field and --multi are not needed and "
+                         "the flags that do fix it may agree but not contradict. Everything "
+                         "else is free to change, which is the point: sampler, reweight, "
+                         "optimizer, penalty, learning rate. The sweep counter and the lr "
+                         "schedule restart at zero, so --lr is the rate this run opens with")
 parser.add_argument("--incremental", action="store_true", default=False,
                     help="grow the state set one state at a time, training --nbr-sweeps per stage")
 parser.add_argument("--warmup-sweeps", action="store", default=None,
@@ -212,7 +152,10 @@ LmLp_freq = ((1 if LmLp_coeff else 0) if args["lmlp_freq"] is None
 # determinants per state; with one it is only cross-checked against the file.
 nterms_arg = (None if args["multi"] is None
               else [int(v) for v in str(args["multi"]).replace(",", " ").split()])
-if nterms_arg is not None and len(nterms_arg) not in (1, nstates):
+# Skipped under --cont-run: `nstates` is still the command-line value here, and the run
+# being continued is about to overrule it.
+if (nterms_arg is not None and args["cont_run"] is None
+        and len(nterms_arg) not in (1, nstates)):
     parser.error(f"--multi needs 1 or {nstates} entries, got {len(nterms_arg)}")
 nterms = ([1] * nstates if nterms_arg is None
           else nterms_arg * nstates if len(nterms_arg) == 1 else list(nterms_arg))
@@ -238,6 +181,84 @@ updater = {"plain": qtx.optimizer.PlainUpdater,
            "adam": qtx.optimizer.Adam,
            "spring": qtx.optimizer.Spring,
            "march": qtx.optimizer.March}[updater_name]()
+
+
+cont_run = args["cont_run"]
+cont_run_id = None
+if cont_run is not None:
+    cont_run_id = f"nes_n_{N}_2s_{L-1}_lz_{lz}_z2_{z2}_ph_{ph}_id0{int(cont_run)}"
+    if cont_run_id == run_id:
+        parser.error(f"--cont-run {cont_run} would overwrite the run it reads from, its "
+                     f"checkpoints and its energy history alike; give this one a new --run-id")
+    if init_state_file is not None:
+        parser.error("--cont-run starts every member from the previous run, leaving nothing "
+                     "for --init-state-file to seed")
+    if incremental:
+        parser.error("--cont-run resumes a finished set of states; --incremental grows one "
+                     "from scratch")
+
+    meta_file = Path(f"{path}/meta_{cont_run_id}.txt")
+    if not meta_file.is_file():
+        parser.error(f"--cont-run {cont_run}: {meta_file} is missing, and it is what records "
+                     f"the shape of the ansatz the checkpoints belong to")
+    prev_meta = {}
+    with open(meta_file) as f:
+        for line in f:
+            key, sep, value = line.partition(":")
+            if sep:
+                prev_meta[key.strip()] = value.strip()
+
+    def inherit(flag, meta_key, parse=int):
+        """Take a tree-fixing setting from the run being continued.
+
+        The command line may agree with it but not contradict it: reshaping the ansatz
+        would make the loaded parameters meaningless, so a disagreement is an error rather
+        than an override in either direction.
+        """
+        if meta_key not in prev_meta:
+            parser.error(f"--cont-run {cont_run}: {meta_file} has no '{meta_key}' entry")
+        from_meta = parse(prev_meta[meta_key])
+        given = args[flag]
+        if given != parser.get_default(flag) and parse(str(given)) != from_meta:
+            parser.error(f"--cont-run {cont_run}: --{flag.replace('_', '-')} asks for {given}, "
+                         f"but {cont_run_id} was built with {from_meta}")
+        return from_meta
+
+    nstates = inherit("nbr_states", "nbr. states")
+    nb = inherit("nbr_blocks", "nbr. blocks")
+    nh = inherit("nbr_heads", "nbr. heads")
+    d = inherit("attn_dim", "attndim")
+
+    # `--multi` takes a spec rather than a value, so it is compared post-expansion.
+    prev_nterms = json.loads(prev_meta["nterms per state"])
+    if nterms_arg is not None and nterms != prev_nterms:
+        parser.error(f"--cont-run {cont_run}: --multi asks for {nterms}, but {cont_run_id} "
+                     f"was built with {prev_nterms}")
+    nterms = prev_nterms
+
+    # A store_true cannot be inherited silently in both directions, so require agreement.
+    prev_pf = prev_meta.get("model") == "PfBackflow"
+    if pf_backflow != prev_pf:
+        parser.error(f"--cont-run {cont_run}: {cont_run_id} used {prev_meta.get('model')}, so "
+                     f"{'add' if prev_pf else 'drop'} --pf-backflow")
+
+    # The mean-field file only ever supplied a starting reference and the term counts. The
+    # term counts now come from the meta, and every parameter comes from the checkpoint --
+    # U0, the backflow weights and the multi-determinant coefficients alike -- so the two
+    # build paths in `transformer_backflow_state` give the same tree and the file is
+    # redundant here.
+    if mf_file is not None:
+        print(f"--cont-run: ignoring --mean-field; {cont_run_id} supplies both the ansatz "
+              f"shape and every parameter", flush=True)
+        mf_file = None
+
+    absent = [k for k in range(nstates)
+              if not Path(f"{path}/state{k}_{cont_run_id}.eqx").is_file()]
+    if absent:
+        parser.error(f"--cont-run {cont_run}: no checkpoint for member(s) {absent} at "
+                     f"{path}/state*_{cont_run_id}.eqx")
+    print(f"continuing from {cont_run_id}: {nstates} states, nterms {nterms}, "
+          f"{nb} blocks x {nh} heads x {d}", flush=True)
 
 
 def stage_phases(K):
@@ -323,6 +344,10 @@ else:
 start_time = datetime.now()
 
 def init_args(index):
+    if cont_run_id is not None:
+        # `param_file` replaces every leaf, so this only has to rebuild the parameter tree,
+        # which `nterms[index]` already pins -- hence no coefficients, no noise, no scale.
+        return dict(orbital_noise=0, param_file=f"{path}/state{index}_{cont_run_id}.eqx")
     if mf_coeffs is not None:
         # The members already differ by their Rayleigh-Ritz coefficients, so no noise is needed
         # -- and any would spoil the tuned reference. Checked first because it also fixes the
@@ -335,8 +360,8 @@ def init_args(index):
     return dict(orbital_noise=(0 if index == 1 else 1e-1), param_file=None)
 
 member_states = [
-    build_state(index, L, N, d, nb, nh, symm, pf_backflow, U, nterms=nterms[index],
-                **init_args(index))
+    transformer_backflow_state(index, L, N, d, nb, nh, symm, pf_backflow, U,
+                               nterms=nterms[index], **init_args(index))
     for index in range(nstates)
 ]
 # The last phase of the last stage holds every state, so this is the set the meta block
@@ -369,6 +394,7 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
   f.write(f"nterms per state: {nterms}\n")
   f.write(f"nbr. states: {nstates}\n")
   f.write(f"init state file: {init_state_file}\n")
+  f.write(f"continued from: {cont_run_id}\n")
   f.write(f"mean field file: {mf_file}\n")
   if mf_coeffs is not None:
       f.write(f"backflow scale: {MF_BACKFLOW_SCALE}\n")

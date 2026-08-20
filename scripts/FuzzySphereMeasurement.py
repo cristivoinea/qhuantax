@@ -1,7 +1,6 @@
 import quantax as qtx
-from qhuantax.quantumhall_transformer import Transformer
+from qhuantax.quantumhall_transformer import transformer_backflow_state
 import equinox as eqx
-import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,7 +8,6 @@ from qhuantax.quantumhall_operators import GetSpinlessDenIntTerms, GetSpinfulDen
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzDenseProjector
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_utils import adaptive_learning_rate_exp, generate_spin_configs, read_meta_file
-from qhuantax.quantumhall_models import MultiPfBackflow, MultiDetBackflow
 from quspin.basis import spinful_fermion_basis_1d
 
 from datetime import datetime
@@ -74,51 +72,25 @@ else:
         symm = ParticleHoleQH(eigval=ph) @ symm
 
 
-# initialize NQS
+# Rebuild the ansatz with the tree the checkpoint was written from. What fixes that tree
+# comes from the run's own meta file rather than the command line, because a mismatch does
+# not raise on load: Equinox reads leaves positionally, so a wrong tree quietly fills the
+# model from the wrong slots. `transformer_backflow_state` checks it instead.
 nterms = int(meta_dict["nterms"])
 nb = int(meta_dict["nbr. blocks"])
 nh = int(meta_dict["nbr. heads"])
 d = int(meta_dict["attndim"])
 
+meta_pf = str(meta_dict.get("model", "DetBackflow")) == "PfBackflow"
+if pf_backflow and not meta_pf:
+    raise ValueError(f"{run_id} was trained with {meta_dict['model']}; drop --pf-backflow")
+pf_backflow = meta_pf
 
-# start NN training
-if nterms > 1:
-    net = tuple(
-    Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-    for _ in range(nterms))
-else:
-    net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-
+# Only the shape of `U` matters here: every leaf is about to come from the checkpoint.
 U = np.zeros((2*L, N))
-
-if pf_backflow:
-    U0s = []
-    for alpha in range(nterms):
-        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-
-        U_pf = jnp.zeros((2 * L, 2 * L))
-        for i in range(N):
-            U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
-
-        U0s.append(U_pf)
-
-    if nterms > 1:
-        model = MultiPfBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d,)
-    else:
-        model = qtx.model.PfBackflow(net, U0=U0s[0], d=d)
-else:
-    U0s = []
-    for alpha in range(nterms):
-        U_alpha = U + 1e-2 * np.random.normal(size=U.shape)
-        U0s.append(U_alpha)
-
-    if nterms > 1:
-        model = MultiDetBackflow(nets=net, U0=jnp.stack(U0s), coeffs=jnp.ones(nterms)/nterms, d=d)
-    else:
-        model = qtx.model.DetBackflow(net, U0=U0s[0], d=d)
-
-
-state = qtx.state.Variational(model, symm=symm, max_parallel=16384, param_file=f"{path}/state_{run_id}.eqx")
+state = transformer_backflow_state(0, L, N, d, nb, nh, symm, pf_backflow, U,
+                                   orbital_noise=0, nterms=nterms,
+                                   param_file=f"{path}/state_{run_id}.eqx")
 
 
 # get operator

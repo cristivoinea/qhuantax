@@ -1,8 +1,11 @@
-from typing import Callable, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Optional, Sequence, Tuple, Union
+import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
+import quantax as qtx
 from quantax.global_defs import get_sites, get_subkeys
 from quantax.nn import (
     lecun_normal,
@@ -154,3 +157,96 @@ class Transformer(Sequential):
 
         layers = [*layers, final_layer]
         super().__init__(layers)
+
+
+def transformer_backflow_state(
+    index: int,
+    L: int,
+    N: int,
+    d: int,
+    nb: int,
+    nh: int,
+    symm,
+    pf_backflow: bool,
+    U: np.ndarray,
+    coeffs: Optional[Sequence[float]] = None,
+    orbital_noise: float = 5e-2,
+    rng: np.random.Generator = np.random.default_rng(),
+    param_file: Union[None, str, Path] = None,
+    backflow_scale: float = 1.0,
+    nterms: int = 1,
+):
+    """A `Transformer`-backflow state: one determinant or Pfaffian, or a sum of them.
+
+    `pf_backflow` picks Pfaffian over determinant, `nterms` picks a sum over a single
+    term, and the four combinations are the four models a run can be built from. Every
+    script that reads a checkpoint has to reproduce the same choice, since the tree is
+    what the checkpoint is keyed to and a mismatch does not raise -- hence one definition
+    here rather than a copy per script, and `check_param_file` on the way in.
+
+    `coeffs` switches on the multi-determinant mean-field reference: `U` is then the determinant
+    stack shared by every member (shape `(ndets, 2L, N)`) and `coeffs` is this member's vector over
+    it, so the members differ by their coefficients rather than by noise, and the term count comes
+    from that vector. Without it, `nterms` sets how many perturbed copies of `U` this member sums.
+    """
+    from qhuantax.quantumhall_meanfield import backflow_coeffs
+    from qhuantax.quantumhall_models import MultiDetBackflow, MultiPfBackflow
+    from qhuantax.quantumhall_utils import check_param_file, scale_backflow
+
+    def wrap(model):
+        # `param_file` replaces every leaf of the model, U0 and W included, so the orbital
+        # noise and the backflow scale above are irrelevant whenever one is given.
+        model = scale_backflow(model, backflow_scale)
+        if param_file is not None:
+            check_param_file(model, param_file)
+        return qtx.state.Variational(model, param_file=param_file, symm=symm,
+                                     max_parallel=16384, use_ref=False)
+
+    U_state = U.copy()
+    if orbital_noise > 0:
+        U_state = U_state + orbital_noise * rng.normal(size=U_state.shape)
+
+    if coeffs is not None:
+        if pf_backflow:
+            raise ValueError("--mean-field builds determinants; drop --pf-backflow")
+        # Only the determinants this member actually uses. Carrying the others would give each a
+        # network whose coefficient is zero, so its gradient vanishes identically -- a singular SR
+        # solve, and `ndets` times the parameters. Without --orthogonalize the mean-field driver
+        # writes one reference per state, so this is usually a small subset of the stack.
+        used = np.flatnonzero(np.asarray(coeffs))
+        U_state, coeffs = U_state[used], np.asarray(coeffs)[used]
+
+        if len(used) == 1:
+            net = Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+            return wrap(qtx.model.DetBackflow(net, U0=jnp.asarray(U_state[0]), d=d))
+
+        nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U_state]
+        return wrap(MultiDetBackflow(
+            nets,
+            U0=jnp.asarray(U_state),
+            # `DetBackflow` divides each determinant by its own std, which would destroy the
+            # relative weights; `backflow_coeffs` undoes exactly that.
+            coeffs=jnp.asarray(backflow_coeffs(U_state, coeffs)),
+            d=d,
+        ))
+
+    # One perturbed copy of the reference per term. The copies must differ, or the terms are
+    # identical and the sum is rank deficient; `orbital_noise` above separates the *members*, not
+    # the terms within one.
+    U0s = [U_state if nterms == 1 else U_state + 1e-2 * rng.normal(size=U_state.shape)
+           for _ in range(nterms)]
+    if pf_backflow:
+        for k, U_alpha in enumerate(U0s):
+            U_pf = jnp.zeros((2 * L, 2 * L))
+            for i in range(N):
+                U_pf = U_pf.at[:, 2 * i].add(U_alpha[:, i])
+            U0s[k] = U_pf
+
+    nets = [Transformer(nblocks=nb, d=d, heads=nh, final_sum=False) for _ in U0s]
+    if nterms > 1:
+        multi = MultiPfBackflow if pf_backflow else MultiDetBackflow
+        return wrap(multi(nets=nets, U0=jnp.stack([jnp.asarray(u) for u in U0s]),
+                          coeffs=jnp.ones(nterms) / nterms, d=d))
+    if pf_backflow:
+        return wrap(qtx.model.PfBackflow(nets[0], U0=U0s[0], d=d))
+    return wrap(qtx.model.DetBackflow(nets[0], U0=U0s[0], d=d))

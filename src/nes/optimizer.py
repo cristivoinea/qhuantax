@@ -263,14 +263,25 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         Centered, reweighted local energies, with non-finite samples discarded.
 
         A configuration sitting close to a node of one member makes Quantax's ``_Oloc``
-        overflow: it materializes :math:`\psi(s')/\psi(s)` in the network's dtype
-        (float32 here), so the ratio saturates once the log amplitudes differ by more
-        than ``log(finfo.max)``, even though the ``Oloc * psi`` product that
-        `local_energies` forms from it is finite -- the divergence cancels analytically,
-        just one step too late to survive the intermediate. Sampling
-        :math:`|\det A|^\mathrm{reweight}` with ``reweight < 2`` deliberately visits
-        those tails more often, which is the point, so this has to be survivable rather
-        than avoided.
+        overflow. It materializes :math:`\psi(s')/\psi(s)` in the network's dtype
+        (float32 here) and then accumulates ``psi_ratio * H_conn`` over the connected
+        configurations, so the binding condition is on the *weighted sum*, not the bare
+        ratio:
+
+        .. math::
+
+            \log \sum_{s'} |H_{ss'}| \;+\; \max_{s'} \log|\psi(s')| \;-\; \log|\psi(s)|
+            \;>\; \log(\mathrm{finfo.max})
+
+        The first term is not a rounding detail: for :math:`H + \lambda L^- L^+` at
+        :math:`\lambda = 3` it is about 11, and 98% of it comes from the penalty rather
+        than the Hamiltonian, so the threshold moves as :math:`\log \lambda` and the
+        merged-operator steps are more exposed than the resolved ones. All of this
+        happens even though the ``Oloc * psi`` product that `local_energies` forms is
+        perfectly finite -- the divergence cancels analytically, just one step too late
+        to survive the intermediate. Sampling :math:`|\det A|^\mathrm{reweight}` with
+        ``reweight < 2`` deliberately visits those tails more often, which is the point,
+        so this has to be survivable rather than avoided.
 
         Such a sample carries a reweight factor of order ``VarE * nsamples /
         Eloc_max_dev**2``, i.e. :math:`10^{-3}` or less in practice, so it contributes
