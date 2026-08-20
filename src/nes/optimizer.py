@@ -10,6 +10,7 @@ from quantax.global_defs import get_default_dtype
 from quantax.sampler import Samples
 from quantax.utils import LogArray, PsiArray, to_distributed_array
 
+from ..quantumhall_optimizers import PenaltySplitGrad
 from .state_set import NaturalStateSet, _stack_psi_arrays
 
 
@@ -31,23 +32,20 @@ def _scale_psi_matrix(psi_matrix: PsiArray) -> tuple[jax.Array, jax.Array]:
     return scaled, row_shift
 
 
-class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
+class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
     r"""
     NES trace gradient, optionally against :math:`H + \lambda P`.
 
-    The penalty is kept as its own operator rather than folded into ``hamiltonian``,
-    so that the bare :math:`\left< H \right>` and the penalty are recorded alongside
-    the quantity being minimized. The two operators reach the same connected
-    configurations as their sum, but Quantax pays a per-``Oloc`` overhead of order
-    10--20% for the second call; ``penalty_every`` amortizes it.
+    The penalty bookkeeping is `PenaltySplitGrad`, shared with the single-state
+    `~qhuantax.quantumhall_optimizers.PenalizedEnergyGrad`; only the local energies
+    differ, and they come from `local_energies` here. Everything that base class calls a
+    local energy is a trace over the members: ``energy`` is
+    :math:`\mathrm{tr}(S^{-1}(H + \lambda P))`, ``energy_H`` is
+    :math:`\mathrm{tr}(S^{-1} H)`, and ``penalty_value`` is
+    :math:`\mathrm{tr}(S^{-1} P)`, which for :math:`P = L^- L^+` at :math:`L_z = 0` is
+    :math:`\sum_k L_k(L_k+1)` and so reaches zero exactly when every member has
+    converged to :math:`L = 0`.
     """
-
-    _Eloc_max_dev = None
-    _energy_H = None
-    _VarE_H = None
-    _penalty_value = None
-    _VarPenalty = None
-    _nonfinite = None
 
     def __init__(
         self,
@@ -80,97 +78,7 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         biasing them, and ``penalty_every=0`` penalizes without measuring.
         """
         super().__init__(hamiltonian)
-        self._penalty_coeff = float(penalty_coeff)
-        self._penalty_every = max(0, int(penalty_every))
-        self._penalty_op = penalty if self._penalty_every else None
-        # Only built when it is actually reached, since summing the operators is not
-        # free -- and with a zero coefficient the sum is just the Hamiltonian.
-        self._merged_op = (
-            hamiltonian + self._penalty_coeff * penalty
-            if penalty is not None and self._penalty_coeff and self._penalty_every != 1
-            else None
-        )
-        self._steps = 0
-
-    @property
-    def penalty(self) -> Optional[qtx.operator.Operator]:
-        """The measured penalty operator, ``None`` when ``penalty_every`` is 0."""
-        return self._penalty_op
-
-    @property
-    def penalty_coeff(self) -> float:
-        r"""The multiplier :math:`\lambda` on `~NaturalTraceEnergyGrad.penalty`."""
-        return self._penalty_coeff
-
-    @property
-    def penalty_every(self) -> int:
-        """How often `energy_H` and `penalty_value` are refreshed."""
-        return self._penalty_every
-
-    @property
-    def energy_H(self) -> Optional[jax.Array]:
-        r"""
-        :math:`\mathrm{tr}(S^{-1} H)` of the current step, without the penalty.
-
-        Equal to `energy` whenever nothing is added to the Hamiltonian, ``nan`` on a
-        step that ``penalty_every`` skipped. This is the quantity to compare against
-        ED: with :math:`\lambda \neq 0`, `energy` sums the *shifted* levels.
-        """
-        return self._energy_H
-
-    @property
-    def VarE_H(self) -> Optional[jax.Array]:
-        r"""
-        Sample variance of :math:`\mathrm{tr}(S^{-1} H)` over the last batch.
-
-        The zero-variance property belongs to :math:`H` alone, so this is the one that
-        has to fall to zero at convergence; `VarE` also carries
-        :math:`\lambda^2 \mathrm{Var}(P)` and their covariance, which is what makes it
-        the wrong thing to read when :math:`\lambda` is large. ``nan`` on a step that
-        ``penalty_every`` skipped.
-        """
-        return self._VarE_H
-
-    @property
-    def penalty_value(self) -> Optional[jax.Array]:
-        r"""
-        :math:`\mathrm{tr}(S^{-1} P)` of the current step.
-
-        For :math:`P = L^- L^+` at :math:`L_z = 0` this is :math:`\sum_k L_k(L_k+1)`
-        over the members, so it reaches zero exactly when every member has converged
-        to :math:`L = 0` -- the convergence check for the penalty itself. ``nan``, not
-        zero, on a step where it was not measured.
-        """
-        return self._penalty_value
-
-    @property
-    def VarPenalty(self) -> Optional[jax.Array]:
-        r"""Sample variance of :math:`\mathrm{tr}(S^{-1} P)` over the last batch."""
-        return self._VarPenalty
-
-    @property
-    def Eloc_max_dev(self) -> Optional[jax.Array]:
-        r"""
-        :math:`\max_s |E_{loc}(s) - \bar E|` over the last batch, discarded samples
-        excluded.
-
-        Compared against ``sqrt(VarE)``, this says whether :math:`\bar \epsilon` is
-        dominated by a single sample -- the SR right-hand side is used one realization at
-        a time, not in expectation, so a lone outlier translates directly into a step.
-        """
-        return self._Eloc_max_dev
-
-    @property
-    def nonfinite(self) -> Optional[jax.Array]:
-        r"""
-        How many samples of the last batch were discarded for a non-finite local energy.
-
-        See `~NaturalTraceEnergyGrad.ebar` for why they arise and why dropping them is
-        cheaper than it looks. Persistently nonzero means the members are running close
-        enough to their nodes that the float32 amplitude ratio saturates, which is worth
-        knowing even though the estimator absorbs it.
-        """
-        return self._nonfinite
+        self._init_penalty(hamiltonian, penalty, penalty_coeff, penalty_every)
 
     def local_energies(
         self, states: NaturalStateSet, samples: Samples, resolve: bool = True
@@ -216,11 +124,7 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         )
 
         resolve = resolve and self._penalty_op is not None
-        if resolve:
-            operators = [self.hamiltonian, self._penalty_op]
-        else:
-            # `_merged_op` is None whenever the sum degenerates to the Hamiltonian.
-            operators = [self._merged_op or self.hamiltonian]
+        operators = self._operators(self.hamiltonian, resolve)
         columns = [[] for _ in operators]
 
         for state, psi_column in zip(states.states, psi_columns):
@@ -243,16 +147,7 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
                 jnp.trace(Sinv_O, axis1=-2, axis2=-1).astype(get_default_dtype())
             )
 
-        if not resolve:
-            # `nan` rather than 0 for the penalty: it was not measured, which is not
-            # the same statement as "it vanished".
-            Eloc = traces[0]
-            unresolved = jnp.full_like(Eloc, jnp.nan)
-            # With nothing added to the Hamiltonian the optimized energy is the bare one.
-            return Eloc, (unresolved if self._penalty_coeff else Eloc), unresolved
-
-        Eloc_H, Eloc_P = traces
-        return Eloc_H + self._penalty_coeff * Eloc_P, Eloc_H, Eloc_P
+        return self._combine(traces, resolve)
 
     def local_energy(self, states: NaturalStateSet, samples: Samples) -> jax.Array:
         """The optimized local energy, i.e. the first entry of `local_energies`."""
@@ -262,36 +157,15 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         r"""
         Centered, reweighted local energies, with non-finite samples discarded.
 
-        A configuration sitting close to a node of one member makes Quantax's ``_Oloc``
-        overflow. It materializes :math:`\psi(s')/\psi(s)` in the network's dtype
-        (float32 here) and then accumulates ``psi_ratio * H_conn`` over the connected
-        configurations, so the binding condition is on the *weighted sum*, not the bare
-        ratio:
-
-        .. math::
-
-            \log \sum_{s'} |H_{ss'}| \;+\; \max_{s'} \log|\psi(s')| \;-\; \log|\psi(s)|
-            \;>\; \log(\mathrm{finfo.max})
-
-        The first term is not a rounding detail: for :math:`H + \lambda L^- L^+` at
-        :math:`\lambda = 3` it is about 11, and 98% of it comes from the penalty rather
-        than the Hamiltonian, so the threshold moves as :math:`\log \lambda` and the
-        merged-operator steps are more exposed than the resolved ones. All of this
-        happens even though the ``Oloc * psi`` product that `local_energies` forms is
-        perfectly finite -- the divergence cancels analytically, just one step too late
-        to survive the intermediate. Sampling :math:`|\det A|^\mathrm{reweight}` with
-        ``reweight < 2`` deliberately visits those tails more often, which is the point,
-        so this has to be survivable rather than avoided.
-
-        Such a sample carries a reweight factor of order ``VarE * nsamples /
-        Eloc_max_dev**2``, i.e. :math:`10^{-3}` or less in practice, so it contributes
-        nothing to any of the weighted estimators below and dropping it is free. Keeping
-        it is not: the centering at the end is an *unweighted* mean, so one ``nan``
-        propagates to every entry of the returned vector, the SR solve returns a
-        ``nan`` step, and a converged run dies on a single unlucky draw.
+        The discarding, and why it is needed, is `PenaltySplitGrad._record`. Two things
+        are specific to the trace: the overflow happens even though the ``Oloc * psi``
+        product that `local_energies` forms is perfectly finite -- the divergence cancels
+        analytically, just one step too late to survive the intermediate -- and sampling
+        :math:`|\det A|^\mathrm{reweight}` with ``reweight < 2`` deliberately visits
+        those tails more often, which is the point, so this has to be survivable rather
+        than avoided.
         """
-        resolve = bool(self._penalty_every) and self._steps % self._penalty_every == 0
-        self._steps += 1
+        resolve = self._resolve()
         Eloc, Eloc_H, Eloc_P = self.local_energies(states, samples, resolve=resolve)
 
         if samples.reweight_factor is None:
@@ -299,41 +173,7 @@ class NaturalTraceEnergyGrad(qtx.optimizer.EnergyGrad):
         else:
             reweight_factor = samples.reweight_factor
 
-        # Taken from `Eloc` alone, so that the components stay `nan` on the steps
-        # `penalty_every` skips -- there they are unmeasured, not overflowed, and
-        # `Eloc` is finite throughout. On a resolved step an overflow in either
-        # component reaches `Eloc` through the sum, so the masks agree.
-        finite = jnp.isfinite(Eloc)
-        nfinite = jnp.count_nonzero(finite)
-        self._nonfinite = samples.nsamples - nfinite
-        # Zero weight is what actually removes a sample; zeroing the value only keeps
-        # `nan * 0 = nan` from resurrecting it in the reductions.
-        reweight_factor = jnp.where(finite, reweight_factor, 0.0)
-        Eloc = jnp.where(finite, Eloc, 0.0)
-        Eloc_H = jnp.where(finite, Eloc_H, 0.0)
-        Eloc_P = jnp.where(finite, Eloc_P, 0.0)
-
-        Emean = jnp.mean(Eloc * reweight_factor)
-        self._energy = Emean.real
-        Evar = jnp.abs(Eloc - Emean) ** 2
-        self._VarE = jnp.mean(Evar * reweight_factor).real
-        # Free: `Evar` is already materialized, so the max is one more reduction over it.
-        # Discarded samples sit at `Eloc = 0`, whose deviation is a spurious `|Emean|`.
-        self._Eloc_max_dev = jnp.sqrt(jnp.max(jnp.where(finite, Evar, 0.0)))
-
-        # Same batch, same weights: reductions over arrays already in hand.
-        Hmean = jnp.mean(Eloc_H * reweight_factor)
-        self._energy_H = Hmean.real
-        self._VarE_H = jnp.mean(jnp.abs(Eloc_H - Hmean) ** 2 * reweight_factor).real
-        Pmean = jnp.mean(Eloc_P * reweight_factor)
-        self._penalty_value = Pmean.real
-        self._VarPenalty = jnp.mean(jnp.abs(Eloc_P - Pmean) ** 2 * reweight_factor).real
-
-        # Over the surviving samples: `jnp.mean` would divide by `nsamples` and pull the
-        # centre towards zero by whatever the discarded ones would have contributed.
-        Eloc -= jnp.sum(Eloc) / nfinite
-        Eloc *= jnp.sqrt(reweight_factor / samples.nsamples)
-        return Eloc
+        return self._record(Eloc, Eloc_H, Eloc_P, reweight_factor)
 
 
 class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):

@@ -4,6 +4,7 @@ import equinox as eqx
 import numpy as np
 from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons, GetLzSymmetryProjector
+from qhuantax.quantumhall_optimizers import PenalizedAdamSR
 from qhuantax.quantumhall_utils import (
     MF_BACKFLOW_SCALE,
     adaptive_learning_rate_inv,
@@ -44,9 +45,14 @@ parser.add_argument("--mean-field", action="store", default=None,
 parser.add_argument("--exact-diag", action="store_true", default=False,
                     help="perform exact diagonalization and track energy, energy variance and overlap with ground state")
 parser.add_argument("--lmlp-coeff", action="store", default=0,
-                    help="coefficient in front of L^- L^+ term")
-parser.add_argument("--lmlp-freq", action="store", default=5,
-                    help="measurement frequency of L^- L^+ term")
+                    help="coefficient in front of the L^- L^+ term added to the Hamiltonian")
+parser.add_argument("--lmlp-freq", action="store", default=None,
+                    help="how often to measure <L^- L^+>, and with it the unpenalized <H>; "
+                         "0 never does and costs nothing, 1 does it every sweep for the ~20% "
+                         "overhead of a second Oloc call. Independent of --lmlp-coeff: 0 with a "
+                         "coefficient penalizes without measuring, a frequency without a "
+                         "coefficient labels the state by L(L+1) without biasing it. "
+                         "Defaults to 1 with a coefficient and 0 without")
 
 parser.add_argument("--multi", action="store", default=None,
                     help="number of terms of the ansatz, i.e. MultiDetBackflow (or MultiPfBackflow "
@@ -92,7 +98,10 @@ mf_file = args["mean_field"]
 
 do_ED = bool(args["exact_diag"])
 LmLp_coeff = float(args["lmlp_coeff"])
-LmLp_freq = float(args["lmlp_freq"])
+# A penalized run needs the split to report a physical energy at all, so it is on by
+# default there; an unpenalized one gets the plain single-operator cost it had before.
+LmLp_freq = ((1 if LmLp_coeff else 0) if args["lmlp_freq"] is None
+             else int(args["lmlp_freq"]))
 
 # None means "unset", which `--mean-field` fills in from the file; the cold start defaults to 1.
 # A list is accepted for symmetry with FuzzySphereNESTrain, but only one state is trained here.
@@ -144,11 +153,12 @@ if do_ED:
     print("Target state norm = ",np.vdot(wf_exact, wf_exact))
 
 
+# Kept out of `tms_H`: the optimizer takes it as a separate operator, so <H> and
+# <L^- L^+> come back separately at every step for the same cost as the sum, and the
+# exact readout below stays on the unshifted Hamiltonian.
 tms_Lp = GetLpTerms(L, 2)
 tms_Lm = tms_Lp.H
 tms_LmLp = tms_Lm @ tms_Lp
-if LmLp_coeff:
-    tms_H = tms_H + LmLp_coeff * tms_LmLp
 
 
 # Mean-field reference, or the cold-start Fock matrix
@@ -239,10 +249,16 @@ with open(f"{path}/meta_{run_id}.txt", "w") as f:
 
 init_configs = generate_spin_configs(L, N, lz, nsamples)
 sampler = FermionTwoBodyDipoleCons(state, nsamples, n_neighbor=np.arange(1,3), initial_spins=init_configs, reweight = rw)
-optimizer = qtx.optimizer.AdamSR(state, tms_H)
+optimizer = PenalizedAdamSR(state, tms_H, penalty=tms_LmLp, penalty_coeff=LmLp_coeff,
+                            penalty_every=LmLp_freq)
 
+# `energy`/`VarE` describe H + lambda L^- L^+, the quantity the optimizer minimizes;
+# `energy_H` is the physical <H> to compare against ED, and reads nan on the sweeps
+# --lmlp-freq skips. The three coincide when --lmlp-coeff is 0.
 energy = qtx.utils.DataTracer()
 VarE = qtx.utils.DataTracer()
+energy_H = qtx.utils.DataTracer()
+VarE_H = qtx.utils.DataTracer()
 LmLp_tracer = qtx.utils.DataTracer()
 LmLp_var_tracer = qtx.utils.DataTracer()
 if do_ED:
@@ -258,13 +274,12 @@ for i in range(nsweeps):
 
     energy.append(optimizer.energy)
     VarE.append(optimizer.VarE)
+    # Same batch, no extra Oloc pass: the optimizer already split the two operators.
+    energy_H.append(optimizer.energy_H)
+    VarE_H.append(optimizer.VarE_H)
+    LmLp_tracer.append(optimizer.penalty_value)
+    LmLp_var_tracer.append(optimizer.VarPenalty)
 
-    if i % LmLp_freq == 0:
-        expval, var = tms_LmLp.expectation(state, samples, return_var=True)
-        LmLp_tracer.append(expval)
-        LmLp_var_tracer.append(var)
-        np.savetxt(f"{path}/data_LmLp_{run_id}.txt", np.vstack((LmLp_tracer.time, LmLp_tracer.data, LmLp_var_tracer.data)).T)
-    
     if do_ED:
         dense = state.todense(dense_symm).normalize()
 
@@ -274,7 +289,15 @@ for i in range(nsweeps):
 
         np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.vstack((exact_energy.time, exact_energy.data, exact_variance.data, overlap.data)).T)
 
-    np.savetxt(f"{path}/data_energy_{run_id}.txt", np.vstack((energy.time, energy.data, VarE.data)).T)
+    # Columns 0-2 are unchanged, so the existing readers keep working; the rest are
+    # appended. `VarE_H` is the variance that has to vanish at convergence -- `VarE`
+    # cannot, since it also carries lambda^2 Var(L^- L^+) and the covariance.
+    np.savetxt(
+        f"{path}/data_energy_{run_id}.txt",
+        np.vstack((energy.time, energy.data, VarE.data, energy_H.data, VarE_H.data,
+                   LmLp_tracer.data, LmLp_var_tracer.data)).T,
+        header="sweep E_total VarE E_H VarE_H LmLp VarLmLp",
+    )
     state.save(f"{path}/state_{run_id}.eqx")
 
 
