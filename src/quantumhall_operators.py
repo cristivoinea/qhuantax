@@ -84,6 +84,13 @@ def qtx_annihilate(f,m):
     else:
         return qtx.operator.annihilate_d(m)
 
+
+def qtx_number(f,m):
+    if f == 0:
+        return qtx.operator.number_u(m)
+    else:
+        return qtx.operator.number_d(m)
+
 def GetSpinfulDenIntTerms(nm : int, ps_pot : Sequence[int], mat_a : Sequence[int], mat_b : Sequence[int]) -> qtx.operator.Operator:
     """
         GetDenIntTerms(nm :: Int64, nf :: Int64[, ps_pot :: Vector{<:Number}][, mat_a :: Matrix{<:Number}[, mat_b :: Matrix{<:Number}]][ ; m_kept :: Vector{Int64}]) :: Terms
@@ -128,7 +135,18 @@ def GetSpinfulDenIntTerms(nm : int, ps_pot : Sequence[int], mat_a : Sequence[int
                     #print(val)
                     if (np.abs(val) < 1E-15):
                         continue
-                    H += val * (qtx_create(f1, m1) @ qtx_create(f2, m2) @ qtx_annihilate(f3, m3) @ qtx_annihilate(f4, m4))
+                    # Emit true density operators when the term is diagonal so Quantax
+                    # keeps it in the cheap `apply_diag` path instead of generating a
+                    # connected configuration equal to s.  With Lz conservation
+                    # (m4 = m1+m2-m3) the direct case is ~L^2 of the terms.
+                    if (m1, f1) == (m4, f4) and (m2, f2) == (m3, f3):
+                        # c+_1 c+_2 c_2 c_1 = n_1 n_2
+                        H += val * (qtx_number(f1, m1) @ qtx_number(f2, m2))
+                    elif (m1, f1) == (m3, f3) and (m2, f2) == (m4, f4):
+                        # c+_1 c+_2 c_1 c_2 = -n_1 n_2
+                        H += -val * (qtx_number(f1, m1) @ qtx_number(f2, m2))
+                    else:
+                        H += val * (qtx_create(f1, m1) @ qtx_create(f2, m2) @ qtx_annihilate(f3, m3) @ qtx_annihilate(f4, m4))
     return H
 
 
