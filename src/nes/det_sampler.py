@@ -20,6 +20,7 @@ from quantax.utils import (
 
 from ..quantumhall_samplers import (
     _get_site_neighbors,
+    _mix_flavour_flips,
     _propose_exchange_dipolecons,
 )
 from .state_set import NaturalStateSet
@@ -255,3 +256,28 @@ class NaturalLzDetSampler(NaturalDetSampler):
             self._spinful,
         )
         return new_selected_spins.reshape(nsamples, Nstates, Nmodes)
+
+
+class NaturalLzDetFlavourFlipSampler(NaturalLzDetSampler):
+    r"""
+    `NaturalLzDetSampler` mixed with single-electron flavour flips, the NES counterpart of
+    `~qhuantax.quantumhall_samplers.FermionDipoleConsFlavourFlip`.
+
+    The pair move never flips one electron alone, so near the polarised vacuum the chains freeze
+    on the configurations of the h=0 members. Each configuration of each tuple independently
+    takes a flip instead of its pair move with probability ``flip_prob``; both moves are
+    symmetric, so the proposal ratio stays one.
+    """
+
+    def __init__(self, *args, flip_prob: float = 0.5, **kwargs):
+        self.flip_prob = flip_prob
+        super().__init__(*args, **kwargs)
+
+    @partial(jax.jit, static_argnums=0)
+    def propose(self, key: Key, old_spins: jax.Array) -> jax.Array:
+        key_pair, key_flip = jr.split(key)
+        pair_spins = super().propose(key_pair, old_spins)
+        nsamples, Nstates, Nmodes = old_spins.shape
+        mixed = _mix_flavour_flips(key_flip, old_spins.reshape(-1, Nmodes),
+                                   pair_spins.reshape(-1, Nmodes), self.flip_prob)
+        return mixed.reshape(nsamples, Nstates, Nmodes)
