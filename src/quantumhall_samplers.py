@@ -507,6 +507,57 @@ class FermionTwoBodyDipoleCons(qtx.sampler.Metropolis):
             )
 
 
+class FermionDipoleConsFlavourFlip(FermionTwoBodyDipoleCons):
+    r"""
+    `FermionTwoBodyDipoleCons` mixed with single-electron flavour flips
+    :math:`c^\dagger_{\bar f m} c_{f m}`, which conserve :math:`L_z` and the particle number.
+
+    The pair move never flips one electron alone: when the first particle stays, so does the
+    second. Near the polarised vacuum :math:`|\Uparrow\rangle` (full up band) every accepted pair
+    move therefore flips two electrons, and the one-exciton configurations a transverse field
+    couples to first are reached only through two-exciton ones, at an acceptance of order
+    :math:`|\psi_{k=2}/\psi_{k=0}|^2`. The chains then freeze on the vacuum.
+
+    With probability ``flip_prob`` a chain instead picks one of its particles uniformly and moves
+    it to the other flavour of the same orbital, staying put if that mode is occupied. Picking the
+    particle has probability :math:`1/N` both ways, so the move is symmetric, as is the mixture.
+    """
+
+    def __init__(self, *args, flip_prob: float = 0.5, **kwargs):
+        self.flip_prob = flip_prob
+        super().__init__(*args, **kwargs)
+
+    @partial(jax.jit, static_argnums=0)
+    def propose(self, key: Key, old_spins: jax.Array) -> jax.Array:
+        key_pair, key_flip = jr.split(key)
+        pair_spins = super().propose(key_pair, old_spins)
+        return _mix_flavour_flips(key_flip, old_spins, pair_spins, self.flip_prob)
+
+
+def _mix_flavour_flips(key: Key, old_spins: jax.Array, pair_spins: jax.Array,
+                       flip_prob: float) -> jax.Array:
+    r"""Replace, with probability ``flip_prob`` per configuration, the proposal ``pair_spins`` by
+    a single-electron flavour flip of ``old_spins`` (see `FermionDipoleConsFlavourFlip`).
+
+    Both arrays are ``(nconf, Nmodes)`` with the up modes first. The flip picks one particle
+    uniformly and moves it to the other flavour of its orbital, or stays put if that mode is
+    occupied, so it is symmetric; mixing two symmetric proposals configuration by configuration
+    keeps it symmetric.
+    """
+    key_flip, key_mix = jr.split(key)
+    nconf, Nmodes = old_spins.shape
+    arange = jnp.arange(nconf)
+    choice_vmap = jax.vmap(lambda k, p: jr.choice(k, Nmodes, p=p))
+    idx = choice_vmap(jr.split(key_flip, nconf), old_spins == 1)
+    target = (idx + Nmodes // 2) % Nmodes
+    free = old_spins[arange, target] != 1
+    flip_spins = old_spins.at[arange, idx].set(-1).at[arange, target].set(1)
+    flip_spins = jnp.where(free[:, None], flip_spins, old_spins)
+
+    use_flip = jr.uniform(key_mix, (nconf,)) < flip_prob
+    return jnp.where(use_flip[:, None], flip_spins, pair_spins)
+
+
 class FermionTwoBodyDipoleConsSymmetricSqueezed(qtx.sampler.Metropolis):
     """
     Symmetric spinless dipole-conserving sampler restricted to the squeezed basis.
