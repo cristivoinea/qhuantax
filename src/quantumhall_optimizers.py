@@ -119,46 +119,6 @@ class ERDipoleCons(qtx.optimizer.QNGD):
         return step
 
 
-class FuzzySphereSupervised(qtx.optimizer.QNGD):
-    def __init__(
-        self,
-        state: qtx.state.Variational,
-        target_state: qtx.state.State,
-        solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
-    ):
-        super().__init__(state, OverlapGrad(target_state), solver=solver)
-        self._target_state = target_state
-
-        self._loss_mean = None
-        self._loss_variance = None
-
-    @property
-    def loss_mean(self) -> Optional[float]:
-        """Loss function for the current step."""
-        return self._loss_mean
-    
-    @property
-    def loss_variance(self) -> Optional[float]:
-        """Loss function for the current step."""
-        return self._loss_variance
-
-    def get_Ebar(self, samples: qtx.sampler.Samples) -> jax.Array:
-        phi = self._target_state(samples.spins)
-        psi = samples.psi
-        ratio = phi / psi
-        reweight = samples.reweight_factor
-
-        ratio_mean = jnp.mean(ratio * reweight)
-        ratio_var = jnp.abs(ratio - ratio_mean) ** 2
-        self._loss_mean = ratio_mean.real
-        self._loss_variance = jnp.mean(ratio_var * samples.reweight_factor).real
-
-        ratio = ratio / ratio_mean - 1
-        Ebar = -ratio * jnp.sqrt(reweight / samples.nsamples)
-        return Ebar
-
-
-
 class Supervised_KL_Sign(qtx.optimizer.StochasticQNGD):
     """Supervised loss on log-amplitude + sign, in the spirit of arXiv:2507.13322.
 
@@ -390,127 +350,6 @@ class SupervisedExact_KL_Sign(qtx.optimizer.SupervisedExact):
         Obar = self.get_Obar(psi)
         step = self.solve(Obar, epsilon)
         return step
-
-
-def _squeezed_dominance_from_spins(
-    spins: jax.Array,
-    hopping_particle: int,
-    n_particles: int,
-    root_cumsum: jax.Array,
-) -> jax.Array:
-    Nmodes = spins.shape[-1]
-    # Keep only occupied positions and extract the N largest directly.
-    # This avoids sorting the full mode axis for every connected configuration.
-    pos = jnp.where(spins == hopping_particle, jnp.arange(Nmodes), -1)
-    pos_desc, _ = lax.top_k(pos, n_particles)
-    return jnp.all(jnp.cumsum(pos_desc, axis=-1) <= root_cumsum, axis=-1)
-
-
-class _SqueezedEnergyMixin:
-    def _init_squeezed_energy(
-        self, root_partition: jax.Array, hopping_particle: int
-    ) -> None:
-        # Cache the root prefix sums once. The dominance test then becomes
-        # a simple cumulative-sum comparison on connected configurations.
-        root_desc = jnp.sort(jnp.asarray(root_partition))[::-1]
-        self._root_partition = root_desc
-        self._root_cumsum = jnp.cumsum(root_desc)
-        self._n_particles = root_desc.shape[0]
-        self._hopping_particle = hopping_particle
-
-    def _squeezed_Oloc(self, samples: qtx.sampler.Samples) -> jax.Array:
-        """Compute the local energy after projecting H onto the squeezed sector."""
-        state = self._state
-        forward_chunk = getattr(state, "forward_chunk", None)
-        ref_chunk = getattr(state, "ref_chunk", None)
-
-        spins = samples.spins
-        psi = samples.psi
-        internal = samples.state_internal
-
-        Oloc = self._hamiltonian.apply_diag(spins)
-        off_diags = self._hamiltonian.apply_off_diag(spins)
-
-        for nflips, (s_conn, H_conn) in off_diags.items():
-            # Project H onto the squeezed sector by discarding matrix elements
-            # that connect the sampled state to configurations outside the
-            # root-dominated basis.
-            valid_conn = _squeezed_dominance_from_spins(
-                s_conn,
-                self._hopping_particle,
-                self._n_particles,
-                self._root_cumsum,
-            )
-            H_conn = jnp.where(valid_conn, H_conn, 0)
-            conn_size = _get_conn_size(H_conn, forward_chunk).item()
-
-            if conn_size == 0:
-                continue
-
-            def get_Oloc_terms(spins, psi, s_conn, H_conn, internal):
-                segment, s_conn, H_conn = _get_conn(s_conn, H_conn, conn_size)
-                if internal is None:
-                    internal = state.init_internal(spins)
-                psi_conn = state.segment_ref_forward(
-                    s_conn, spins, {"nflips": nflips}, segment, internal
-                )
-                return _get_Olocx(psi, segment, psi_conn, H_conn)
-
-            in_axes = (0, 0, 0, 0, None) if internal is None else 0
-            get_Oloc_terms = chunk_map(get_Oloc_terms, in_axes, chunk_size=ref_chunk)
-            Oloc += get_Oloc_terms(spins, psi, s_conn, H_conn, internal)
-
-        return Oloc
-
-    def get_Ebar(self, samples: qtx.sampler.Samples) -> jax.Array:
-        Eloc = self._squeezed_Oloc(samples).astype(get_default_dtype())
-        Emean = jnp.mean(Eloc * samples.reweight_factor)
-        self._energy = Emean.real
-        Evar = jnp.abs(Eloc - Emean) ** 2
-        self._VarE = jnp.mean(Evar * samples.reweight_factor).real
-
-        Eloc -= jnp.mean(Eloc)
-        Eloc *= jnp.sqrt(samples.reweight_factor / samples.nsamples)
-        return Eloc
-
-
-class SqueezedSR(_SqueezedEnergyMixin, qtx.optimizer.SR):
-    def __init__(
-        self,
-        state: qtx.state.Variational,
-        hamiltonian: qtx.operator.Operator,
-        root_partition: jax.Array,
-        hopping_particle: int = 1,
-        imag_time: bool = True,
-        solver: Optional[Callable] = None,
-    ):
-        super().__init__(state, hamiltonian, imag_time, solver)
-        self._init_squeezed_energy(root_partition, hopping_particle)
-
-
-class SqueezedAdamSR(_SqueezedEnergyMixin, qtx.optimizer.AdamSR):
-    def __init__(
-        self,
-        state: qtx.state.Variational,
-        hamiltonian: qtx.operator.Operator,
-        root_partition: jax.Array,
-        hopping_particle: int = 1,
-        imag_time: bool = True,
-        solver: Optional[Callable] = None,
-        mu: float = 0.95,
-        beta: float = 0.995,
-        file: Union[None, str] = None,
-    ):
-        super().__init__(
-            state,
-            hamiltonian,
-            imag_time=imag_time,
-            solver=solver,
-            mu=mu,
-            beta=beta,
-            file=file,
-        )
-        self._init_squeezed_energy(root_partition, hopping_particle)
 
 
 class PenaltySplitGrad:
@@ -785,3 +624,8 @@ class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
     def Eloc_max_dev(self):
         r"""Largest deviation of a single sample's local energy, see the gradient source."""
         return getattr(self._grad, "Eloc_max_dev", None)
+
+    @property
+    def nonfinite(self):
+        r"""Samples dropped for a non-finite local energy, see the gradient source."""
+        return getattr(self._grad, "nonfinite", None)
