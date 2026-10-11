@@ -14,13 +14,26 @@ from ..quantumhall_optimizers import PenaltySplitGrad
 from .state_set import NaturalStateSet, _stack_psi_arrays
 
 
-def _scale_psi_matrix(psi_matrix: PsiArray) -> tuple[jax.Array, jax.Array]:
+def _scale_psi_matrix(psi_matrix: PsiArray) -> tuple[jax.Array, jax.Array, jax.Array]:
     r"""
-    Apply the per-row stabilization to an evaluated NES matrix.
+    Apply the per-row and per-column stabilization to an evaluated NES matrix.
 
-    If ``A[i, a] = psi_a(s_i)`` and ``D[i, i] = exp(row_shift[i])``, this returns
-    ``A_scaled = D^{-1} A``. The same row scaling must be used for ``B`` in the
-    local-energy trace, so that ``solve(A_scaled, D^{-1} B) = A^{-1} B``.
+    If ``A[i, a] = psi_a(s_i)``, ``D[i, i] = exp(row_shift[i])`` and
+    ``C[a, a] = exp(col_shift[a])``, this returns ``A_scaled = D^{-1} A C^{-1}``. The same
+    scalings must be applied to ``B`` in the local-energy trace, ``B -> D^{-1} B C^{-1}``,
+    so that ``tr(pinv(A_scaled) D^{-1} B C^{-1}) = tr(A^{-1} B)``; the log-derivative
+    coefficients ``(A^{-1})_{ai} A_{ia}`` of `NaturalExcitedSR.get_Obar` are unchanged by it
+    as they stand.
+
+    The columns matter because the member states are unnormalized and nothing in
+    ``tr(S^{-1} H)`` fixes their scales, which drift apart during training. Without the
+    column shift, a member a few orders of magnitude below the others leaves ``A_scaled``
+    ill-conditioned by that ratio alone, and ``pinv`` -- an SVD with a relative cutoff,
+    ~3.6e-6 in float32 for 3x3 -- discards it as if it were a genuine linear dependence:
+    the trace and the gradient then silently lose that member (N=8, three members: a
+    member at 1e-6 of the others gave a sampled trace of E_0 + E_1). Both shifts are taken
+    in the log domain before exponentiating, so a member far below the others does not
+    underflow either.
 
     It takes the matrix rather than ``(states, spins)`` because the local energy
     already holds the amplitudes it is built from, and must not evaluate them twice.
@@ -28,8 +41,11 @@ def _scale_psi_matrix(psi_matrix: PsiArray) -> tuple[jax.Array, jax.Array]:
     psi_matrix = LogArray.from_value(psi_matrix)
     row_shift = jnp.max(psi_matrix.logabs, axis=-1)
     row_shift = jnp.where(jnp.isfinite(row_shift), row_shift, 0.0)
-    scaled = psi_matrix.sign * jnp.exp(psi_matrix.logabs - row_shift[..., None])
-    return scaled, row_shift
+    rel = psi_matrix.logabs - row_shift[..., None]
+    col_shift = jnp.max(rel, axis=-2)
+    col_shift = jnp.where(jnp.isfinite(col_shift), col_shift, 0.0)
+    scaled = psi_matrix.sign * jnp.exp(rel - col_shift[..., None, :])
+    return scaled, row_shift, col_shift
 
 
 class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
@@ -119,7 +135,7 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
         flat_spins = to_distributed_array(tuple_spins.reshape(nsamples * Nstates, Nmodes))
         psi_columns = [state(flat_spins) for state in states.states]
         psi_matrix = _stack_psi_arrays(psi_columns, axis=-1)
-        S_scaled, row_shift = _scale_psi_matrix(
+        S_scaled, row_shift, col_shift = _scale_psi_matrix(
             psi_matrix.reshape(nsamples, Nstates, Nstates)
         )
 
@@ -135,7 +151,8 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
                 operator_columns.append(Oloc * psi)
 
         Sinv = jnp.linalg.pinv(S_scaled)
-        row_scale = jnp.exp(-row_shift[..., None])
+        # B gets the same row and column scalings as A, see `_scale_psi_matrix`
+        row_scale = jnp.exp(-row_shift[..., None] - col_shift[..., None, :])
 
         traces = []
         for operator_columns in columns:
@@ -430,7 +447,9 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
                 f"{tuple_spins.shape}."
             )
 
-        A_scaled, _ = _scale_psi_matrix(self.states.psi_matrix(tuple_spins))
+        # (A^-1)_{ai} A_{ia} is invariant under the column scaling, so the equilibrated
+        # matrix gives the same coefficients, only without pinv truncating a small member
+        A_scaled, _, _ = _scale_psi_matrix(self.states.psi_matrix(tuple_spins))
         Ainv = jnp.linalg.pinv(A_scaled)
 
         # `jacobians` skips frozen states, so the yield order is not the member-state
