@@ -25,5 +25,5 @@ cuda12 = [
 ]
 
 [tool.setuptools]
-packages = ["qhuantax", "qhuantax.nes", "qhuantax.penalty"]
+packages = ["qhuantax", "qhuantax.nes", "qhuantax.penalty", "qhuantax.rotated"]
 package-dir = { "qhuantax" = "src" }

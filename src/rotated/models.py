@@ -8,8 +8,7 @@ only reassigns the flavour of singly occupied orbitals, so it preserves the orbi
 
 .. math::
 
-    (R\psi)(s) = \det\big([R_1 M(n)]_{\mathrm{occ}(s)}\big), \qquad
-    (R\psi)(s) = \mathrm{pf}\big([R_1 M J M^T R_1^T]_{\mathrm{occ}(s),\mathrm{occ}(s)}\big),
+    (R\psi)(s) = \det\big([R_1 M(n)]_{\mathrm{occ}(s)}\big),
 
 with :math:`R_1` mixing the (up :math:`m`, down :math:`m`) rows by
 :math:`\begin{pmatrix}c&-s\\s&c\end{pmatrix}`, :math:`c,s=\cos,\sin\frac\theta2`
@@ -17,8 +16,8 @@ with :math:`R_1` mixing the (up :math:`m`, down :math:`m`) rows by
 orbital and is exact; ``theta`` is a leaf, so it can be fixed (mask its gradient) or trained.
 
 With ``charge_only=False`` the network sees the flavours and the same formula is just a
-flavour-aware backflow written in a rotated frame: no less expressive than ``DetBackflow`` /
-``PfBackflow`` (at ``theta=0`` it is identical to them), but no longer exactly
+flavour-aware backflow written in a rotated frame: no less expressive than ``DetBackflow``
+(at ``theta=0`` it is identical to it), but no longer exactly
 :math:`R(\theta)` of the ``theta=0`` state. ``untie`` switches a charge-only model over without
 changing a single amplitude, which is the transfer from the exactly rotated :math:`h=0` reference to a
 model trained at :math:`h>0`.
@@ -29,8 +28,8 @@ tree is that of the ordinary ``Transformer``. ``untie`` copies row 1 (up only) i
 
 Limitation of a single term, from ``docs``/the k=2 tests: on the configurations without charge
 fluctuations (one electron per orbital, which carry ~90% of the :math:`h=0`, :math:`k=2` state) a
-charge-only model is one *fixed* determinant or Pfaffian. A determinant, or any Pfaffian with exact
-:math:`k=2` support, then gives amplitudes :math:`T(p,p')` of rank :math:`\le4` there.
+charge-only model is one *fixed* determinant, which gives amplitudes :math:`T(p,p')` of rank
+:math:`\le4` there; ``RotatedMultiDetBackflow`` adds terms to lift this.
 """
 
 from typing import Callable
@@ -38,7 +37,6 @@ from typing import Callable
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import lrux
 from jax.typing import DTypeLike
 from quantax.global_defs import get_sites, get_subkeys
 from quantax.nn import fermion_idx, fermion_inverse_sign, lecun_normal
@@ -74,7 +72,8 @@ class _RotatedBackflow(eqx.Module):
 
     def _init_common(self, net, d, U0, W, theta, charge_only, dtype, rescale):
         self.net = net
-        self.dtype = dtype
+        # float64 becomes float32 when x64 is off (NES runs load the float64 members of the ansatz script)
+        self.dtype = dtype = jax.dtypes.canonicalize_dtype(dtype)
         self.charge_only = bool(charge_only)
         U0 = jnp.asarray(U0, dtype)
         if U0.shape[0] != get_sites().Nfmodes:
@@ -129,48 +128,6 @@ class RotatedDetBackflow(_RotatedBackflow):
         return LogArray(sign, logabs) * fermion_inverse_sign(s)
 
 
-class RotatedPfBackflow(_RotatedBackflow):
-    r""":math:`\psi(s)=\mathrm{pf}\big([R_1MJM^TR_1^T]_{\mathrm{occ}(s),\mathrm{occ}(s)}\big)`,
-    :math:`M=U_0+X(s)W^T`.
-
-    ``J0`` stores the strict upper triangle of the skew pairing matrix, as ``PfBackflow`` does.
-
-    :param U0: unrotated reference, ``(2*nm, ncols)``; ``ncols = 2*nm`` for ``PfBackflow``'s
-        shape. If only ``Ntotal`` columns are nonzero the model is a determinant times
-        :math:`\mathrm{pf}(J)` on those columns (``pf_from_det``).
-    :param J0: full ``(ncols, ncols)`` skew matrix, or its upper triangle; default
-        ``lrux.skew_eye``.
-    """
-
-    J0: jax.Array
-
-    def __init__(self, net, U0, d=None, theta=0.0, charge_only=True, W=None, J0=None,
-                 dtype=jnp.float64, rescale=True):
-        self._init_common(net, d, U0, W, theta, charge_only, dtype, rescale)
-        ncols = self.U0.shape[1]
-        if J0 is None:
-            J0 = lrux.skew_eye(ncols // 2, dtype)
-        J0 = jnp.asarray(J0, dtype)
-        if J0.ndim == 2:
-            J0 = J0[jnp.triu_indices(ncols, k=1)]
-        self.J0 = J0
-
-    @property
-    def J0_full(self) -> jax.Array:
-        ncols = self.U0.shape[1]
-        J = jnp.zeros((ncols, ncols), self.dtype).at[jnp.triu_indices(ncols, k=1)].set(self.J0)
-        return J - J.T
-
-    def _fields(self) -> dict:
-        return {**super()._fields(), "J0": self.J0}
-
-    def __call__(self, s: jax.Array) -> LogArray:
-        idx = fermion_idx(s)
-        M = self.orbitals(s)[idx]
-        sign, logabs = lrux.slogpf(M @ self.J0_full @ M.T)
-        return LogArray(sign, logabs) * fermion_inverse_sign(s)
-
-
 class RotatedMultiDetBackflow(_RotatedBackflow):
     r""":math:`\psi(s)=\sum_a c_a\det\big([R_1(\theta)(U_0^a+X(s)W_a^T)]_{\mathrm{occ}(s)}\big)`: one
     network, one reference and one ``W`` per determinant.
@@ -190,7 +147,7 @@ class RotatedMultiDetBackflow(_RotatedBackflow):
     def __init__(self, net, U0, d=None, theta=0.0, charge_only=True, W=None, coeffs=None,
                  dtype=jnp.float64, rescale=True):
         self.net = net
-        self.dtype = dtype
+        self.dtype = dtype = jax.dtypes.canonicalize_dtype(dtype)    # float32 when x64 is off
         self.charge_only = bool(charge_only)
         U0 = jnp.asarray(U0, dtype)
         if U0.ndim != 3 or U0.shape[1] != get_sites().Nfmodes:
