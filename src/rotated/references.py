@@ -98,5 +98,5 @@ def pf_from_det(model: RotatedDetBackflow, noise: float = 0.0, seed: int = 0) ->
 def set_gap(model, gap: float):
     r"""Reset the up-feature suppression of the last FFN bias to :math:`e^{-g}` (``block_backflow``
     puts :math:`g=20`); a smaller :math:`g` lets the up features, and their gradients, back in."""
-    b2 = model.net.layers[-2].b2.at[0::2].set(-gap * np.sqrt(model.net.nblocks + 1))
+    b2 = model.net.layers[-2].b2.at[0::2].set(-gap * float(np.sqrt(model.net.nblocks + 1)))
     return eqx.tree_at(lambda m: m.net.layers[-2].b2, model, b2)

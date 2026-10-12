@@ -577,7 +577,7 @@ def block_backflow(model, k: int, gap: float = 20.0):
     Ntot = model.W.shape[0]
     W_mask = jnp.zeros_like(model.W).at[Ntot - k:, :].set(1.0)
     model = eqx.tree_at(lambda m: m.W, model, model.W * W_mask)
-    b2 = model.net.layers[-2].b2.at[0::2].set(-gap * np.sqrt(model.net.nblocks + 1))
+    b2 = model.net.layers[-2].b2.at[0::2].set(-gap * float(np.sqrt(model.net.nblocks + 1)))
     model = eqx.tree_at(lambda m: m.net.layers[-2].b2, model, b2)
     U0_mask = (jnp.zeros_like(model.U0).at[:Ntot, :Ntot - k].set(1.0)
                .at[Ntot:, Ntot - k:].set(1.0))
