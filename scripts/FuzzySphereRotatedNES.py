@@ -75,6 +75,10 @@ parser.add_argument("--reweight", type=float, default=1.0, help="reweight factor
 parser.add_argument("--flip-prob", type=float, default=0.5, help="fraction of flavour-flip proposals")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--run-id", type=int, default=1)
+parser.add_argument("--cont-run", type=int, default=None,
+                    help="run id under --path to continue from: the members start from that run's checkpoints, "
+                         "as they are (no release); everything else may change, e.g. --lmlp-coeff. The sweep "
+                         "counter, the lr schedule and Adam restart at zero, so --lr is the rate this run opens with")
 parser.add_argument("--path", required=True, help="output directory")
 args = vars(parser.parse_args())
 
@@ -103,6 +107,17 @@ if lmlp_auto and not do_ED:
     parser.error("--lmlp-coeff auto reads the L-resolved spectrum from ED; add --exact-diag")
 if nstates >= 3 and not penalized:
     parser.error("with K >= 3 an L >= 1 level lies inside the window at h_c: give --lmlp-coeff")
+
+cont_run_id = None
+if args["cont_run"] is not None:
+    cont_run_id = f"rotnes_n_{N}_2s_{N-1}_lz_0_z2_{z2}_K_{nstates}_h_{h:g}_id0{args['cont_run']}"
+    if cont_run_id == run_id:
+        parser.error(f"--cont-run {args['cont_run']} would overwrite the run it reads from; "
+                     "give this one a new --run-id")
+    cont_meta_file = Path(f"{path}/meta_{cont_run_id}.json")
+    if not cont_meta_file.is_file():
+        parser.error(f"--cont-run {args['cont_run']}: {cont_meta_file} is missing")
+    cont_meta = json.load(open(cont_meta_file))
 
 Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -133,13 +148,18 @@ def release(member):
     return model
 
 
-models = [release(member) for member in ansatz["members"]]
+if cont_run_id is None:
+    models = [release(member) for member in ansatz["members"]]
+    start = (f"theta {np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}, "
+             f"k=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
+else:
+    # released by the run being continued already, so loaded as they are
+    models = [load_member(m["spec"], N, f"{path}/{m['file']}") for m in cont_meta["members"]]
+    start = f"continued from {cont_run_id} (lambda {cont_meta['lam']:g} there)"
 member_states = [qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
 state_set = NaturalStateSet(member_states)
-print(f"N={N}, h={h}, z2={z2:+d}, K={nstates}: members k = {[m['k'] for m in ansatz['members']]}, theta "
-      f"{np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}, "
-      f"k=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}; {state_set.nparams_per_state} parameters "
-      f"per member", flush=True)
+print(f"N={N}, h={h}, z2={z2:+d}, K={nstates}: members k = {[m['k'] for m in ansatz['members']]}, {start}; "
+      f"{state_set.nparams_per_state} parameters per member", flush=True)
 
 # Chain j opens in exciton sector j: every rotated member reaches it, and distinct sectors keep the tuple's
 # det A away from zero
@@ -236,7 +256,7 @@ if do_ED:
 
 
 meta = dict(args=args, ansatz_meta=str(args["ansatz_meta"]), N=N, z2=z2, h=h, K=nstates, lam=LmLp_coeff,
-            theta=ansatz["theta"],
+            theta=ansatz["theta"], continued_from=cont_run_id,
             members=[dict(k=m["k"], root=m["root"], file=f"state{i}_{run_id}.eqx",
                           spec=member_spec(model, m["spec"]["d"], m["spec"]["nb"], m["spec"]["nh"]))
                      for i, (m, model) in enumerate(zip(ansatz["members"], models))],
