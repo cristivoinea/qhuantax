@@ -66,8 +66,10 @@ parser.add_argument("--adam-clip", type=float, default=0.0, help="cap on the raw
 parser.add_argument("--rshift", type=float, default=None,
                     help="relative diagonal shift of the SR solve; defaults to quantax's")
 parser.add_argument("--max-fs", type=float, default=0.0,
-                    help="trust region: cap on the sampled Fubini-Study size |Obar dtheta|^2 of the update; "
-                         "0 disables")
+                    help="trust region: cap on 1 - F per sweep, F the fidelity of the determinant states "
+                         "det[psi_k(x_j)] before and after the update (= prod cos^2 of the principal angles between "
+                         "the old and new spans). Measured to second order as dtheta^T S dtheta with S from the "
+                         "previous sweep's samples; 0 disables")
 parser.add_argument("--diagnostics", action="store_true", help="record the SR matrix spectrum every 5 sweeps")
 parser.add_argument("--thermal-steps", type=int, default=None,
                     help="sampler thermalisation steps; defaults to the sampler's")
@@ -323,6 +325,10 @@ optimizer = ObarKeepingSR(state_set, tms_H, updater=updater, solver=solver, pena
 
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
 rows = []
+# The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 when
+# the trust region is on): on the batch the step was solved from, the SR fit makes |Obar dtheta|^2 biased low,
+# 10-50x right after the release at N=8
+prev_Obar = optimizer.get_Obar(sampler.sweep()) if max_fs > 0 else None
 start_time = datetime.now()
 for i in range(nsweeps):
     samples = sampler.sweep()
@@ -334,25 +340,28 @@ for i in range(nsweeps):
                            f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc, "
                            f"{optimizer.nonfinite_grad} for the log-derivative")
 
-    # Cap the step norm, then (--max-fs) the update's sampled Fubini-Study size, ~ 1 - fidelity of the step
+    # Cap the step norm, then (--max-fs) the step's 1 - F, measured to second order as dtheta^T S dtheta: `fs` on
+    # the previous sweep's batch, `fs_same` on this one (biased low, for comparison)
     step_norm = float(jnp.linalg.norm(step))
     if 0 < norm_clip < step_norm:
         step = step * (norm_clip / step_norm)
     dtheta = step * adaptive_learning_rate_inv(lr0, t0, i)
-    fs = fs_applied = float(jnp.sum(jnp.abs(optimizer.last_Obar @ dtheta)**2))
+    fs_same = float(jnp.sum(jnp.abs(optimizer.last_Obar @ dtheta)**2))
+    fs = fs_applied = np.nan if prev_Obar is None else float(jnp.sum(jnp.abs(prev_Obar @ dtheta)**2))
     if 0 < max_fs < fs:
         dtheta, fs_applied = dtheta * np.sqrt(max_fs / fs), max_fs
     state_set.update(state_set.split_step(dtheta))
+    prev_Obar = optimizer.last_Obar
 
     g_norm = optimizer._buffers.get("g_norm")
     diag = optimizer.diagnostics if args["diagnostics"] else {}
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
-                 fs, fs_applied))
+                 fs, fs_applied, fs_same))
     np.savetxt(f"{path}/data_energy_{run_id}.txt",
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied")
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same")
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
 
