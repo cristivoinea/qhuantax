@@ -2,7 +2,8 @@
 # The members are released before training: untied (the features may then depend on the flavour, no amplitude
 # changes), the k=2 up-feature suppression lowered to exp(-gap), and the k=0,1 determinants (W = 0, where the
 # network has no gradient and the first SR steps blow up) given a small random backflow. The angle stays
-# trainable. With K >= 3 an L >= 1 level lies inside the window at h_c, so --lmlp-coeff is needed.
+# trainable. With K >= 3 an L >= 1 level lies inside the window at h_c, so --lmlp-coeff is needed; --lmlp-bump-var
+# doubles it once the penalty's sampled variance has come down, since its noise is lambda^2 Var(L^- L^+).
 # --exact-diag tracks the members against the lowest L=0 levels of the (Lz=0, z2) block, cached in --ed-dir.
 #
 #   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_h_3.16_id04.json \
@@ -49,6 +50,11 @@ parser.add_argument("--lmlp-margin", type=float, default=0.1,
                     help="auto: every L >= 1 level ends this far above the K-th L=0 level")
 parser.add_argument("--lmlp-freq", type=int, default=None,
                     help="how often to measure <H> and <L^- L^+> separately; defaults to 1 with a penalty")
+parser.add_argument("--lmlp-bump-var", type=float, default=0.0,
+                    help="double lambda, once, when the sampled Var(L^- L^+) averaged over the last "
+                         "--lmlp-bump-window sweeps drops below this (the penalty's noise is lambda^2 Var(L^- L^+), "
+                         "large while the members are far from L=0); 0 disables")
+parser.add_argument("--lmlp-bump-window", type=int, default=50, help="sweeps averaged for --lmlp-bump-var")
 parser.add_argument("--exact-diag", action="store_true", help="track the members against ED (feasible up to N=14)")
 parser.add_argument("--ed-every", type=int, default=5, help="ED readout every this many sweeps")
 parser.add_argument("--ed-k", type=int, default=10,
@@ -60,8 +66,8 @@ parser.add_argument("--nbr-samples", type=int, default=512, help="number of samp
 parser.add_argument("--updater", default="adam", choices=("plain", "adam"))
 parser.add_argument("--lr", type=float, default=1e-2, help="starting value of the learning rate")
 parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0); defaults to N")
-parser.add_argument("--norm-clip", type=float, default=5.0,
-                    help="cap on the step norm before the learning rate; <= 0 disables")
+parser.add_argument("--norm-clip", type=float, default=0.0,
+                    help="cap on the step norm before the learning rate; <= 0 (default) disables")
 parser.add_argument("--adam-clip", type=float, default=0.0, help="cap on the raw SR solve inside Adam; 0 disables")
 parser.add_argument("--rshift", type=float, default=None,
                     help="relative diagonal shift of the SR solve; defaults to quantax's")
@@ -109,6 +115,8 @@ if lmlp_auto and not do_ED:
     parser.error("--lmlp-coeff auto reads the L-resolved spectrum from ED; add --exact-diag")
 if nstates >= 3 and not penalized:
     parser.error("with K >= 3 an L >= 1 level lies inside the window at h_c: give --lmlp-coeff")
+if args["lmlp_bump_var"] > 0 and not (penalized and LmLp_freq == 1):
+    parser.error("--lmlp-bump-var needs a penalty measured every sweep (--lmlp-coeff, --lmlp-freq 1)")
 
 cont_run_id = None
 if args["cont_run"] is not None:
@@ -357,11 +365,24 @@ for i in range(nsweeps):
     diag = optimizer.diagnostics if args["diagnostics"] else {}
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
-                 fs, fs_applied, fs_same))
+                 fs, fs_applied, fs_same, optimizer.penalty_coeff))
     np.savetxt(f"{path}/data_energy_{run_id}.txt",
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same")
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda")
+
+    # --lmlp-bump-var: lambda doubles once, from the next sweep, when the penalty's variance has come down
+    window = args["lmlp_bump_window"]
+    if args["lmlp_bump_var"] > 0 and "lam_bump" not in meta and len(rows) >= window:
+        var_penalty = np.mean([float(np.real(row[6])) for row in rows[-window:]])
+        if var_penalty < args["lmlp_bump_var"]:
+            meta["lam_bump"] = dict(sweep=i, var_penalty=var_penalty, lam_from=optimizer.penalty_coeff,
+                                    lam_to=2 * optimizer.penalty_coeff)
+            optimizer.penalty_coeff = 2 * optimizer.penalty_coeff
+            save_meta()
+            print(f"  sweep {i:5d}: Var(L^- L^+) over the last {window} sweeps {var_penalty:.3g} < "
+                  f"{args['lmlp_bump_var']:g}, lambda {meta['lam_bump']['lam_from']:g} -> "
+                  f"{optimizer.penalty_coeff:g}", flush=True)
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
 

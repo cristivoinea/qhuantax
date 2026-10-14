@@ -361,6 +361,15 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
         r"""Sample variance of :math:`\mathrm{tr}(S^{-1} P)`, see the gradient source."""
         return getattr(self._grad, "VarPenalty", None)
 
+    @property
+    def penalty_coeff(self) -> float:
+        r"""The multiplier :math:`\lambda` on the penalty; setting it takes effect from the next step."""
+        return self._grad.penalty_coeff
+
+    @penalty_coeff.setter
+    def penalty_coeff(self, value: float) -> None:
+        self._grad.penalty_coeff = value
+
     # Gram eigenvalues below this fraction of the largest are treated as unresolved.
     # Comfortably above the float32 eigensolver noise floor (~1e-8 relative), while still
     # a tight rank criterion.

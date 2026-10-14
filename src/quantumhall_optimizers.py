@@ -377,11 +377,17 @@ class PenaltySplitGrad:
     _nonfinite = None
 
     def _init_penalty(self, hamiltonian, penalty, penalty_coeff, penalty_every) -> None:
-        self._penalty_coeff = float(penalty_coeff)
         self._penalty_every = max(0, int(penalty_every))
         # Measuring and penalizing are independent: a zero coefficient still lets the
         # penalty label the state without biasing it, and 0 penalizes without measuring.
         self._penalty_op = penalty if self._penalty_every else None
+        self._penalty_terms = (hamiltonian, penalty)
+        self._set_penalty_coeff(penalty_coeff)
+        self._steps = 0
+
+    def _set_penalty_coeff(self, penalty_coeff) -> None:
+        self._penalty_coeff = float(penalty_coeff)
+        hamiltonian, penalty = self._penalty_terms
         # Only built when it is actually reached, since summing the operators is not
         # free -- and with a zero coefficient the sum is just the Hamiltonian.
         self._merged_op = (
@@ -389,7 +395,6 @@ class PenaltySplitGrad:
             if penalty is not None and self._penalty_coeff and self._penalty_every != 1
             else None
         )
-        self._steps = 0
 
     @property
     def penalty(self):
@@ -398,8 +403,12 @@ class PenaltySplitGrad:
 
     @property
     def penalty_coeff(self) -> float:
-        r"""The multiplier :math:`\lambda` on `penalty`."""
+        r"""The multiplier :math:`\lambda` on `penalty`; may be changed between steps (a schedule)."""
         return self._penalty_coeff
+
+    @penalty_coeff.setter
+    def penalty_coeff(self, value: float) -> None:
+        self._set_penalty_coeff(value)
 
     @property
     def penalty_every(self) -> int:
