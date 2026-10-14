@@ -13,8 +13,10 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import quantax as qtx
@@ -76,9 +78,17 @@ parser.add_argument("--max-fs", type=float, default=0.0,
                          "det[psi_k(x_j)] before and after the update (= prod cos^2 of the principal angles between "
                          "the old and new spans). Measured to second order as dtheta^T S dtheta with S from the "
                          "previous sweep's samples; 0 disables")
-parser.add_argument("--diagnostics", action="store_true", help="record the SR matrix spectrum every 5 sweeps")
+parser.add_argument("--diagnostics", action="store_true",
+                    help="record the SR matrix spectrum every 5 sweeps and the sampler's acceptance every sweep "
+                         "(columns moved, valid: moved/valid is the Metropolis acceptance of the joint tuple move)")
+parser.add_argument("--profile", action="store_true",
+                    help="time each part of a sweep (sampling, local energies of H and L^- L^+, log-derivatives, "
+                         "SR solve, update, ED readout, output) into data_profile_<run_id>.txt")
 parser.add_argument("--thermal-steps", type=int, default=None,
                     help="sampler thermalisation steps; defaults to the sampler's")
+parser.add_argument("--sweep-steps", type=int, default=None,
+                    help="Metropolis steps between samples (each moves all K configurations of a tuple); defaults "
+                         "to the sampler's 2 K 2N. Check it with NESSamplerAutocorr.py --sweep-test")
 parser.add_argument("--reweight", type=float, default=1.0, help="reweight factor for training sampling")
 parser.add_argument("--flip-prob", type=float, default=0.5, help="fraction of flavour-flip proposals")
 parser.add_argument("--seed", type=int, default=0)
@@ -179,7 +189,8 @@ init_configs = np.stack([ksectors.configs(j)[rng.integers(ksectors.dim(j), size=
                          for j in range(nstates)], axis=1)
 sampler = NaturalLzDetFlavourFlipSampler(state_set, nsamples, n_neighbor=np.arange(1, 3),
                                          initial_spins=init_configs, reweight=args["reweight"],
-                                         flip_prob=args["flip_prob"], thermal_steps=args["thermal_steps"])
+                                         flip_prob=args["flip_prob"], thermal_steps=args["thermal_steps"],
+                                         sweep_steps=args["sweep_steps"])
 
 
 def L_from_L2(q):
@@ -333,12 +344,46 @@ optimizer = ObarKeepingSR(state_set, tms_H, updater=updater, solver=solver, pena
 
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
 rows = []
+
+# --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
+# parts add up to the sweep; the first sweeps also contain compilation
+PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "solve", "update", "readout", "output")
+timings, profile_rows = {}, []
+
+
+def timed(key, fn):
+    def run(*a, **k):
+        t = perf_counter()
+        out = jax.block_until_ready(fn(*a, **k))
+        timings[key] = timings.get(key, 0.0) + perf_counter() - t
+        return out
+    return run
+
+
+def profile_summary(first=2):
+    p = np.array(profile_rows)[first:]
+    if len(p) == 0:
+        return "no sweeps after compilation yet"
+    mean = p.mean(0)
+    return (f"{mean[1]:.2f} s per sweep (sweeps {first}-{int(p[-1, 0])}): "
+            + ", ".join(f"{c} {m / mean[1]:.0%}" for c, m in zip(PROFILE_COLUMNS + ("rest",), mean[2:])))
+
+
+if args["profile"]:
+    sampler.sweep = timed("sample", sampler.sweep)
+    tms_H.Oloc = timed("eloc_H", tms_H.Oloc)
+    tms_LmLp.Oloc = timed("eloc_LmLp", tms_LmLp.Oloc)
+    optimizer.get_Ebar = timed("ebar", optimizer.get_Ebar)
+    optimizer.get_Obar = timed("obar", optimizer.get_Obar)
+    optimizer.solve = timed("solve", optimizer.solve)
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 when
 # the trust region is on): on the batch the step was solved from, the SR fit makes |Obar dtheta|^2 biased low,
 # 10-50x right after the release at N=8
 prev_Obar = optimizer.get_Obar(sampler.sweep()) if max_fs > 0 else None
 start_time = datetime.now()
 for i in range(nsweeps):
+    timings.clear()
+    t_sweep = perf_counter()
     samples = sampler.sweep()
     step = optimizer.get_step(samples)
 
@@ -350,6 +395,7 @@ for i in range(nsweeps):
 
     # Cap the step norm, then (--max-fs) the step's 1 - F, measured to second order as dtheta^T S dtheta: `fs` on
     # the previous sweep's batch, `fs_same` on this one (biased low, for comparison)
+    t = perf_counter()
     step_norm = float(jnp.linalg.norm(step))
     if 0 < norm_clip < step_norm:
         step = step * (norm_clip / step_norm)
@@ -360,16 +406,21 @@ for i in range(nsweeps):
         dtheta, fs_applied = dtheta * np.sqrt(max_fs / fs), max_fs
     state_set.update(state_set.split_step(dtheta))
     prev_Obar = optimizer.last_Obar
+    if args["profile"]:
+        jax.block_until_ready([st.model for st in state_set.states])
+        timings["update"] = perf_counter() - t
 
+    t = perf_counter()
     g_norm = optimizer._buffers.get("g_norm")
     diag = optimizer.diagnostics if args["diagnostics"] else {}
+    acceptance = sampler.acceptance if args["diagnostics"] else {}
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
-                 fs, fs_applied, fs_same, optimizer.penalty_coeff))
+                 fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid")))
     np.savetxt(f"{path}/data_energy_{run_id}.txt",
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda")
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid")
 
     # --lmlp-bump-var: lambda doubles once, from the next sweep, when the penalty's variance has come down
     window = args["lmlp_bump_window"]
@@ -385,14 +436,28 @@ for i in range(nsweeps):
                   f"{optimizer.penalty_coeff:g}", flush=True)
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
+    timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}" + ("" if g_norm is None else f"  |g| = {float(g_norm):.3e}")
-            + f"  fs = {fs:.2e}")
+            + f"  fs = {fs:.2e}"
+            + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == nsweeps - 1):
+        t = perf_counter()
         line += "  | " + record_exact(i)
+        timings["readout"] = perf_counter() - t
     if i < 5 or i % 10 == 0 or i == nsweeps - 1:
         print(line, flush=True)
+
+    if args["profile"]:
+        total = perf_counter() - t_sweep
+        timings["ebar_rest"] = timings.get("ebar", 0.0) - timings.get("eloc_H", 0.0) - timings.get("eloc_LmLp", 0.0)
+        parts = [timings.get(c, 0.0) for c in PROFILE_COLUMNS]
+        profile_rows.append([i, total, *parts, total - sum(parts)])
+        np.savetxt(f"{path}/data_profile_{run_id}.txt", np.array(profile_rows),
+                   header="seconds: sweep total " + " ".join(PROFILE_COLUMNS) + " rest")
+        if i in (10, 50) or i == nsweeps - 1:
+            print("  profile: " + profile_summary(), flush=True)
 
 print("NES training completed in: ", datetime.now() - start_time)
 meta["time"] = str(datetime.now() - start_time)

@@ -146,14 +146,28 @@ class NaturalDetSampler(NaturalDetAbstractSampler):
         self._spins = samples.spins
         return samples
 
+    @property
+    def acceptance(self) -> dict:
+        r"""
+        Over the Metropolis steps and chains of the last sweep: ``moved``, the fraction of
+        steps that changed the tuple, and ``valid``, the fraction whose proposal was a real
+        move (something changed, no doubly occupied orbital). ``moved / valid`` is the
+        Metropolis acceptance of the joint move of all ``Nstates`` configurations.
+        """
+        return {key: float(value) for key, value in self._acceptance.items()}
+
     def _partial_sweep(self, nsweeps: int, spins: jax.Array) -> Samples:
         psi = self.determinant(spins)
         samples = Samples(spins, psi)
 
         keys_propose = get_subkeys(nsweeps)
         keys_update = get_subkeys(nsweeps)
+        moved = valid = 0.0
         for keyp, keyu in zip(keys_propose, keys_update):
             samples = self._single_sweep(keyp, keyu, samples)
+            # device scalars, summed without a host sync per step
+            moved, valid = moved + self._step_moved, valid + self._step_valid
+        self._acceptance = dict(moved=moved / max(nsweeps, 1), valid=valid / max(nsweeps, 1))
 
         return Samples(samples.spins, samples.psi, None, self._get_reweight_factor(samples.psi))
 
@@ -195,6 +209,8 @@ class NaturalDetSampler(NaturalDetAbstractSampler):
 
         updated = jnp.any(old_samples.spins != new_samples.spins, axis=(1, 2))
         cond = accepted & updated & occ_allowed
+        self._step_moved = jnp.mean(cond)                      # read by `_partial_sweep`
+        self._step_valid = jnp.mean(updated & occ_allowed)
 
         def select(new, old):
             cond_expand = cond.reshape([-1] + [1] * (new.ndim - 1))
