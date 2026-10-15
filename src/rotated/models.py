@@ -176,11 +176,19 @@ class RotatedMultiDetBackflow(_RotatedBackflow):
 
     def __call__(self, s: jax.Array) -> LogArray:
         idx = fermion_idx(s)
-        sign, logabs = jnp.linalg.slogdet(self.orbitals(s)[:, idx])
-        top = jax.lax.stop_gradient(jnp.max(logabs))
+        M = self.orbitals(s)[:, idx]
+        # A term with no weight next to the largest (singular, or below e^-80 of it) adds 0, but the gradient of its
+        # log-determinant goes through M^-1 and 0 * inf = nan reaches every parameter: such terms are swapped for the
+        # identity before the differentiated determinant, and likewise a configuration where every term vanishes
+        _, logabs = jax.lax.stop_gradient(jnp.linalg.slogdet(M))
+        top = jnp.max(logabs)
         top = jnp.where(jnp.isfinite(top), top, 0.0)    # every term exactly 0 outside sector k
-        val = jnp.sum(self.coeffs * sign * jnp.exp(logabs - top))
-        return LogArray(jnp.sign(val), jnp.log(jnp.abs(val)) + top) * fermion_inverse_sign(s)
+        live = logabs > top - 80.0
+        sign, logabs = jnp.linalg.slogdet(jnp.where(live[:, None, None], M, jnp.eye(M.shape[-1], dtype=M.dtype)))
+        val = jnp.sum(jnp.where(live, self.coeffs * sign * jnp.exp(logabs - top), 0.0))
+        safe = jnp.where(val == 0, 1.0, val)
+        return LogArray(jnp.sign(val), jnp.where(val == 0, -jnp.inf, jnp.log(jnp.abs(safe)) + top)) \
+            * fermion_inverse_sign(s)
 
 
 def untie(model: _RotatedBackflow) -> _RotatedBackflow:
