@@ -380,15 +380,22 @@ class KSectors:
     def dim(self, k: int) -> int:
         return len(self.configs(k))
 
-    def block(self, op, k_out: int, k_in: int, chunk: int = 2048):
+    def block(self, op, k_out: int, k_in: int, chunk: int | None = None):
         r""":math:`\langle s'|O|s\rangle` for ``s'`` in sector ``k_out`` and ``s`` in ``k_in``, as a
-        scipy CSR matrix. Connected configurations outside ``k_out`` are dropped."""
+        scipy CSR matrix. Connected configurations outside ``k_out`` are dropped.
+
+        ``apply_off_diag`` builds every connected configuration of a batch at once, so memory goes as
+        ``chunk`` x (number of terms): 68 GB for 2048 configurations of :math:`H_0` at :math:`N=24`.
+        By default ``chunk`` keeps that product below :math:`10^6` (a few GB)."""
         import jax.numpy as jnp
         from scipy.sparse import csr_matrix
 
         cache_key = (id(op), k_out, k_in)
         if cache_key in self._blocks:
             return self._blocks[cache_key]
+        if chunk is None:
+            nterms = sum(len(term.strength) for term in op.op_list)
+            chunk = int(np.clip(1_000_000 // max(nterms, 1), 16, 2048))
 
         s_in = self.configs(k_in)
         keys_out = spins_key(self.configs(k_out))
