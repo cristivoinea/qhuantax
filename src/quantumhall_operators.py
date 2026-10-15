@@ -91,21 +91,27 @@ def qtx_number(f,m):
     else:
         return qtx.operator.number_d(m)
 
-def GetSpinfulDenIntTerms(nm : int, ps_pot : Sequence[int], mat_a : Sequence[int], mat_b : Sequence[int]) -> qtx.operator.Operator:
+def GetSpinfulDenIntTerms(nm : int, ps_pot : Sequence[int], mat_a : Sequence[int], mat_b : Sequence[int],
+                          cutoff : float = 1e-15, return_dropped : bool = False) -> qtx.operator.Operator:
     """
         GetDenIntTerms(nm :: Int64, nf :: Int64[, ps_pot :: Vector{<:Number}][, mat_a :: Matrix{<:Number}[, mat_b :: Matrix{<:Number}]][ ; m_kept :: Vector{Int64}]) :: Terms
 
-    Return the normal-ordered density-density term in the Hamiltonian 
-    ```math 
+    Return the normal-ordered density-density term in the Hamiltonian
+    ```math
     ∑_{\\{m_i,f_i\\}}U_{m_1m_2m_3m_4}M^A_{f_1f_4}M^B_{f_2f_3}c^{†}_{m_1f_1}c^{†}_{m_2f_2}c_{m_3f_3}c_{m_4f_4}.
     ```
 
-    # Arguments 
+    # Arguments
 
     * `nm :: Int64` is the number of orbitals.
-    * `ps_pot :: Vector{<:Number}` is a list of numbers specifying the pseudopotentials for the interacting matrix ``U_{m_1m_2m_3m_4}``. Facultative, `[1.0]` by default. 
+    * `ps_pot :: Vector{<:Number}` is a list of numbers specifying the pseudopotentials for the interacting matrix ``U_{m_1m_2m_3m_4}``. Facultative, `[1.0]` by default.
+    * `cutoff` drops the hopping terms (those changing the configuration, the cost of a local energy) with
+      |coefficient| below it; the diagonal density terms are free to evaluate and always kept down to 1e-15.
+    * `return_dropped` also returns the sum of the dropped |coefficients|: a bound on the norm of the dropped part,
+      so on the shift of every eigenvalue and expectation value.
     """
     H = 0
+    dropped = 0.0
     interaction = get_int_matrix(nm, ps_pot)
 
     for o1 in range(2*nm):
@@ -145,9 +151,11 @@ def GetSpinfulDenIntTerms(nm : int, ps_pot : Sequence[int], mat_a : Sequence[int
                     elif (m1, f1) == (m3, f3) and (m2, f2) == (m4, f4):
                         # c+_1 c+_2 c_1 c_2 = -n_1 n_2
                         H += -val * (qtx_number(f1, m1) @ qtx_number(f2, m2))
+                    elif np.abs(val) < cutoff:
+                        dropped += float(np.abs(val))
                     else:
                         H += val * (qtx_create(f1, m1) @ qtx_create(f2, m2) @ qtx_annihilate(f3, m3) @ qtx_annihilate(f4, m4))
-    return H
+    return (H, dropped) if return_dropped else H
 
 
 def GetSpinfulPolTerms(nm : int, mat : Sequence[int]) -> qtx.operator.Operator:

@@ -199,16 +199,16 @@ k2 = [i for i, k in enumerate(members) if k == 2]
 if args["parallel"] and len(k2) > 1:
     np.savez(f"{work}.npz", spins2=spins2, V2=V2, E2=E2, theta=theta)
     sp.sparse.save_npz(f"{work}_H2.npz", H2)
-    all_cpus = os.sched_getaffinity(0)
+    all_cpus = sorted(os.sched_getaffinity(0))
     if len(all_cpus) < len(k2):
         raise SystemExit(f"--parallel: {len(all_cpus)} CPUs for {len(k2)} k=2 members")
-    shares = [set(map(int, c)) for c in np.array_split(sorted(all_cpus), len(k2))]
+    shares = [set(map(int, c)) for c in np.array_split(all_cpus, len(k2))]
     for i, cpus in zip(k2, shares):
         os.sched_setaffinity(0, cpus)
         children[i] = subprocess.Popen([sys.executable, __file__, *sys.argv[1:], "--fit-member", str(i)],
                                        env={**os.environ, "JAX_NUM_CPU_DEVICES": str(len(cpus))})
     os.sched_setaffinity(0, all_cpus)
-    print(f"k=2 members {k2} fitting in parallel on {[len(c) for c in shares]} CPUs", flush=True)
+    print(f"k=2 members {k2} fitting in parallel, CPUs {[sorted(c) for c in shares]}", flush=True)
 
 
 # The members, built at h = 0 and rotated by setting theta; with --parallel the k=2 ones come from the children
