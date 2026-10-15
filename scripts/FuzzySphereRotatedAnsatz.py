@@ -9,8 +9,8 @@
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 0,1,2,2 --nbr-dets 4 --check --path runs/rot
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 2 --k-root 1 --run-id 2 --path runs/rot
 # --parallel fits the k=2 members at the same time: the parent computes the targets once and starts one child
-# process per member (this script with --fit-member), each pinned to an equal share of the job's CPUs, over which
-# the fit splits the configurations (JAX_NUM_CPU_DEVICES); it then collects them into the one meta file.
+# process per member (this script with --fit-member), each pinned to an equal share of the job's CPUs and splitting
+# its fit over half as many JAX devices; it then collects them into the one meta file.
 import argparse
 import json
 import os
@@ -193,7 +193,8 @@ if 2 in members:
 
 
 # --parallel: the k=2 fits in child processes. Each is pinned to its share of the CPUs by setting it on this thread
-# while the child starts (a child inherits it), and splits its fit over that many JAX devices
+# while the child starts (a child inherits it), and splits its fit over half as many JAX devices: with as many devices
+# as CPUs the children hung at 0% CPU on the cluster (2026-10-15), probably waiting in the cross-device sum
 children = {}
 k2 = [i for i, k in enumerate(members) if k == 2]
 if args["parallel"] and len(k2) > 1:
@@ -206,7 +207,7 @@ if args["parallel"] and len(k2) > 1:
     for i, cpus in zip(k2, shares):
         os.sched_setaffinity(0, cpus)
         children[i] = subprocess.Popen([sys.executable, __file__, *sys.argv[1:], "--fit-member", str(i)],
-                                       env={**os.environ, "JAX_NUM_CPU_DEVICES": str(len(cpus))})
+                                       env={**os.environ, "JAX_NUM_CPU_DEVICES": str(max(1, len(cpus) // 2))})
     os.sched_setaffinity(0, all_cpus)
     print(f"k=2 members {k2} fitting in parallel, CPUs {[sorted(c) for c in shares]}", flush=True)
 
