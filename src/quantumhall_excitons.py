@@ -436,29 +436,41 @@ class KSectors:
             A = A + mu * (self.block(L2, k, k) - self.lz * (self.lz + 1) * identity(A.shape[0]))
         return A.tocsr()
 
-    def eigenstates(self, H0, k: int, nstates: int = 1, L2=None, mu: float = 10.0):
-        r"""Lowest ``nstates`` eigenstates of ``H0`` with exactly ``k`` flips and
-        :math:`L=L_z` (when ``L2`` is given; otherwise any :math:`L\ge L_z`).
+    def eigenstates(self, H0, k: int, nstates: int = 1, L2=None, nlevels: int = 20):
+        r"""Lowest ``nstates`` eigenstates of ``H0`` with exactly ``k`` flips and :math:`L=L_z` (when
+        ``L2`` is given; otherwise any :math:`L\ge L_z`). As in ``FuzzySphereNESTrain``: the lowest
+        ``nlevels`` levels of the block, every :math:`L`, keeping those with :math:`L=L_z` by
+        :math:`\langle L^2\rangle`; ``nlevels`` doubles until ``nstates`` of them are found.
 
-        :return: ``(energies, vectors)``, ``vectors[:, i]`` on ``configs(k)``; the energies are
-            those of ``H0`` itself, since the penalty vanishes on :math:`L=L_z` (checked).
+        :return: ``(energies, vectors)``, ``vectors[:, i]`` on ``configs(k)``.
         """
         from scipy.sparse.linalg import eigsh
 
-        A = self._shifted(H0, k, L2, mu)
-        if A.shape[0] <= 2000:
-            e, V = np.linalg.eigh(A.toarray())
-            e, V = e[:nstates], V[:, :nstates]
-        else:
-            e, V = eigsh(A, k=nstates, which="SA", tol=1e-12)
-            o = np.argsort(e); e, V = e[o], V[:, o]
-        if L2 is not None:
-            L2k = self.block(L2, k, k)
-            leak = np.abs(np.einsum("si,si->i", V, L2k @ V) - self.lz * (self.lz + 1))
-            if np.any(leak > 1e-6):
-                raise ValueError(f"k={k}: lowest states not at L={self.lz} "
-                                 f"(<L^2> off by {leak}); raise mu")
-        return e, V
+        A = self.block(H0, k, k)
+        L2k = None if L2 is None else self.block(L2, k, k)
+        n = A.shape[0]
+        nlevels = max(nlevels, nstates) if L2 is not None else nstates
+        while True:
+            if nlevels >= n - 1:
+                e, V = np.linalg.eigh(A.toarray())
+            else:
+                e, V = eigsh(A, k=nlevels, which="SA", tol=1e-12)
+                o = np.argsort(e); e, V = e[o], V[:, o]
+            if L2k is None:
+                return e[:nstates], V[:, :nstates]
+            q = np.einsum("si,si->i", V, L2k @ V)
+            L = np.round((-1 + np.sqrt(1 + 4 * np.clip(q, 0, None))) / 2)
+            keep = np.flatnonzero(L == self.lz)[:nstates]
+            if len(keep) == nstates or nlevels >= n - 1:
+                break
+            nlevels = 2 * nlevels
+        if len(keep) < nstates:
+            raise ValueError(f"k={k}: only {len(keep)} levels with L={self.lz} in the whole sector")
+        off = np.abs(q[keep] - self.lz * (self.lz + 1))
+        if np.any(off > 1e-6):
+            raise ValueError(f"k={k}: <L^2> of the L={self.lz} levels off by {off}: degenerate levels of "
+                             "different L mix")
+        return e[keep], V[:, keep]
 
     def first_order(self, H0, V, k0: int, psi0: np.ndarray, E0: float, L2=None, mu: float = 10.0):
         r"""First-order response of an exact ``H0`` eigenstate to :math:`H=H_0-hV`, with :math:`V`
