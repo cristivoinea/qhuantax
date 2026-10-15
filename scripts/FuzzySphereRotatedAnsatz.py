@@ -6,7 +6,8 @@
 #        two-exciton state; 1-F is reported (a stuck fit plateaus at 1e-3 - 1e-2: more dets or another seed)
 # With charge-only features R(theta) only rotates the orbital rows, so setting theta is the rotation.
 #
-#   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --members 0,1,2,2 --nbr-dets 4 --check --path runs/rot
+#   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 0,1,2,2 --nbr-dets 4 --check --path runs/rot
+#   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 2 --k-root 1 --run-id 2 --path runs/rot
 import argparse
 import json
 import time
@@ -37,8 +38,10 @@ parser.add_argument("-n", type=int, required=True, help="number of particles = n
 parser.add_argument("--lz", type=int, default=0, help="Lz sector; every member has L = Lz")
 parser.add_argument("--z2-sect", type=int, default=1, choices=(1, -1), help="Z2 symmetry sector")
 parser.add_argument("--h", type=float, required=True, help="transverse field")
-parser.add_argument("--members", required=True,
-                    help="exciton number k <= 2 of each member, e.g. 0,1,2,2; a repeated k is the next root")
+parser.add_argument("--k-sect", required=True, help="exciton number k <= 2 of each member, e.g. 0,1,2,2")
+parser.add_argument("--k-root", default=None,
+                    help="root of each member within its sector k, 0 the lowest L = lz state, e.g. 0,0,0,1; "
+                         "defaults to the next root for a repeated k")
 parser.add_argument("--theta", type=float, default=None,
                     help="rotation angle in degrees; defaults to the optimal vacuum angle at h")
 parser.add_argument("--ps-pot", default="4.75,1", help="inter-flavour pseudopotentials")
@@ -60,7 +63,11 @@ N = args["n"]
 lz = args["lz"]
 z2 = args["z2_sect"]
 h = args["h"]
-members = [int(k) for k in args["members"].replace(" ", "").split(",") if k]
+members = [int(k) for k in args["k_sect"].replace(" ", "").split(",") if k]
+if args["k_root"] is None:
+    roots = [members[:i].count(k) for i, k in enumerate(members)]
+else:
+    roots = [int(r) for r in args["k_root"].replace(" ", "").split(",") if r]
 pspot_inter = np.array([float(v) for v in args["ps_pot"].split(",")])
 d, nb, nh = args["attn_dim"], args["nbr_blocks"], args["nbr_heads"]
 ndets = args["nbr_dets"]
@@ -68,11 +75,15 @@ path = args["path"]
 run_id = f"n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_h_{h:g}_id0{args['run_id']}"
 
 if any(k not in (0, 1, 2) for k in members):
-    parser.error("--members: only k = 0, 1, 2 are implemented")
+    parser.error("--k-sect: only k = 0, 1, 2 are implemented")
+if len(roots) != len(members):
+    parser.error(f"--k-root gives {len(roots)} roots for {len(members)} members")
 if 0 in members and lz != 0:
     parser.error("k=0 (the vacuum) exists only at Lz = 0")
-if members.count(1) > 1:
-    parser.error("k=1 has one state per L; it cannot be repeated")
+if any(r != 0 for k, r in zip(members, roots) if k < 2):
+    parser.error("k=0 and k=1 have one state at L = Lz: root 0 only")
+if len(set(zip(members, roots))) < len(members):
+    parser.error("--k-sect/--k-root: a state (k, root) appears twice")
 if args["check"] and N > 12:
     parser.error("--check needs ED; use N <= 12")
 
@@ -123,15 +134,15 @@ def amplitudes(model, spins):
 # The k=2 targets: the lowest L = lz states of the two-exciton sector at h = 0
 if 2 in members:
     spins2 = ksectors.configs(2)
-    E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=members.count(2), L2=tms_L2)
+    E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=1 + max(r for k, r in zip(members, roots) if k == 2),
+                                  L2=tms_L2)
     H2 = ksectors.block(tms_H0, 2, 2)
     print(f"k=2 sector: {len(spins2)} configurations, exact L={lz} energies {np.round(E2, 6)}", flush=True)
 
 
 # The members, built at h = 0 and rotated by setting theta
 models = []
-for i, k in enumerate(members):
-    root = members[:i].count(k)
+for i, (k, root) in enumerate(zip(members, roots)):
     info = dict(index=i, k=k, root=root, file=f"state{i}_{run_id}.eqx")
     start_time = time.time()
     if k < 2:

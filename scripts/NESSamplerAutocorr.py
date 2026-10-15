@@ -12,7 +12,8 @@
 # so an excess at lag 1 is noise shared by consecutive sweeps.
 #
 #   python NESSamplerAutocorr.py --nes-meta runs/rotnes/meta_rotnes_..._id01.json --nbr-samples 512 --steps 400
-#   python NESSamplerAutocorr.py --nes-meta runs/rotnes/meta_rotnes_..._id01.json --nbr-samples 2048 --steps 0 \n#       --sweep-test 224,112
+#   python NESSamplerAutocorr.py --nes-meta runs/rotnes/meta_rotnes_..._id01.json --nbr-samples 2048 --steps 0 \
+#       --sweep-test 224,112
 import argparse
 import json
 import time

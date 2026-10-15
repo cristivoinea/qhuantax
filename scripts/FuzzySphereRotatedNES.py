@@ -41,6 +41,10 @@ SX = np.array([[0, 1], [1, 0]])
 parser = argparse.ArgumentParser()
 parser.add_argument("--ansatz-meta", required=True, help="meta file written by FuzzySphereRotatedAnsatz.py")
 parser.add_argument("--h", type=float, default=None, help="transverse field; defaults to the ansatz's")
+parser.add_argument("--int-cutoff", type=float, default=1e-15,
+                    help="train on H without the interaction hopping terms below this |U|; the sum of the dropped |U| "
+                         "(printed, in the meta) bounds the shift of every energy. ED and the dense readout keep the "
+                         "full H. 1e-6 drops 7%% of the terms at N=28 (shift <= 2e-4), 16%% at N=36 (<= 7e-4)")
 parser.add_argument("--no-untie", action="store_true", help="keep the features charge-only")
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 members: W = this x the default random init; 0 keeps W = 0")
@@ -145,10 +149,17 @@ lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Npar
 symm = FlavourPermQH(eigval=z2)
 
 
-# quantum Hall Hamiltonian
-tms_H = GetSpinfulDenIntTerms(nm=N, ps_pot=2*pspot_inter, mat_a=S1, mat_b=S2)
-if h != 0:
-    tms_H = tms_H - h * GetSpinfulPolTerms(nm=N, mat=SX)
+# quantum Hall Hamiltonian; the one trained on drops the hopping terms below --int-cutoff
+def hamiltonian(cutoff=1e-15):
+    tms, dropped = GetSpinfulDenIntTerms(nm=N, ps_pot=2*pspot_inter, mat_a=S1, mat_b=S2, cutoff=cutoff,
+                                         return_dropped=True)
+    return (tms if h == 0 else tms - h * GetSpinfulPolTerms(nm=N, mat=SX)), dropped
+
+
+tms_H, int_dropped = hamiltonian(args["int_cutoff"])
+if int_dropped > 0:
+    print(f"interaction hopping terms below {args['int_cutoff']:g} dropped: every energy shifts by at most "
+          f"{int_dropped:.1e}", flush=True)
 
 # Kept out of `tms_H`: the optimizer takes it as a separate operator, so <H> and <L^- L^+> come back separately
 tms_Lp = GetLpTerms(N, 2)
@@ -175,7 +186,11 @@ if cont_run_id is None:
 else:
     # released by the run being continued already, so loaded as they are
     models = [load_member(m["spec"], N, f"{path}/{m['file']}") for m in cont_meta["members"]]
-    start = f"continued from {cont_run_id} (lambda {cont_meta['lam']:g} there)"
+    cont_lam = cont_meta.get("lam_bump", {}).get("lam_to", cont_meta["lam"])     # meta["lam"] is the opening one
+    start = f"continued from {cont_run_id} (lambda {cont_lam:g} at its end)"
+    if LmLp_coeff is not None and LmLp_coeff < cont_lam:
+        print(f"warning: --lmlp-coeff {LmLp_coeff:g} is below the lambda {cont_lam:g} that {cont_run_id} ended with",
+              flush=True)
 member_states = [qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
 state_set = NaturalStateSet(member_states)
 print(f"N={N}, h={h}, z2={z2:+d}, K={nstates}: members k = {[m['k'] for m in ansatz['members']]}, {start}; "
@@ -212,7 +227,7 @@ def exact_L0_levels():
                 return cached["E"][:args["ed_nstates"]], cached["V"][:, :args["ed_nstates"]], f"read from {f}"
             print(f"skipping {f.name}: vectors of length {cached['V'].shape[0]}, block dim {dim}", flush=True)
 
-    E, V = tms_H.diagonalize(symm=dense_symm, k=min(args["ed_k"], dim - 2))
+    E, V = tms_H_ED.diagonalize(symm=dense_symm, k=min(args["ed_k"], dim - 2))
     q = np.real(np.einsum("si,si->i", V.conj(), L2_sp @ V))
     L, order = L_from_L2(q), np.argsort(E)
     print("Lowest levels of the block, (L) from <L^2>: " + " ".join(f"{E[j]:.6f}({L[j]})" for j in order),
@@ -260,9 +275,10 @@ def dense_readout():
 
 # Exact diagonalization in the (Lz=0, z2) user basis, ~7e5 states at N=14
 if do_ED:
+    tms_H_ED = tms_H if int_dropped == 0 else hamiltonian()[0]
     dense_symm = LzUserBasisSymmetry(0, z2)
     L2_sp = GetL2Terms(N, 2).get_quspin_op(dense_symm).tocsr()
-    H_sp = tms_H.get_quspin_op(dense_symm).tocsr()
+    H_sp = tms_H_ED.get_quspin_op(dense_symm).tocsr()
     dim = H_sp.shape[0]
     if lmlp_auto and dim > 20000:
         raise SystemExit(f"--lmlp-coeff auto diagonalizes the block densely and dim {dim} is too large; "
@@ -277,7 +293,7 @@ if do_ED:
 
 
 meta = dict(args=args, ansatz_meta=str(args["ansatz_meta"]), N=N, z2=z2, h=h, K=nstates, lam=LmLp_coeff,
-            theta=ansatz["theta"], continued_from=cont_run_id,
+            theta=ansatz["theta"], continued_from=cont_run_id, int_dropped=int_dropped,
             members=[dict(k=m["k"], root=m["root"], file=f"state{i}_{run_id}.eqx",
                           spec=member_spec(model, m["spec"]["d"], m["spec"]["nb"], m["spec"]["nh"]))
                      for i, (m, model) in enumerate(zip(ansatz["members"], models))],

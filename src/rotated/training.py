@@ -22,6 +22,8 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
     ``abort_at`` the run stops if the best :math:`1-F` so far is above ``abort_above`` and has not
     halved since step ``abort_at/2``.
 
+    A non-finite gradient also stops the run (``aborted``), with a message naming the parameters it hit.
+
     :return: ``(model, history, aborted)``; ``history`` lists ``(step, 1-F)`` every ``log_every``
         steps and ends with the best value.
     """
@@ -45,6 +47,7 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
     def step(p, m1, m2, it):
         val, g = jax.value_and_grad(infidelity)(p)
         g = mask(g)
+        finite = jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), g)
         a = lr / (1 + it / lr_t0)
         m1 = jax.tree_util.tree_map(lambda x, y: 0.9 * x + 0.1 * y, m1, g)
         m2 = jax.tree_util.tree_map(lambda x, y: 0.999 * x + 0.001 * y * y, m2, g)
@@ -53,14 +56,23 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
         p = jax.tree_util.tree_map(
             lambda q, x, y: (q - a * (x / (1 - 0.9 ** it)) / (jnp.sqrt(y / (1 - 0.999 ** it)) + 1e-12)).astype(q.dtype),
             p, m1, m2)
-        return p, m1, m2, val
+        return p, m1, m2, val, finite, jnp.all(jnp.stack(jax.tree_util.tree_leaves(finite)))
 
     m1 = jax.tree_util.tree_map(jnp.zeros_like, params)
     m2 = jax.tree_util.tree_map(jnp.zeros_like, params)
     history, best, at_half, aborted = [], (np.inf, params), None, False
     for it in range(1, steps + 1):
-        new, m1, m2, val = step(params, m1, m2, jnp.asarray(it, dtype=jnp.float64))
+        new, m1, m2, val, finite, all_finite = step(params, m1, m2, jnp.asarray(it, dtype=jnp.float64))
         val = float(val)
+        if not bool(all_finite):
+            # Adam turns one non-finite gradient into non-finite parameters for good: stop, keep the best
+            bad = [jax.tree_util.keystr(path) for path, ok in jax.tree_util.tree_flatten_with_path(finite)[0]
+                   if not bool(ok)]
+            print(f"      step {it}: non-finite gradient (1-F {val:.3e} here) in {', '.join(bad)}; fit stopped, "
+                  f"best 1-F so far {best[0]:.3e} kept", flush=True)
+            history.append((it, val))
+            aborted = True
+            break
         if val < best[0]:
             best = (val, params)            # the loss of `params`, before this update
         params = new
