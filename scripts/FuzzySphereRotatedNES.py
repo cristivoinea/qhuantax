@@ -174,7 +174,8 @@ def release(member):
     if member["spec"]["kind"] == "multidet" and args["gap"] > 0:
         model = set_gap(model, args["gap"])
     if member["spec"]["kind"] == "det" and args["det_backflow_scale"] > 0 and not jnp.any(model.W):
-        W = lecun_normal(get_subkeys(), model.W.shape, dtype=model.W.dtype) / 10
+        # relative to U0, whose std is 1 unless the ansatz script scaled the member to unit norm
+        W = lecun_normal(get_subkeys(), model.W.shape, dtype=model.W.dtype) / 10 * float(jnp.std(model.U0))
         model = eqx.tree_at(lambda m: m.W, model, args["det_backflow_scale"] * W)
     return model
 

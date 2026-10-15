@@ -59,6 +59,8 @@ parser.add_argument("--nbr-dets", type=int, default=6, help="k=2: number of bloc
 parser.add_argument("--gap", type=float, default=20.0, help="k=2: up features suppressed by exp(-gap)")
 parser.add_argument("--pretrain-steps", type=int, default=4000, help="k=2: number of fit steps")
 parser.add_argument("--pretrain-lr", type=float, default=1e-2, help="k=2: fit learning rate")
+parser.add_argument("--pretrain-lr-t0", type=float, default=None,
+                    help="k=2: learning rate decay, lr / (1 + step / t0); defaults to a quarter of --pretrain-steps")
 parser.add_argument("--pretrain-log-every", type=int, default=500, help="k=2: record 1-F every this many steps")
 parser.add_argument("--parallel", action="store_true",
                     help="fit the k=2 members at the same time, one process each on an equal share of the job's CPUs "
@@ -105,6 +107,7 @@ Path(path).mkdir(parents=True, exist_ok=True)
 qtx.set_default_dtype(jnp.float64)
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
 symm = FlavourPermQH(eigval=z2)
+ksectors = KSectors(N, lz)
 work = f"{path}/work_{run_id}"         # --parallel: the k=2 targets from the parent, the members from the children
 
 
@@ -118,9 +121,17 @@ def amplitudes(model, spins):
 
 
 def save_member(i, k, root, model, start_time, **fit):
-    """Member i rotated by theta and written; returns its meta entry and the rotated model."""
+    """Member i scaled to unit norm, rotated by theta and written; returns its meta entry and the rotated model.
+    The norm is the exact sum over sector k, where the h=0 member lives, and R(theta) keeps it: the members then enter
+    NES's det[psi_k(x_j)] as columns of one size, which float32 needs. The meta keeps the norm it had."""
+    logabs = np.asarray(jax.vmap(model)(jnp.asarray(ksectors.configs(k))).logabs)
+    log_norm = logabs.max() + 0.5 * np.log(np.sum(np.exp(2 * (logabs - logabs.max()))))
+    # every orbital matrix times f, so every determinant term times f^N: the scale stays in the matrix entries, which
+    # float32 (NES) holds, rather than in the multi-det coefficients, which it would round to 0 for a large norm
+    f = np.exp(-log_norm / N)
+    model = eqx.tree_at(lambda m: (m.U0, m.W), model, (model.U0 * f, model.W * f))
     model = model.rebuild(theta=theta)
-    info = dict(index=i, k=k, root=root, file=f"state{i}_{run_id}.eqx", **fit,
+    info = dict(index=i, k=k, root=root, file=f"state{i}_{run_id}.eqx", **fit, log10_norm=float(log_norm / np.log(10)),
                 spec=member_spec(model, d, nb, nh), time=time.time() - start_time)
     eqx.tree_serialise_leaves(f"{path}/{info['file']}", model)
     return info, model
@@ -132,7 +143,8 @@ def fit_k2(i, root, spins2, target, E_exact, H2):
     label = f"member {i} (k=2 root {root}):"
     model, masks = multidet_block_reference(new_net(), d, N, 2, ndets, gap=args["gap"], seed=args["seed"] + i)
     model, hist, _ = pretrain_exact(model, spins2, target, masks, steps=args["pretrain_steps"], lr=args["pretrain_lr"],
-                                    abort_at=None, log_every=args["pretrain_log_every"], log_prefix=label)
+                                    lr_t0=args["pretrain_lr_t0"], abort_at=None, log_every=args["pretrain_log_every"],
+                                    log_prefix=label)
     a = amplitudes(model, spins2)
     infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
     E = float(a @ (H2 @ a) / (a @ a))
@@ -160,7 +172,6 @@ tms_H0 = GetSpinfulDenIntTerms(nm=N, ps_pot=2*pspot_inter, mat_a=S1, mat_b=S2)
 tms_H = tms_H0 if h == 0 else tms_H0 - h * GetSpinfulPolTerms(nm=N, mat=SX)
 tms_L2 = GetL2Terms(N, 2)
 excitons = H0Excitons(N, 2*pspot_inter)
-ksectors = KSectors(N, lz)
 
 meta = dict(args=args, N=N, lz=lz, z2=z2, h=h, members=[])
 
@@ -235,6 +246,26 @@ for i, (k, root) in enumerate(zip(members, roots)):
     print(f"member {i} (k={k}) written: {info['file']}", flush=True)
 for f in [f"{work}.npz", f"{work}_H2.npz", *(f"{work}_member{i}.json" for i in children)]:
     Path(f).unlink(missing_ok=True)
+
+
+# Conditioning as NES members. The overlap matrix of the unprojected members is that of the h = 0 ones (R(theta) is
+# unitary), block diagonal in k: only the fits of the same k (the k=2 roots) can make it ill-conditioned, and that
+# part is exact here. The Z2 projection adds cross terms <psi_i|F R(2 theta)|psi_j>: sin(theta)^N for the vacuum
+# (0.34 at N=8, 0.12 at N=24), larger between different k by combinatorial factors; --check gives the full overlap
+# matrix at N <= 12 (condition number 4.4 at N=8)
+vecs = [(k, np.asarray((lambda p: p.sign * jnp.exp(p.logabs))(jax.vmap(m.rebuild(theta=0.0))(
+            jnp.asarray(ksectors.configs(k)))))) for k, m in zip(members, models)]
+S = np.array([[a @ b if ka == kb else 0.0 for kb, b in vecs] for ka, a in vecs])
+S /= np.sqrt(np.outer(np.diag(S), np.diag(S)))
+s = np.linalg.eigvalsh(S)
+max_overlap = float(np.max(np.abs(S - np.eye(len(S))))) if len(S) > 1 else 0.0
+meta["conditioning"] = dict(log10_norm=[m["log10_norm"] for m in meta["members"]], overlap_cond_h0=float(s[-1] / s[0]),
+                            max_overlap_h0=max_overlap)
+save_meta()
+print(f"as NES members:\n"
+      f"  each scaled to norm 1 (log10 of the norms they had: {np.round(meta['conditioning']['log10_norm'], 2)})\n"
+      f"  unprojected overlap matrix condition number {s[-1] / s[0]:.4f}, largest |overlap| {max_overlap:.2e}",
+      flush=True)
 
 
 # ED check at h: the members against the lowest L = lz levels, one by one and as a span
