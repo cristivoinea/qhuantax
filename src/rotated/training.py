@@ -12,30 +12,37 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from quantax.utils import to_distributed_array
 
 
 def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int = 4000,
                    lr: float = 1e-2, lr_t0: float | None = None, abort_at: int | None = 1000,
-                   abort_above: float = 1e-3, log_every: int = 500):
+                   abort_above: float = 1e-3, log_every: int = 500, log_prefix: str | None = None):
     r"""``quantumhall_excitons.pretrain_masked`` (full-batch Adam on the exact infidelity over
     ``spins``, gradients multiplied by ``masks``, best parameters kept) with an early abort: at step
     ``abort_at`` the run stops if the best :math:`1-F` so far is above ``abort_above`` and has not
     halved since step ``abort_at/2``.
 
     A non-finite gradient also stops the run (``aborted``), with a message naming the parameters it hit.
+    The configurations are split over all JAX devices (e.g. ``JAX_NUM_CPU_DEVICES``), padded with copies of
+    the first one at weight 0. With ``log_prefix``, every ``log_every`` steps print a line starting with it.
 
     :return: ``(model, history, aborted)``; ``history`` lists ``(step, 1-F)`` every ``log_every``
         steps and ends with the best value.
     """
     masks = masks or {}
     lr_t0 = steps / 4 if lr_t0 is None else lr_t0
-    spins = jnp.asarray(spins)
-    tgt = jnp.asarray(target / np.linalg.norm(target))
+    n, pad = len(spins), -len(spins) % jax.device_count()
+    data = (to_distributed_array(np.concatenate([np.asarray(spins), np.repeat(np.asarray(spins)[:1], pad, 0)])),
+            to_distributed_array(np.r_[np.ones(n), np.zeros(pad)]),
+            to_distributed_array(np.r_[target / np.linalg.norm(target), np.zeros(pad)]))
     params, static = eqx.partition(model, eqx.is_inexact_array)
+    start_time = time.time()
 
-    def infidelity(p):
+    def infidelity(p, data):
+        spins, weight, tgt = data
         psi = jax.vmap(eqx.combine(p, static))(spins)
-        amp = psi.sign * jnp.exp(psi.logabs - jnp.max(psi.logabs))
+        amp = weight * psi.sign * jnp.exp(psi.logabs - jnp.max(psi.logabs))
         return 1.0 - (amp @ tgt) ** 2 / (amp @ amp)
 
     def mask(g):
@@ -44,8 +51,8 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
         return g
 
     @eqx.filter_jit
-    def step(p, m1, m2, it):
-        val, g = jax.value_and_grad(infidelity)(p)
+    def step(p, m1, m2, it, data):
+        val, g = jax.value_and_grad(infidelity)(p, data)
         g = mask(g)
         finite = jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), g)
         a = lr / (1 + it / lr_t0)
@@ -62,14 +69,14 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
     m2 = jax.tree_util.tree_map(jnp.zeros_like, params)
     history, best, at_half, aborted = [], (np.inf, params), None, False
     for it in range(1, steps + 1):
-        new, m1, m2, val, finite, all_finite = step(params, m1, m2, jnp.asarray(it, dtype=jnp.float64))
+        new, m1, m2, val, finite, all_finite = step(params, m1, m2, jnp.asarray(it, dtype=jnp.float64), data)
         val = float(val)
         if not bool(all_finite):
             # Adam turns one non-finite gradient into non-finite parameters for good: stop, keep the best
             bad = [jax.tree_util.keystr(path) for path, ok in jax.tree_util.tree_flatten_with_path(finite)[0]
                    if not bool(ok)]
-            print(f"      step {it}: non-finite gradient (1-F {val:.3e} here) in {', '.join(bad)}; fit stopped, "
-                  f"best 1-F so far {best[0]:.3e} kept", flush=True)
+            print(f"{log_prefix or '     '} step {it}: non-finite gradient (1-F {val:.3e} here) in {', '.join(bad)}; "
+                  f"fit stopped, best 1-F so far {best[0]:.3e} kept", flush=True)
             history.append((it, val))
             aborted = True
             break
@@ -78,13 +85,16 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
         params = new
         if it % log_every == 0 or it == steps:
             history.append((it, val))
+            if log_prefix is not None:
+                print(f"{log_prefix} step {it}: 1-F {val:.3e} (best {best[0]:.3e}) [{time.time() - start_time:.0f}s]",
+                      flush=True)
         # judged on the best value so far: the loss spikes, and a spike at abort_at is not a plateau
         if abort_at and it == abort_at // 2:
             at_half = best[0]
         if abort_at and it == abort_at and best[0] > abort_above and best[0] > 0.5 * at_half:
             aborted = True
             break
-    final = float(infidelity(params))
+    final = float(infidelity(params, data))
     if final < best[0]:
         best = (final, params)
     history.append((it, best[0]))

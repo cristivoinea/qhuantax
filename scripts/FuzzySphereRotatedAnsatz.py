@@ -8,8 +8,14 @@
 #
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 0,1,2,2 --nbr-dets 4 --check --path runs/rot
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 2 --k-root 1 --run-id 2 --path runs/rot
+# --parallel fits the k=2 members at the same time: the parent computes the targets once and starts one child
+# process per member (this script with --fit-member), each pinned to an equal share of the job's CPUs, over which
+# the fit splits the configurations (JAX_NUM_CPU_DEVICES); it then collects them into the one meta file.
 import argparse
 import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -25,7 +31,8 @@ from qhuantax.quantumhall_operators import GetL2Terms, GetSpinfulDenIntTerms, Ge
 from qhuantax.quantumhall_symmetries import FlavourPermQH
 from qhuantax.quantumhall_transformer import Transformer
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
-from qhuantax.rotated import RotatedDetBackflow, member_spec, multidet_block_reference, pretrain_exact
+from qhuantax.rotated import (RotatedDetBackflow, load_member, member_spec, multidet_block_reference,
+                              pretrain_exact)
 
 
 S1 = np.array([[1, 0], [0, 0]])
@@ -53,6 +60,10 @@ parser.add_argument("--gap", type=float, default=20.0, help="k=2: up features su
 parser.add_argument("--pretrain-steps", type=int, default=4000, help="k=2: number of fit steps")
 parser.add_argument("--pretrain-lr", type=float, default=1e-2, help="k=2: fit learning rate")
 parser.add_argument("--pretrain-log-every", type=int, default=500, help="k=2: record 1-F every this many steps")
+parser.add_argument("--parallel", action="store_true",
+                    help="fit the k=2 members at the same time, one process each on an equal share of the job's CPUs "
+                         "(Linux)")
+parser.add_argument("--fit-member", type=int, default=None, help=argparse.SUPPRESS)    # a child of --parallel
 parser.add_argument("--check", action="store_true", help="compare the members with ED at h (N <= 12)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--run-id", type=int, default=1)
@@ -86,12 +97,62 @@ if len(set(zip(members, roots))) < len(members):
     parser.error("--k-sect/--k-root: a state (k, root) appears twice")
 if args["check"] and N > 12:
     parser.error("--check needs ED; use N <= 12")
+if args["parallel"] and not hasattr(os, "sched_setaffinity"):
+    parser.error("--parallel pins the child processes to CPUs, which needs Linux")
 
 Path(path).mkdir(parents=True, exist_ok=True)
 
 qtx.set_default_dtype(jnp.float64)
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
 symm = FlavourPermQH(eigval=z2)
+work = f"{path}/work_{run_id}"         # --parallel: the k=2 targets from the parent, the members from the children
+
+
+def new_net():
+    return Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
+
+
+def amplitudes(model, spins):
+    out = jax.vmap(model)(jnp.asarray(spins))
+    return np.asarray(out.sign * jnp.exp(out.logabs - jnp.max(out.logabs)))
+
+
+def save_member(i, k, root, model, start_time, **fit):
+    """Member i rotated by theta and written; returns its meta entry and the rotated model."""
+    model = model.rebuild(theta=theta)
+    info = dict(index=i, k=k, root=root, file=f"state{i}_{run_id}.eqx", **fit,
+                spec=member_spec(model, d, nb, nh), time=time.time() - start_time)
+    eqx.tree_serialise_leaves(f"{path}/{info['file']}", model)
+    return info, model
+
+
+def fit_k2(i, root, spins2, target, E_exact, H2):
+    """Member i: --nbr-dets block determinants fitted to root `root` of the k=2 sector at h = 0."""
+    start_time = time.time()
+    label = f"member {i} (k=2 root {root}):"
+    model, masks = multidet_block_reference(new_net(), d, N, 2, ndets, gap=args["gap"], seed=args["seed"] + i)
+    model, hist, _ = pretrain_exact(model, spins2, target, masks, steps=args["pretrain_steps"], lr=args["pretrain_lr"],
+                                    abort_at=None, log_every=args["pretrain_log_every"], log_prefix=label)
+    a = amplitudes(model, spins2)
+    infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
+    E = float(a @ (H2 @ a) / (a @ a))
+    print(f"{label} h=0 1-F {infidelity:.3e}, <H> {E:.6f} (exact {E_exact:.6f}), {ndets} dets "
+          f"[{time.time() - start_time:.0f}s]", flush=True)
+    return save_member(i, 2, root, model, start_time, E_h0=float(E_exact), infidelity_h0=float(infidelity),
+                       E_model_h0=E, history=[(int(s), float(v)) for s, v in hist[:-1]])
+
+
+# --parallel child: one k=2 member from the parent's targets; its meta entry goes back through a file
+if args["fit_member"] is not None:
+    i = args["fit_member"]
+    qtx.set_random_seed(args["seed"] + i)          # otherwise every child starts from the same network
+    with np.load(f"{work}.npz") as w:
+        theta = float(w["theta"])
+        info, _ = fit_k2(i, roots[i], w["spins2"], w["V2"][:, roots[i]], float(w["E2"][roots[i]]),
+                         sp.sparse.load_npz(f"{work}_H2.npz"))
+    with open(f"{work}_member{i}.json", "w") as f:
+        json.dump(info, f, default=float)
+    raise SystemExit
 
 
 # quantum Hall Hamiltonian: tms_H0 at h = 0, where the members are built, and tms_H at h
@@ -122,15 +183,6 @@ meta["theta"] = theta
 print(f"every member is rotated by {np.degrees(theta):.4f} deg", flush=True)
 
 
-def new_net():
-    return Transformer(nblocks=nb, d=d, heads=nh, final_sum=False)
-
-
-def amplitudes(model, spins):
-    out = jax.vmap(model)(jnp.asarray(spins))
-    return np.asarray(out.sign * jnp.exp(out.logabs - jnp.max(out.logabs)))
-
-
 # The k=2 targets: the lowest L = lz states of the two-exciton sector at h = 0
 if 2 in members:
     spins2 = ksectors.configs(2)
@@ -140,36 +192,48 @@ if 2 in members:
     print(f"k=2 sector: {len(spins2)} configurations, exact L={lz} energies {np.round(E2, 6)}", flush=True)
 
 
-# The members, built at h = 0 and rotated by setting theta
+# --parallel: the k=2 fits in child processes. Each is pinned to its share of the CPUs by setting it on this thread
+# while the child starts (a child inherits it), and splits its fit over that many JAX devices
+children = {}
+k2 = [i for i, k in enumerate(members) if k == 2]
+if args["parallel"] and len(k2) > 1:
+    np.savez(f"{work}.npz", spins2=spins2, V2=V2, E2=E2, theta=theta)
+    sp.sparse.save_npz(f"{work}_H2.npz", H2)
+    all_cpus = os.sched_getaffinity(0)
+    if len(all_cpus) < len(k2):
+        raise SystemExit(f"--parallel: {len(all_cpus)} CPUs for {len(k2)} k=2 members")
+    shares = [set(map(int, c)) for c in np.array_split(sorted(all_cpus), len(k2))]
+    for i, cpus in zip(k2, shares):
+        os.sched_setaffinity(0, cpus)
+        children[i] = subprocess.Popen([sys.executable, __file__, *sys.argv[1:], "--fit-member", str(i)],
+                                       env={**os.environ, "JAX_NUM_CPU_DEVICES": str(len(cpus))})
+    os.sched_setaffinity(0, all_cpus)
+    print(f"k=2 members {k2} fitting in parallel on {[len(c) for c in shares]} CPUs", flush=True)
+
+
+# The members, built at h = 0 and rotated by setting theta; with --parallel the k=2 ones come from the children
 models = []
 for i, (k, root) in enumerate(zip(members, roots)):
-    info = dict(index=i, k=k, root=root, file=f"state{i}_{run_id}.eqx")
-    start_time = time.time()
     if k < 2:
         # an exact determinant: no backflow (W = 0)
         U = excitons.vacuum_orbitals() if k == 0 else excitons.exciton_orbitals(lz, lz)
         model = RotatedDetBackflow(new_net(), jnp.asarray(U), W=jnp.zeros((N, d // 2)), charge_only=True)
-        info.update(E_h0=0.0 if k == 0 else float(excitons.exciton_energy(lz)), infidelity_h0=0.0)
+        info, model = save_member(i, k, root, model, time.time(), infidelity_h0=0.0,
+                                  E_h0=0.0 if k == 0 else float(excitons.exciton_energy(lz)))
+    elif i in children:
+        if children[i].wait() != 0:
+            raise SystemExit(f"member {i}: its fit failed (exit code {children[i].returncode}); inputs in {work}*")
+        with open(f"{work}_member{i}.json") as f:
+            info = json.load(f)
+        model = load_member(info["spec"], N, f"{path}/{info['file']}")
     else:
-        target = V2[:, root]
-        model, masks = multidet_block_reference(new_net(), d, N, 2, ndets, gap=args["gap"], seed=args["seed"] + i)
-        model, hist, _ = pretrain_exact(model, spins2, target, masks, steps=args["pretrain_steps"],
-                                        lr=args["pretrain_lr"], abort_at=None, log_every=args["pretrain_log_every"])
-        a = amplitudes(model, spins2)
-        infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
-        E = float(a @ (H2 @ a) / (a @ a))
-        hist = [(int(s), float(v)) for s, v in hist[:-1]]
-        info.update(E_h0=float(E2[root]), infidelity_h0=float(infidelity), E_model_h0=E, history=hist)
-        print(f"member {i} (k=2 root {root}, {ndets} dets): h=0 1-F {infidelity:.3e}, <H> {E:.6f} "
-              f"(exact {E2[root]:.6f}) [{time.time() - start_time:.0f}s] | 1-F along the way: "
-              + " ".join(f"{s}:{v:.1e}" for s, v in hist), flush=True)
-    model = model.rebuild(theta=theta)
-    info.update(spec=member_spec(model, d, nb, nh), time=time.time() - start_time)
+        info, model = fit_k2(i, root, spins2, V2[:, root], float(E2[root]), H2)
     models.append(model)
-    eqx.tree_serialise_leaves(f"{path}/{info['file']}", model)
     meta["members"].append(info)
     save_meta()
     print(f"member {i} (k={k}) written: {info['file']}", flush=True)
+for f in [f"{work}.npz", f"{work}_H2.npz", *(f"{work}_member{i}.json" for i in children)]:
+    Path(f).unlink(missing_ok=True)
 
 
 # ED check at h: the members against the lowest L = lz levels, one by one and as a span
