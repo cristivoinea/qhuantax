@@ -31,7 +31,7 @@ from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, Natur
 from qhuantax.nes.optimizer import NaturalTraceEnergyGrad
 from qhuantax.quantumhall_excitons import KSectors
 from qhuantax.quantumhall_operators import GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
-from qhuantax.quantumhall_symmetries import FlavourPermQH
+from qhuantax.quantumhall_symmetries import FlavourPermQH, fuzzy_sphere_symmetry
 from qhuantax.rotated import load_member
 
 
@@ -56,7 +56,7 @@ parser.add_argument("--lmlp-coeff", type=float, default=None, help="--sweep-test
 args = vars(parser.parse_args())
 
 meta = json.load(open(args["nes_meta"]))
-N, z2, h, K = meta["N"], meta["z2"], meta["h"], meta["K"]
+N, lz, z2, h, K = meta["N"], meta.get("lz", 0), meta["z2"], meta["h"], meta["K"]
 n = args["nbr_samples"]
 pspot_inter = np.array([float(v) for v in args["ps_pot"].split(",")])
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
@@ -64,16 +64,18 @@ lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Npar
 tms_H = GetSpinfulDenIntTerms(nm=N, ps_pot=2*pspot_inter, mat_a=S1, mat_b=S2)
 if h != 0:
     tms_H = tms_H - h * GetSpinfulPolTerms(nm=N, mat=SX)
-symm = FlavourPermQH(eigval=z2)
+# the run's symmetries; Z2 alone was always imposed before they became options
+symm = fuzzy_sphere_symmetry(**meta["symmetries"]) if "symmetries" in meta else FlavourPermQH(eigval=z2)
 D = Path(args["nes_meta"]).parent
 members = [qtx.state.Variational(load_member(m["spec"], N, D / m["file"]), symm=symm, max_parallel=16384, use_ref=False)
            for m in meta["members"]]
 state_set = NaturalStateSet(members)
 grad = NaturalTraceEnergyGrad(tms_H)
 
-ksectors = KSectors(N, 0)
+ksectors = KSectors(N, lz)
 rng = np.random.default_rng(args["seed"])
-init = np.stack([ksectors.configs(j)[rng.integers(ksectors.dim(j), size=n)] for j in range(K)], axis=1)
+k0 = int(lz != 0)                                   # k = 0 is empty at Lz != 0
+init = np.stack([ksectors.configs(k)[rng.integers(ksectors.dim(k), size=n)] for k in range(k0, k0 + K)], axis=1)
 t = time.time()
 sampler = NaturalLzDetFlavourFlipSampler(state_set, n, n_neighbor=np.arange(1, 3), initial_spins=init,
                                          reweight=args["reweight"], flip_prob=args["flip_prob"])
