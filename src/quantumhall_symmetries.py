@@ -217,7 +217,9 @@ class FermionMapSymmetry(FuzzySphereSymmetry):
     def __init__(self, maps: Sequence[Tuple[np.ndarray, np.ndarray, bool]] = (), eigvals: Sequence[int] = (),
                  names: Sequence[str] = ()):
         super().__init__()
-        self._maps = tuple((jnp.asarray(p, jnp.int32), jnp.asarray(a, jnp.int8), bool(inv)) for p, a, inv in maps)
+        # (perm, mode signs, inverting, eps): an inverting map has U|0> = eps |full>, |full> in quantax's mode order
+        self._maps = tuple((jnp.asarray(m[0], jnp.int32), jnp.asarray(m[1], jnp.int8), bool(m[2]),
+                            int(m[3]) if len(m) > 3 else 1) for m in maps)
         self._eigvals = tuple(int(e) for e in eigvals)
         self._names = tuple(names)
         k = len(self._maps)
@@ -244,10 +246,10 @@ class FermionMapSymmetry(FuzzySphereSymmetry):
         images, signs = [], []
         for el in self._elements:
             t, sign = spins, 1
-            for (perm, a, inverting), used in zip(self._maps, el):
+            for (perm, a, inverting, eps), used in zip(self._maps, el):
                 if used:
                     t = -t[perm] if inverting else t[perm]
-                    sign = sign * _map_sign(t, perm, a, inverting)
+                    sign = sign * _map_sign(t, perm, a, inverting) * (eps if inverting else 1)
             images.append(t)
             signs.append(sign)
         return jnp.stack(images), jnp.stack(jnp.asarray(signs))
@@ -272,7 +274,7 @@ class FermionMapSymmetry(FuzzySphereSymmetry):
                                   [*self._names, *other._names])
 
     def _raw_maps(self):
-        return [(np.asarray(p), np.asarray(a), inv) for p, a, inv in self._maps]
+        return [(np.asarray(p), np.asarray(a), inv, eps) for p, a, inv, eps in self._maps]
 
 
 def _check_eigval(eigval: int):
@@ -299,27 +301,33 @@ def RyQH(eigval: int) -> FermionMapSymmetry:
     return FermionMapSymmetry([(mirror, (-1) ** j, False)], [eigval], ["Ry"])
 
 
+def _ph_phase(N: int) -> int:
+    """The sign between the filled states in FuzzifiED's mode order (orbital-major) and quantax's (flavour-major)."""
+    return (-1) ** (N * (N - 1) // 2)
+
+
 def PHQH(eigval: int) -> FermionMapSymmetry:
     r"""The particle-hole symmetry of the fuzzy-sphere Ising model, PRX 13, 021009:
     :math:`c^\dagger_{m\uparrow}\mapsto -c_{m\downarrow}`, :math:`c^\dagger_{m\downarrow}\mapsto c_{m\uparrow}`
-    (FuzzifiED ``GetParityQNOffd(nm, 2, [2, 1], [-1, 1])``), with :math:`U|0\rangle=|\text{full}\rangle` in quantax's
-    mode order, which puts the ground state at +1 as in FuzzifiED. ``ParticleHoleQH`` is this times
-    :math:`\mathbb{Z}_2`. Requires half filling."""
+    (FuzzifiED ``GetParityQNOffd(nm, 2, [2, 1], [-1, 1])``), with :math:`U|0\rangle=|\text{full}\rangle` in
+    FuzzifiED's orbital-major mode order, i.e. :math:`(-1)^{N(N-1)/2}|\text{full}\rangle` in quantax's flavour-major
+    one (``_ph_phase``): the vacuum and the Ising ground state are +1 at every N, as in FuzzifiED. Requires half
+    filling."""
     _check_eigval(eigval)
     sites = get_sites()
     N = sites.Nsites
     if sites.Ntotal != N:
         raise ValueError("particle-hole needs half filling (N particles in 2N modes)")
     flip = np.concatenate([np.arange(N, 2 * N), np.arange(N)])
-    return FermionMapSymmetry([(flip, np.where(np.arange(2 * N) < N, -1, 1), True)], [eigval], ["PH"])
+    return FermionMapSymmetry([(flip, np.where(np.arange(2 * N) < N, -1, 1), True, _ph_phase(N))], [eigval], ["PH"])
 
 
 def PHRyQH(eigval: int) -> FermionMapSymmetry:
     r"""The product of ``PHQH`` and ``RyQH``, one particle-hole map: :math:`c^\dagger_{m\uparrow}\mapsto
     -(-1)^{m+s}c_{-m\downarrow}`, :math:`c^\dagger_{m\downarrow}\mapsto(-1)^{m+s}c_{-m\uparrow}`. Both factors send
     :math:`L^+\to-L^-`, so it commutes with every rotation: it keeps :math:`L_z` (unlike either factor) and is constant
-    on a multiplet, with eigenvalue :math:`P(-1)^L` -- the particle-hole :math:`P` of PRX 13, 021009 at :math:`L=0`.
-    Requires half filling."""
+    on a multiplet, with eigenvalue :math:`P(-1)^L` -- the particle-hole :math:`P` of PRX 13, 021009 at :math:`L=0`
+    (same global phase as ``PHQH``). Requires half filling."""
     _check_eigval(eigval)
     sites = get_sites()
     N = sites.Nsites
@@ -330,7 +338,8 @@ def PHRyQH(eigval: int) -> FermionMapSymmetry:
     mirror = f * N + (N - 1 - j)
     flip_of = lambda q: (1 - q // N) * N + q % N
     sign_ph = lambda q: np.where(q < N, -1, 1)
-    return FermionMapSymmetry([(flip_of(mirror), (-1) ** j * sign_ph(mirror), True)], [eigval], ["PHRy"])
+    return FermionMapSymmetry([(flip_of(mirror), (-1) ** j * sign_ph(mirror), True, _ph_phase(N))], [eigval],
+                              ["PHRy"])
 
 
 def fuzzy_sphere_symmetry(z2: Optional[int] = None, ry: Optional[int] = None, ph: Optional[int] = None,

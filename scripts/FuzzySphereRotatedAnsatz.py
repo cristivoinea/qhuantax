@@ -26,9 +26,9 @@ import numpy as np
 import quantax as qtx
 import scipy as sp
 
-from qhuantax.quantumhall_excitons import H0Excitons, KSectors, vacuum_angle
+from qhuantax.quantumhall_excitons import H0Excitons, KSectors, spins_key, vacuum_angle
 from qhuantax.quantumhall_operators import GetL2Terms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
-from qhuantax.quantumhall_symmetries import FlavourPermQH
+from qhuantax.quantumhall_symmetries import PHRyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_transformer import Transformer
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 from qhuantax.rotated import (RotatedDetBackflow, load_member, member_spec, multidet_block_reference,
@@ -49,6 +49,10 @@ parser.add_argument("--k-sect", required=True, help="exciton number k <= 2 of ea
 parser.add_argument("--k-root", default=None,
                     help="root of each member within its sector k, 0 the lowest L = lz state, e.g. 0,0,0,1; "
                          "defaults to the next root for a repeated k")
+parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
+                    help="put every member in this sector of particle-hole x Ry (eigenvalue P (-1)^L): the k=2 roots "
+                         "are counted within it (--k-root) and fitted as projected models, k=0 and k=1 must have it; "
+                         "not imposed if omitted. Pass the same value to FuzzySphereRotatedNES.py")
 parser.add_argument("--theta", type=float, default=None,
                     help="rotation angle in degrees; defaults to the optimal vacuum angle at h")
 parser.add_argument("--ps-pot", default="4.75,1", help="inter-flavour pseudopotentials")
@@ -75,6 +79,7 @@ args = vars(parser.parse_args())
 N = args["n"]
 lz = args["lz"]
 z2 = args["z2_sect"]
+ry_ph = args["ry_ph_sect"]
 h = args["h"]
 members = [int(k) for k in args["k_sect"].replace(" ", "").split(",") if k]
 if args["k_root"] is None:
@@ -106,9 +111,32 @@ Path(path).mkdir(parents=True, exist_ok=True)
 
 qtx.set_default_dtype(jnp.float64)
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
-symm = FlavourPermQH(eigval=z2)
+symm = fuzzy_sphere_symmetry(z2=z2, phry=ry_ph)
 ksectors = KSectors(N, lz)
 work = f"{path}/work_{run_id}"         # --parallel: the k=2 targets from the parent, the members from the children
+U_phry = PHRyQH(1)
+
+
+def image_map(spins):
+    """PH x Ry on a list of configurations it maps onto itself (every sector k at fixed Lz):
+    <s|U|psi> = sign[s] psi(spins[index[s]]); returns (index, sign)."""
+    t, sign = jax.vmap(U_phry.images)(jnp.asarray(spins))
+    position = {key: i for i, key in enumerate(spins_key(spins))}
+    return np.array([position[key] for key in spins_key(np.asarray(t[:, 1]))]), np.asarray(sign[:, 1], float)
+
+
+def eigenvalue(vec, images):
+    """<U> of a vector on such a list: the PH x Ry eigenvalue of an eigenstate."""
+    index, sign = images
+    return float(vec @ (sign * vec[index]) / (vec @ vec))
+
+
+def sector_vector(a, k):
+    """Amplitudes a of a member on sector k, projected onto --ry-ph-sect (as NES's member is) when it is given."""
+    if ry_ph is None:
+        return a
+    index, sign = image_map(ksectors.configs(k))
+    return 0.5 * (a + ry_ph * sign * a[index])
 
 
 def new_net():
@@ -123,9 +151,11 @@ def amplitudes(model, spins):
 def save_member(i, k, root, model, start_time, **fit):
     """Member i scaled to unit norm, rotated by theta and written; returns its meta entry and the rotated model.
     The norm is the exact sum over sector k, where the h=0 member lives, and R(theta) keeps it: the members then enter
-    NES's det[psi_k(x_j)] as columns of one size, which float32 needs. The meta keeps the norm it had."""
-    logabs = np.asarray(jax.vmap(model)(jnp.asarray(ksectors.configs(k))).logabs)
-    log_norm = logabs.max() + 0.5 * np.log(np.sum(np.exp(2 * (logabs - logabs.max()))))
+    NES's det[psi_k(x_j)] as columns of one size, which float32 needs. With --ry-ph-sect it is the norm of the projected
+    member, the one NES uses. The meta keeps the norm it had."""
+    out = jax.vmap(model)(jnp.asarray(ksectors.configs(k)))
+    top = float(jnp.max(out.logabs))
+    log_norm = top + np.log(np.linalg.norm(sector_vector(np.asarray(out.sign * jnp.exp(out.logabs - top)), k)))
     # every orbital matrix times f, so every determinant term times f^N: the scale stays in the matrix entries, which
     # float32 (NES) holds, rather than in the multi-det coefficients, which it would round to 0 for a large norm
     f = np.exp(-log_norm / N)
@@ -138,14 +168,18 @@ def save_member(i, k, root, model, start_time, **fit):
 
 
 def fit_k2(i, root, spins2, target, E_exact, H2):
-    """Member i: --nbr-dets block determinants fitted to root `root` of the k=2 sector at h = 0."""
+    """Member i: --nbr-dets block determinants fitted to root `root` of the k=2 sector at h = 0; with --ry-ph-sect the
+    projected model is fitted (what NES uses), at no extra cost since the images are k=2 configurations too."""
     start_time = time.time()
     label = f"member {i} (k=2 root {root}):"
+    images = None if ry_ph is None else image_map(spins2)
     model, masks = multidet_block_reference(new_net(), d, N, 2, ndets, gap=args["gap"], seed=args["seed"] + i)
     model, hist, _ = pretrain_exact(model, spins2, target, masks, steps=args["pretrain_steps"], lr=args["pretrain_lr"],
                                     lr_t0=args["pretrain_lr_t0"], abort_at=None, log_every=args["pretrain_log_every"],
-                                    log_prefix=label)
+                                    log_prefix=label, projection=None if images is None else (*images, ry_ph))
     a = amplitudes(model, spins2)
+    if images is not None:
+        a = 0.5 * (a + ry_ph * images[1] * a[images[0]])
     infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
     E = float(a @ (H2 @ a) / (a @ a))
     print(f"{label} h=0 1-F {infidelity:.3e}, <H> {E:.6f} (exact {E_exact:.6f}), {ndets} dets "
@@ -173,7 +207,7 @@ tms_H = tms_H0 if h == 0 else tms_H0 - h * GetSpinfulPolTerms(nm=N, mat=SX)
 tms_L2 = GetL2Terms(N, 2)
 excitons = H0Excitons(N, 2*pspot_inter)
 
-meta = dict(args=args, N=N, lz=lz, z2=z2, h=h, members=[])
+meta = dict(args=args, N=N, lz=lz, z2=z2, ry_ph=ry_ph, h=h, members=[])
 
 
 def save_meta():
@@ -194,13 +228,35 @@ meta["theta"] = theta
 print(f"every member is rotated by {np.degrees(theta):.4f} deg", flush=True)
 
 
-# The k=2 targets: the lowest L = lz states of the two-exciton sector at h = 0
+# The k=2 targets: the lowest L = lz states of the two-exciton sector at h = 0; with --ry-ph-sect those of that PH x Ry
+# eigenvalue (the sector is closed under it), more roots being computed until there are enough
 if 2 in members:
     spins2 = ksectors.configs(2)
-    E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=1 + max(r for k, r in zip(members, roots) if k == 2),
-                                  L2=tms_L2)
+    need = 1 + max(r for k, r in zip(members, roots) if k == 2)
+    if ry_ph is None:
+        E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=need, L2=tms_L2)
+        sector_note = ""
+    else:
+        images2 = image_map(spins2)
+        nst = need
+        E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=nst, L2=tms_L2)
+        while True:
+            ev = np.array([eigenvalue(V2[:, j], images2) for j in range(V2.shape[1])])
+            keep = np.flatnonzero(ev * ry_ph > 0.5)
+            if len(keep) >= need:
+                break
+            nst *= 2
+            try:
+                E2, V2 = ksectors.eigenstates(tms_H0, 2, nstates=nst, L2=tms_L2)
+            except ValueError:                               # fewer L = lz levels in the whole sector
+                break
+        print(f"k=2 L={lz} roots {np.round(E2, 6)}: PH x Ry {np.round(ev, 4)}", flush=True)
+        if len(keep) < need:
+            raise SystemExit(f"--ry-ph-sect {ry_ph:+d}: only {len(keep)} k=2 L={lz} roots in that sector, {need} needed")
+        E2, V2 = E2[keep[:need]], V2[:, keep[:need]]
+        sector_note = f" (PH x Ry {ry_ph:+d})"
     H2 = ksectors.block(tms_H0, 2, 2)
-    print(f"k=2 sector: {len(spins2)} configurations, exact L={lz} energies {np.round(E2, 6)}", flush=True)
+    print(f"k=2 sector: {len(spins2)} configurations, exact L={lz}{sector_note} energies {np.round(E2, 6)}", flush=True)
 
 
 # --parallel: the k=2 fits in child processes. Each is pinned to its share of the CPUs by setting it on this thread
@@ -230,6 +286,11 @@ for i, (k, root) in enumerate(zip(members, roots)):
         # an exact determinant: no backflow (W = 0)
         U = excitons.vacuum_orbitals() if k == 0 else excitons.exciton_orbitals(lz, lz)
         model = RotatedDetBackflow(new_net(), jnp.asarray(U), W=jnp.zeros((N, d // 2)), charge_only=True)
+        if ry_ph is not None:
+            # one state per sector k: its PH x Ry eigenvalue is fixed, so it is checked rather than chosen
+            e = eigenvalue(amplitudes(model, ksectors.configs(k)), image_map(ksectors.configs(k)))
+            if e * ry_ph < 0.5:
+                raise SystemExit(f"--ry-ph-sect {ry_ph:+d}: the k={k} member has PH x Ry {e:+.4f}")
         info, model = save_member(i, k, root, model, time.time(), infidelity_h0=0.0,
                                   E_h0=0.0 if k == 0 else float(excitons.exciton_energy(lz)))
     elif i in children:
@@ -253,8 +314,7 @@ for f in [f"{work}.npz", f"{work}_H2.npz", *(f"{work}_member{i}.json" for i in c
 # part is exact here. The Z2 projection adds cross terms <psi_i|F R(2 theta)|psi_j>: sin(theta)^N for the vacuum
 # (0.34 at N=8, 0.12 at N=24), larger between different k by combinatorial factors; --check gives the full overlap
 # matrix at N <= 12 (condition number 4.4 at N=8)
-vecs = [(k, np.asarray((lambda p: p.sign * jnp.exp(p.logabs))(jax.vmap(m.rebuild(theta=0.0))(
-            jnp.asarray(ksectors.configs(k)))))) for k, m in zip(members, models)]
+vecs = [(k, sector_vector(amplitudes(m.rebuild(theta=0.0), ksectors.configs(k)), k)) for k, m in zip(members, models)]
 S = np.array([[a @ b if ka == kb else 0.0 for kb, b in vecs] for ka, a in vecs])
 S /= np.sqrt(np.outer(np.diag(S), np.diag(S)))
 s = np.linalg.eigvalsh(S)
@@ -264,7 +324,8 @@ meta["conditioning"] = dict(log10_norm=[m["log10_norm"] for m in meta["members"]
 save_meta()
 print(f"as NES members:\n"
       f"  each scaled to norm 1 (log10 of the norms they had: {np.round(meta['conditioning']['log10_norm'], 2)})\n"
-      f"  unprojected overlap matrix condition number {s[-1] / s[0]:.4f}, largest |overlap| {max_overlap:.2e}",
+      f"  overlap matrix before the Z2 projection{'' if ry_ph is None else ' (PH x Ry projected)'} condition number "
+      f"{s[-1] / s[0]:.4f}, largest |overlap| {max_overlap:.2e}",
       flush=True)
 
 
@@ -275,9 +336,22 @@ if args["check"]:
     E_all, V_all = tms_H.diagonalize(symm=dense_symm, k=min(16, H_sp.shape[0] - 2))
     q = np.einsum("si,si->i", V_all, L2_sp @ V_all)
     L_all = np.round((-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2)
-    keep = [j for j in np.argsort(E_all) if L_all[j] == lz][:len(members)]
+    keep = [j for j in np.argsort(E_all) if L_all[j] == lz]
+    if ry_ph is not None:
+        # the PH x Ry eigenvalue of an ED level, from <s|U|v> = u v(s) on its largest entries
+        states = qtx.utils.ints_to_array(dense_symm.basis.states)
+
+        def ed_eigenvalue(v):
+            ds = qtx.state.DenseState(np.asarray(v), dense_symm)
+            s = states[np.argsort(-np.abs(v))[:8]]
+            t, sign = jax.vmap(U_phry.images)(jnp.asarray(s))
+            return float(np.median(np.asarray(sign[:, 1]) * ds(np.asarray(t[:, 1])) / ds(s)))
+
+        keep = [j for j in keep if ed_eigenvalue(V_all[:, j]) * ry_ph > 0.5]
+    keep = keep[:len(members)]
     if len(keep) < len(members):
-        raise SystemExit(f"only {len(keep)} L={lz} levels among the lowest 16 of the Lz block")
+        raise SystemExit(f"only {len(keep)} L={lz} levels{'' if ry_ph is None else ' of that PH x Ry'} among the "
+                         "lowest 16 of the Lz block")
     E_ED, U_ED = E_all[keep], V_all[:, keep]
 
     B = []
@@ -286,7 +360,8 @@ if args["check"]:
         b = np.array(state.todense(dense_symm).psi).real
         B.append(b / np.linalg.norm(b))
     B = np.array(B).T
-    print(f"\nED h={h} L={lz} z2={z2:+d}: {np.round(E_ED, 4)}")
+    sector_label = "" if ry_ph is None else f" PH x Ry {ry_ph:+d}"
+    print(f"\nED h={h} L={lz} z2={z2:+d}{sector_label}: {np.round(E_ED, 4)}")
     rows = []
     for i, b in enumerate(B.T):
         rows.append(dict(overlaps=((U_ED.T @ b)**2).tolist(), E=float(b @ (H_sp @ b)), L2=float(b @ (L2_sp @ b))))

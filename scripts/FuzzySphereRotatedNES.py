@@ -148,6 +148,9 @@ sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
 OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
 if sectors["ry"] == -1:
     parser.error("--ry-sect -1: the L=0 members are Ry=+1 at Lz=0, so the projection would remove them")
+if ansatz.get("ry_ph") is not None and sectors["phry"] != ansatz["ry_ph"]:
+    print(f"warning: the ansatz members were built in PH x Ry {ansatz['ry_ph']:+d}, but --ry-ph-sect is "
+          f"{'not given' if sectors['phry'] is None else format(sectors['phry'], '+d')}", flush=True)
 if sectors["z2"] is not None and sectors["z2"] != z2:
     print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was rotated by the angle of sector {z2:+d}",
           flush=True)
