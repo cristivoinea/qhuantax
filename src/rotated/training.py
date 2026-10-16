@@ -17,7 +17,8 @@ from quantax.utils import to_distributed_array
 
 def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int = 4000,
                    lr: float = 1e-2, lr_t0: float | None = None, abort_at: int | None = 1000,
-                   abort_above: float = 1e-3, log_every: int = 500, log_prefix: str | None = None):
+                   abort_above: float = 1e-3, log_every: int = 500, log_prefix: str | None = None,
+                   projection: tuple | None = None):
     r"""``quantumhall_excitons.pretrain_masked`` (full-batch Adam on the exact infidelity over
     ``spins``, gradients multiplied by ``masks``, best parameters kept) with an early abort: at step
     ``abort_at`` the run stops if the best :math:`1-F` so far is above ``abort_above`` and has not
@@ -26,6 +27,11 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
     A non-finite gradient also stops the run (``aborted``), with a message naming the parameters it hit.
     The configurations are split over all JAX devices (e.g. ``JAX_NUM_CPU_DEVICES``), padded with copies of
     the first one at weight 0. With ``log_prefix``, every ``log_every`` steps print a line starting with it.
+
+    ``projection = (index, sign, eigval)`` fits the symmetrized model instead, the one a projected variational
+    state uses: :math:`\psi_P(s)=\frac12[\psi(s)+\lambda\,\sigma_s\psi(s')]`, with :math:`s'=` ``spins[index[s]]`` the
+    image of :math:`s` under an involutive symmetry that maps ``spins`` onto itself and :math:`\sigma_s` = ``sign[s]``
+    (``<s|U|psi> = sign psi(s')``). The images are among ``spins``, so this costs nothing extra.
 
     :return: ``(model, history, aborted)``; ``history`` lists ``(step, 1-F)`` every ``log_every``
         steps and ends with the best value.
@@ -39,10 +45,16 @@ def pretrain_exact(model, spins, target, masks: dict | None = None, steps: int =
     params, static = eqx.partition(model, eqx.is_inexact_array)
     start_time = time.time()
 
+    if projection is not None:
+        img_index, img_sign, eigval = jnp.asarray(projection[0]), jnp.asarray(projection[1], float), float(projection[2])
+
     def infidelity(p, data):
         spins, weight, tgt = data
         psi = jax.vmap(eqx.combine(p, static))(spins)
         amp = weight * psi.sign * jnp.exp(psi.logabs - jnp.max(psi.logabs))
+        if projection is not None:
+            amp, tgt = amp[:n], tgt[:n]
+            amp = 0.5 * (amp + eigval * img_sign * amp[img_index])
         return 1.0 - (amp @ tgt) ** 2 / (amp @ amp)
 
     def mask(g):
