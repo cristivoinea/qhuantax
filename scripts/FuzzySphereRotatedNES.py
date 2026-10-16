@@ -5,6 +5,10 @@
 # trainable. With K >= 3 an L >= 1 level lies inside the window at h_c, so --lmlp-coeff is needed; --lmlp-bump-var
 # doubles it once the penalty's sampled variance has come down, since its noise is lambda^2 Var(L^- L^+).
 # --exact-diag tracks the members against the lowest L=0 levels of the (Lz=0, z2) block, cached in --ed-dir.
+# Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect (pi rotation about
+# y, (-1)^L at Lz=0: +1 removes the odd-L intruders and with them the L=1 bound on lambda) and --ry-ph-sect
+# (particle-hole x Ry, P (-1)^L at any Lz, with P that of PRX 13, 021009). The ED targets are then the L=0 levels
+# of the same sectors.
 #
 #   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_h_3.16_id04.json \
 #       --lmlp-coeff 3.0 --exact-diag --nbr-sweeps 200 --path runs/rotnes
@@ -27,7 +31,7 @@ from quantax.nn import lecun_normal
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
 from qhuantax.quantumhall_excitons import KSectors
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
-from qhuantax.quantumhall_symmetries import FlavourPermQH
+from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 from qhuantax.quantumhall_utils import adaptive_learning_rate_inv
 from qhuantax.rotated import load_member, member_spec, set_gap, untie
@@ -41,6 +45,15 @@ SX = np.array([[0, 1], [1, 0]])
 parser = argparse.ArgumentParser()
 parser.add_argument("--ansatz-meta", required=True, help="meta file written by FuzzySphereRotatedAnsatz.py")
 parser.add_argument("--h", type=float, default=None, help="transverse field; defaults to the ansatz's")
+parser.add_argument("--z2-sect", type=int, default=None, choices=(1, -1),
+                    help="impose the Ising Z2 (flavour exchange) with this eigenvalue; not imposed if omitted")
+parser.add_argument("--ry-sect", type=int, default=None, choices=(1, -1),
+                    help="impose the pi rotation about y; at Lz=0 its eigenvalue is (-1)^L, so +1 removes every odd L "
+                         "(the L=0 members are +1); not imposed if omitted")
+parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
+                    help="impose particle-hole x Ry, which commutes with every rotation: eigenvalue P (-1)^L, with P "
+                         "the particle-hole symmetry of PRX 13, 021009 (the Ising ground state is +1), so the P of the "
+                         "L=0 members; usable at any Lz; not imposed if omitted")
 parser.add_argument("--int-cutoff", type=float, default=1e-15,
                     help="train on H without the interaction hopping terms below this |U|; the sum of the dropped |U| "
                          "(printed, in the meta) bounds the shift of every energy. ED and the dense readout keep the "
@@ -131,6 +144,13 @@ if nstates >= 3 and not penalized:
     parser.error("with K >= 3 an L >= 1 level lies inside the window at h_c: give --lmlp-coeff")
 if args["lmlp_bump_var"] > 0 and not (penalized and LmLp_freq == 1):
     parser.error("--lmlp-bump-var needs a penalty measured every sweep (--lmlp-coeff, --lmlp-freq 1)")
+sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
+OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
+if sectors["ry"] == -1:
+    parser.error("--ry-sect -1: the L=0 members are Ry=+1 at Lz=0, so the projection would remove them")
+if sectors["z2"] is not None and sectors["z2"] != z2:
+    print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was rotated by the angle of sector {z2:+d}",
+          flush=True)
 
 cont_run_id = None
 if args["cont_run"] is not None:
@@ -146,7 +166,36 @@ if args["cont_run"] is not None:
 Path(path).mkdir(parents=True, exist_ok=True)
 
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
-symm = FlavourPermQH(eigval=z2)
+symm = fuzzy_sphere_symmetry(**sectors)
+symm_label = ", ".join(f"{OPTION[name]} {e:+d}" for name, e in sectors.items() if e is not None) or "none"
+ksectors = KSectors(N, 0)
+
+
+def member_eigenvalue(member, U):
+    """<U> of an ansatz member at h=0, an exact sum over its sector k, which Ry and PH x Ry map onto itself: the eigenvalue
+    for an exact member; the projection onto the other sector would keep (1 - <U>)/2 of its weight."""
+    model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"]).rebuild(theta=0.0)
+    s = jnp.asarray(ksectors.configs(member["k"]))
+    t, sign = jax.vmap(U.images)(s)
+    psi_s, psi_t = jax.vmap(model)(s), jax.vmap(model)(t[:, 1])
+    top = jnp.maximum(jnp.max(psi_s.logabs), jnp.max(psi_t.logabs))
+    a, b = (p.sign * jnp.exp(p.logabs - top) for p in (psi_s, psi_t))
+    return float(jnp.sum(a * sign[:, 1] * b) / jnp.sum(a * a))
+
+
+# The members must lie in the imposed Ry and PH x Ry sectors, or the projection removes them (R(theta) commutes with
+# both)
+member_eigvals = {}
+if args["cont_run"] is None:
+    for name, U in (("ry", RyQH(1)), ("phry", PHRyQH(1))):
+        if sectors[name] is not None:
+            ev = [member_eigenvalue(m, U) for m in ansatz["members"]]
+            member_eigvals[name] = ev
+            print(f"{OPTION[name]}: eigenvalue of the ansatz members at h=0 {np.round(ev, 4)}", flush=True)
+            off = [i for i, e in enumerate(ev) if e * sectors[name] < 0.5]
+            if off:
+                raise SystemExit(f"{OPTION[name]} {sectors[name]:+d}: members {off} lie mostly in the other sector "
+                                 "and the projection would remove them")
 
 
 # quantum Hall Hamiltonian; the one trained on drops the hopping terms below --int-cutoff
@@ -194,12 +243,11 @@ else:
               flush=True)
 member_states = [qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
 state_set = NaturalStateSet(member_states)
-print(f"N={N}, h={h}, z2={z2:+d}, K={nstates}: members k = {[m['k'] for m in ansatz['members']]}, {start}; "
-      f"{state_set.nparams_per_state} parameters per member", flush=True)
+print(f"N={N}, h={h}, K={nstates}, symmetries imposed: {symm_label}; members k = "
+      f"{[m['k'] for m in ansatz['members']]}, {start}; {state_set.nparams_per_state} parameters per member", flush=True)
 
 # Chain j opens in exciton sector j: every rotated member reaches it, and distinct sectors keep the tuple's
 # det A away from zero
-ksectors = KSectors(N, 0)
 rng = np.random.default_rng(args["seed"])
 init_configs = np.stack([ksectors.configs(j)[rng.integers(ksectors.dim(j), size=nsamples)]
                          for j in range(nstates)], axis=1)
@@ -216,7 +264,7 @@ def L_from_L2(q):
 def exact_L0_levels():
     """The lowest L=0 levels and vectors: read from the first usable file in ed_dir, or computed as in
     FuzzySphereNESTrain (the --ed-k lowest levels of the block, all L), keeping the L=0 ones by <L^2>."""
-    stem = f"ed_n_{N}_2s_{N-1}_lz_0_z2_{z2}_h_{h:g}_V_{ansatz['args']['ps_pot'].replace(',', '_')}_nst_"
+    stem = f"ed_n_{N}_2s_{N-1}_lz_0_z2_{sectors['z2'] or 0}_h_{h:g}_V_{ansatz['args']['ps_pot'].replace(',', '_')}_nst_"
 
     def nst(f):                                       # -1 for the .part file of a save in progress
         n = f.name[len(stem):-len(".npz")]
@@ -250,14 +298,28 @@ def exact_L0_levels():
     return E[keep], V[:, keep], f"saved to {f}"
 
 
+def ed_eigenvalue(V, U):
+    """The eigenvalue of each ED vector (columns of V, dense basis) under U, from <s|U|v> = u v(s) on its largest
+    entries (the levels are non-degenerate within the block)."""
+    states = qtx.utils.ints_to_array(dense_symm.basis.states)
+    out = []
+    for v in V.T:
+        ds = qtx.state.DenseState(np.asarray(v), dense_symm)
+        s = states[np.argsort(-np.abs(v))[:8]]
+        t, sign = jax.vmap(U.images)(jnp.asarray(s))
+        out.append(float(np.median(np.asarray(sign[:, 1]) * ds(np.asarray(t[:, 1])) / ds(s))))
+    return np.array(out)
+
+
 def safe_lambda():
     """Smallest L^- L^+ coefficient that lifts the lowest level of every L >= 1 this margin above the K-th L=0
-    level: at Lz = 0 an L level moves up by lambda L(L+1). Dense, so small blocks only."""
+    level: at Lz = 0 an L level moves up by lambda L(L+1). Only the L allowed by --ry-sect ((-1)^L) count;
+    --ry-ph-sect is not resolved here, so with it the value is an upper bound. Dense, so small blocks only."""
     q, W = np.linalg.eigh(L2_sp.toarray().real)
     L, H_dense = L_from_L2(q), H_sp.toarray().real
     E_L = {l: np.linalg.eigvalsh(W[:, L == l].T @ H_dense @ W[:, L == l]) for l in np.unique(L)}
     need, L_bind = max(((E_L[0][nstates - 1] + args["lmlp_margin"] - E_L[l][0]) / (l*(l + 1)), l)
-                       for l in E_L if l >= 1)
+                       for l in E_L if l >= 1 and (sectors["ry"] is None or (-1)**l == sectors["ry"]))
     print(f"lambda = {max(0.0, need):.4f} (auto): lowest L={L_bind} level {E_L[L_bind][0]:.4f} vs L=0 level "
           f"#{nstates} {E_L[0][nstates - 1]:.4f}, margin {args['lmlp_margin']}", flush=True)
     return max(0.0, float(need))
@@ -274,10 +336,11 @@ def dense_readout():
     return float(np.sum(ritz)), float(fidelity), ritz, float(trL2)
 
 
-# Exact diagonalization in the (Lz=0, z2) user basis, ~7e5 states at N=14
+# Exact diagonalization in the Lz=0 user basis (Z2-resolved when --z2-sect is given), ~7e5 states at N=14. The
+# L=0 levels are all Ry=+1; with --ry-ph-sect only those of that eigenvalue (their P) are targets
 if do_ED:
     tms_H_ED = tms_H if int_dropped == 0 else hamiltonian()[0]
-    dense_symm = LzUserBasisSymmetry(0, z2)
+    dense_symm = LzUserBasisSymmetry(0, sectors["z2"] or 0)
     L2_sp = GetL2Terms(N, 2).get_quspin_op(dense_symm).tocsr()
     H_sp = tms_H_ED.get_quspin_op(dense_symm).tocsr()
     dim = H_sp.shape[0]
@@ -287,6 +350,14 @@ if do_ED:
     ed_dir = Path(path if args["ed_dir"] is None else args["ed_dir"])
     ed_dir.mkdir(parents=True, exist_ok=True)
     E_ED, V_ED, source = exact_L0_levels()
+    if sectors["phry"] is not None:
+        ph_ED = ed_eigenvalue(V_ED, PHRyQH(1))
+        print(f"PH x Ry eigenvalue of the exact L=0 levels {np.round(E_ED, 6)}: {np.round(ph_ED, 4)}", flush=True)
+        keep = np.flatnonzero(ph_ED * sectors["phry"] > 0.5)
+        if len(keep) < nstates:
+            raise SystemExit(f"only {len(keep)} of the {len(E_ED)} exact L=0 levels have PH x Ry {sectors['phry']:+d}, "
+                             f"{nstates} members: raise --ed-nstates (and --ed-k)")
+        E_ED, V_ED = E_ED[keep], V_ED[:, keep]
     print(f"Exact L=0 levels: {np.round(E_ED, 6)} (lowest {nstates} sum to {np.sum(E_ED[:nstates]):.6f}); "
           f"block dim {dim}, {source}", flush=True)
     if lmlp_auto:
@@ -294,7 +365,8 @@ if do_ED:
 
 
 meta = dict(args=args, ansatz_meta=str(args["ansatz_meta"]), N=N, z2=z2, h=h, K=nstates, lam=LmLp_coeff,
-            theta=ansatz["theta"], continued_from=cont_run_id, int_dropped=int_dropped,
+            theta=ansatz["theta"], continued_from=cont_run_id, int_dropped=int_dropped, symmetries=sectors,
+            member_eigenvalues=member_eigvals,
             members=[dict(k=m["k"], root=m["root"], file=f"state{i}_{run_id}.eqx",
                           spec=member_spec(model, m["spec"]["d"], m["spec"]["nb"], m["spec"]["nh"]))
                      for i, (m, model) in enumerate(zip(ansatz["members"], models))],
