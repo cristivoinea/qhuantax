@@ -57,6 +57,9 @@ parser.add_argument("--det-backflow-scale", type=float, default=0.1,
 parser.add_argument("--gap", type=float, default=8.0,
                     help="k=2 members: up features suppressed by exp(-gap); <= 0 keeps the ansatz's")
 parser.add_argument("--lmlp-coeff", type=float, default=0.0, help="coefficient lambda of the L^- L^+ penalty")
+parser.add_argument("--lmlp-every", type=int, default=None,
+                    help="measure <L^- L^+> every this many sweeps, also at lambda = 0 (the gradient is unchanged; "
+                         "~10-20%% per measured sweep); 0 never. Defaults to 1 with a penalty, 0 without")
 parser.add_argument("--lmlp-bump-var", type=float, default=0.0,
                     help="double lambda once, when the sampled Var(L^- L^+) averaged over the last --lmlp-bump-window "
                          "sweeps drops below this; 0 disables")
@@ -102,6 +105,7 @@ h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 lam, nsamples, max_fs, do_ED, path = (args[k] for k in ("lmlp_coeff", "nbr_samples", "max_fs", "exact_diag", "path"))
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
+lmlp_every = int(lam > 0) if args["lmlp_every"] is None else args["lmlp_every"]
 
 
 def run_name(run):
@@ -109,12 +113,11 @@ def run_name(run):
 
 
 run_id = run_name(args["run_id"])
-if lam <= 0 and lz == 0 and nstates >= 3:
-    parser.error("with K >= 3 an L >= 1 level lies inside the window at h_c: give --lmlp-coeff")
-if lam <= 0 and lz != 0:
-    print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window", flush=True)
-if args["lmlp_bump_var"] > 0 and lam <= 0:
-    parser.error("--lmlp-bump-var needs --lmlp-coeff")
+if lam <= 0 and (lz != 0 or nstates >= 3):
+    print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window (at Lz = 0 and h_c, K >= 3 "
+          "already reaches some)", flush=True)
+if args["lmlp_bump_var"] > 0 and (lam <= 0 or lmlp_every != 1):
+    parser.error("--lmlp-bump-var needs --lmlp-coeff and the penalty measured every sweep (--lmlp-every 1)")
 sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
 OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
 if sectors["ry"] is not None and (lz != 0 or sectors["ry"] == -1):
@@ -387,7 +390,7 @@ class ObarKeepingSR(NaturalExcitedSR):
 
 solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
 optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
-                          penalty_every=1 if lam > 0 else 0, diagnostics=args["diagnostics"])
+                          penalty_every=lmlp_every, diagnostics=args["diagnostics"])
 
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
 rows = []
