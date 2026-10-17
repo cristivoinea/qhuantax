@@ -40,7 +40,9 @@ import jax.numpy as jnp
 from jax.typing import DTypeLike
 from quantax.global_defs import get_sites, get_subkeys
 from quantax.nn import fermion_idx, fermion_inverse_sign, lecun_normal
-from quantax.utils import LogArray
+from quantax.utils import LogArray, ScaleArray
+
+MAX_EXPONENT = 60.0         # largest backflow feature e^60 ~ 1e26, well inside float32
 
 
 def charge_only_spins(s: jax.Array) -> jax.Array:
@@ -88,9 +90,16 @@ class _RotatedBackflow(eqx.Module):
 
     def features(self, s: jax.Array) -> jax.Array:
         """Backflow features of every mode, ``(2*nm, d/2)``: output row ``2c`` of the network feeds
-        the up modes of channel ``c``, row ``2c+1`` the down modes (the ``DetBackflow`` layout)."""
-        x = jnp.asarray(self.net(charge_only_spins(s) if self.charge_only else s))
-        return x.reshape(-1, get_sites().Nfmodes).T.astype(self.dtype)
+        the up modes of channel ``c``, row ``2c+1`` the down modes (the ``DetBackflow`` layout).
+
+        The network's exp output (``exp_by_scale``: ``significand * e^xmax``) is materialised with ``xmax``
+        capped at ``MAX_EXPONENT``, unchanged below it. Beyond float32's e^88 the features would be inf, and
+        a member with W = 0 NaN (inf * 0) where it should be its exact determinant: an untrained network
+        can get there on rare strongly charge-fluctuating configurations (N=14, k=1 members)."""
+        x = self.net(charge_only_spins(s) if self.charge_only else s)
+        if isinstance(x, ScaleArray):
+            x = x.significand * jnp.exp(jnp.minimum(x.exponent, MAX_EXPONENT))
+        return jnp.asarray(x).reshape(-1, get_sites().Nfmodes).T.astype(self.dtype)
 
     def orbitals(self, s: jax.Array) -> jax.Array:
         r"""The full rotated orbital matrix :math:`R_1(\theta)(U_0+X(s)W^T)`, all :math:`2n_m` rows."""
