@@ -29,7 +29,7 @@ from quantax.utils import LogArray
 
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
 from qhuantax.nes.optimizer import NaturalTraceEnergyGrad
-from qhuantax.quantumhall_excitons import KSectors
+from qhuantax.quantumhall_excitons import rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import FlavourPermQH, fuzzy_sphere_symmetry
 from qhuantax.rotated import load_member
@@ -72,10 +72,9 @@ members = [qtx.state.Variational(load_member(m["spec"], N, D / m["file"]), symm=
 state_set = NaturalStateSet(members)
 grad = NaturalTraceEnergyGrad(tms_H)
 
-ksectors = KSectors(N, lz)
-rng = np.random.default_rng(args["seed"])
-k0 = int(lz != 0)                                   # k = 0 is empty at Lz != 0
-init = np.stack([ksectors.configs(k)[rng.integers(ksectors.dim(k), size=n)] for k in range(k0, k0 + K)], axis=1)
+symmetries = meta.get("symmetries", dict(z2=z2))
+init = rotated_vacuum_tuples(N, n, K, meta["theta"], lz, both=symmetries.get("z2") is not None,
+                             rng=np.random.default_rng(args["seed"]))
 t = time.time()
 sampler = NaturalLzDetFlavourFlipSampler(state_set, n, n_neighbor=np.arange(1, 3), initial_spins=init,
                                          reweight=args["reweight"], flip_prob=args["flip_prob"])

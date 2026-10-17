@@ -1,11 +1,13 @@
-# NES at transverse field h from the rotated exciton members of FuzzySphereRotatedAnsatz.py, which all have L = Lz (its
-# --lz). The members are released before training: untied (the features may then see the flavour; no amplitude
-# changes), the k=2 up-feature suppression lowered to exp(-gap), and the k=0,1 determinants (W = 0, where the network
-# has no gradient) given a small random backflow; the angle trains. The L^- L^+ penalty vanishes on L = Lz and lifts a
-# level of L > Lz by lambda [L(L+1) - Lz(Lz+1)]; --lmlp-bump-var doubles lambda once its sampled variance has come down.
-# Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect (pi rotation about y,
-# (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in PRX 13, 021009).
-# --exact-diag tracks the members against the lowest L = Lz levels of the same sectors, cached in --ed-dir.
+# NES at transverse field h from the rotated exciton members of FuzzySphereRotatedAnsatz.py, in its Lz sector (--lz),
+# each member with its own L >= Lz (--L-sect there). The members are released before training: untied (the features may
+# then see the flavour; no amplitude changes), the k=2 up-feature suppression lowered to exp(-gap), and the k=0,1
+# determinants (W = 0, where the network has no gradient) given a small random backflow; the angle trains. The
+# L^- L^+ penalty vanishes on L = Lz and lifts a level of L > Lz by lambda [L(L+1) - Lz(Lz+1)], so it suits members that
+# all have L = Lz; with members of higher L (e.g. K=6 at Lz=0: four L=0 and the two L=2 levels below them) leave it off
+# and separate the converged span by L with NESSpanSpectrum.py. --lmlp-bump-var doubles lambda once its sampled variance
+# has come down. Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect (pi
+# rotation about y, (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in
+# PRX 13, 021009). --exact-diag tracks the members against the lowest levels of their L's in the same sectors.
 #
 #   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_h_3.16_id04.json \
 #       --lmlp-coeff 3.0 --exact-diag --nbr-sweeps 200 --path runs/rotnes
@@ -26,7 +28,7 @@ from quantax.global_defs import get_subkeys
 from quantax.nn import lecun_normal
 
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
-from qhuantax.quantumhall_excitons import KSectors
+from qhuantax.quantumhall_excitons import KSectors, rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
@@ -67,7 +69,6 @@ parser.add_argument("--lmlp-bump-window", type=int, default=50, help="sweeps ave
 parser.add_argument("--exact-diag", action="store_true", help="track the members against ED (feasible up to N=14)")
 parser.add_argument("--ed-every", type=int, default=5, help="ED readout every this many sweeps")
 parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the Lz block to compute, all L")
-parser.add_argument("--ed-nstates", type=int, default=4, help="number of L = Lz levels kept")
 parser.add_argument("--ed-dir", default=None, help="ED cache folder, searched first; defaults to --path")
 parser.add_argument("--nbr-sweeps", type=int, default=200, help="number of training iterations")
 parser.add_argument("--nbr-samples", type=int, default=512, help="number of sample tuples per iteration")
@@ -101,6 +102,8 @@ args = vars(parser.parse_args())
 
 ansatz = json.load(open(args["ansatz_meta"]))
 N, lz, z2, nstates = ansatz["N"], ansatz["lz"], ansatz["z2"], len(ansatz["members"])
+Ls = [m.get("L", lz) for m in ansatz["members"]]        # older ansatz metas: every member has L = Lz
+mixed_L = set(Ls) != {lz}
 h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 lam, nsamples, max_fs, do_ED, path = (args[k] for k in ("lmlp_coeff", "nbr_samples", "max_fs", "exact_diag", "path"))
@@ -113,9 +116,12 @@ def run_name(run):
 
 
 run_id = run_name(args["run_id"])
-if lam <= 0 and (lz != 0 or nstates >= 3):
+if lam <= 0 and not mixed_L and (lz != 0 or nstates >= 3):
     print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window (at Lz = 0 and h_c, K >= 3 "
           "already reaches some)", flush=True)
+if lam > 0 and mixed_L:
+    print(f"warning: --lmlp-coeff also lifts the members of L > Lz (L = {Ls}); the targets become the lowest K levels "
+          "of H + lambda L^- L^+", flush=True)
 if args["lmlp_bump_var"] > 0 and (lam <= 0 or lmlp_every != 1):
     parser.error("--lmlp-bump-var needs --lmlp-coeff and the penalty measured every sweep (--lmlp-every 1)")
 sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
@@ -170,8 +176,8 @@ def member_eigenvalue(member, U, project=fit_ry_ph is not None):
 
 
 # The members must lie in the imposed Ry and PH x Ry sectors, or the projection removes them (R(theta) commutes with
-# both). Members the ansatz fitted projected are taken projected, so their PH x Ry needs no check; printed instead is the
-# share of the network's weight the projection keeps (a small share is a cancellation that float32 resolves poorly)
+# both). Members the ansatz fitted projected are taken projected, so their PH x Ry needs no check; printed instead is
+# the share of the network's weight the projection keeps (a small share is a cancellation that float32 resolves poorly)
 member_eigvals = {}
 if cont_run_id is None and fit_ry_ph is not None:
     kept = member_eigvals["phry_kept"] = [(1 + fit_ry_ph * member_eigenvalue(m, PHRyQH(1), project=False)) / 2
@@ -207,9 +213,9 @@ def release(member):
     model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"])
     if not args["no_untie"]:
         model = untie(model)
-    if member["spec"]["kind"] == "multidet" and args["gap"] > 0:
+    if member["k"] >= 2 and args["gap"] > 0:               # the block fits
         model = set_gap(model, args["gap"])
-    if member["spec"]["kind"] == "det" and args["det_backflow_scale"] > 0 and not jnp.any(model.W):
+    if member["k"] < 2 and args["det_backflow_scale"] > 0 and not jnp.any(model.W):    # the exact determinant(s)
         # relative to U0, whose std is 1 unless the ansatz script scaled the member to unit norm
         W = lecun_normal(get_subkeys(), model.W.shape, dtype=model.W.dtype) / 10 * float(jnp.std(model.U0))
         model = eqx.tree_at(lambda m: m.W, model, args["det_backflow_scale"] * W)
@@ -229,16 +235,13 @@ else:
               flush=True)
 member_states = [qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
 state_set = NaturalStateSet(member_states)
-print(f"N={N}, Lz={lz}, h={h}, K={nstates}, symmetries imposed: {symm_label}; members k = "
-      f"{[m['k'] for m in ansatz['members']]}, {start}; {state_set.nparams_per_state} parameters per member",
-      flush=True)
+print(f"N={N}, Lz={lz}, h={h}, K={nstates}, symmetries imposed: {symm_label}; members (k, L) = "
+      f"{[(m['k'], L) for m, L in zip(ansatz['members'], Ls)]}, {start}; {state_set.nparams_per_state} parameters per "
+      "member", flush=True)
 
-# Chain j opens in its own exciton sector (k = j, from k = 1 at Lz != 0, where k = 0 is empty): every rotated member
-# reaches it, and distinct sectors keep the tuple's det A away from zero
-rng = np.random.default_rng(args["seed"])
-k0 = int(lz != 0)
-init_configs = np.stack([ksectors.configs(k)[rng.integers(ksectors.dim(k), size=nsamples)]
-                         for k in range(k0, k0 + nstates)], axis=1)
+# Chain seeds distributed like the rotated vacuum (and its Z2 image when Z2 is imposed), the K of a tuple distinct
+init_configs = rotated_vacuum_tuples(N, nsamples, nstates, ansatz["theta"], lz, both=sectors["z2"] is not None,
+                                     rng=np.random.default_rng(args["seed"]))
 sampler = NaturalLzDetFlavourFlipSampler(state_set, nsamples, n_neighbor=np.arange(1, 3),
                                          initial_spins=init_configs, reweight=args["reweight"],
                                          flip_prob=args["flip_prob"], thermal_steps=args["thermal_steps"],
@@ -246,41 +249,34 @@ sampler = NaturalLzDetFlavourFlipSampler(state_set, nsamples, n_neighbor=np.aran
 
 
 def exact_levels():
-    """The lowest L = lz levels and vectors: from the first usable file in ed_dir, or the --ed-k lowest levels of the
-    block (all L), kept by <L^2>."""
-    stem = (f"ed_n_{N}_2s_{N-1}_lz_{lz}_z2_{sectors['z2'] or 0}_h_{h:g}_"
-            f"V_{ansatz['args']['ps_pot'].replace(',', '_')}_nst_")
-
-    def nst(f):                                       # -1 for the .part file of a save in progress
-        n = f.name[len(stem):-len(".npz")]
-        return int(n) if n.isdigit() else -1
-
-    for f in sorted((f for f in ed_dir.glob(stem + "*.npz") if nst(f) >= args["ed_nstates"]), key=nst):
+    """The --ed-k lowest levels of the block (all L, L from <L^2>), sorted: read from ed_dir or computed and cached
+    there. An older cache of L = lz levels only (..._nst_<n>.npz) serves when every member has L = lz."""
+    base = f"ed_n_{N}_2s_{N-1}_lz_{lz}_z2_{sectors['z2'] or 0}_h_{h:g}_V_{ansatz['args']['ps_pot'].replace(',', '_')}"
+    f = ed_dir / f"{base}_nev_{args['ed_k']}.npz"
+    if f.is_file():
         with np.load(f) as cached:
-            if cached["V"].shape[0] == dim:
-                return cached["E"][:args["ed_nstates"]], cached["V"][:, :args["ed_nstates"]], f"read from {f}"
-            print(f"skipping {f.name}: vectors of length {cached['V'].shape[0]}, block dim {dim}", flush=True)
+            return cached["E"], cached["V"], cached["L"], f"read from {f}"
+    if not mixed_L:
+        for g in sorted(ed_dir.glob(f"{base}_nst_*.npz")):
+            n = g.name[len(base) + 5:-len(".npz")]
+            if n.isdigit() and int(n) >= nstates:
+                with np.load(g) as cached:
+                    if cached["V"].shape[0] == dim:
+                        return cached["E"], cached["V"], np.full(len(cached["E"]), lz), f"read from {g}"
 
     E, V = tms_H_ED.diagonalize(symm=dense_symm, k=min(args["ed_k"], dim - 2))
     q = np.real(np.einsum("si,si->i", V.conj(), L2_sp @ V))
     L = np.round((-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2).astype(int)
     order = np.argsort(E)
-    print("Lowest levels of the block, (L) from <L^2>: " + " ".join(f"{E[j]:.6f}({L[j]})" for j in order), flush=True)
+    E, V, L, q = E[order], V[:, order], L[order], q[order]
+    print("Lowest levels of the block, (L) from <L^2>: " + " ".join(f"{e:.6f}({l})" for e, l in zip(E, L)), flush=True)
     if np.any(np.abs(q - L*(L + 1)) > 1e-3):
-        print(f"  warning: <L^2> = {np.round(q[order], 4)} not all L(L+1): degenerate levels of different L mix",
-              flush=True)
-    keep = order[L[order] == lz][:args["ed_nstates"]]
-    if len(keep) < nstates:
-        raise SystemExit(f"only {len(keep)} L={lz} levels among the lowest {args['ed_k']}, {nstates} members: "
-                         "raise --ed-k")
-    if len(keep) < args["ed_nstates"]:
-        print(f"  warning: only {len(keep)} L={lz} levels among the lowest {args['ed_k']}", flush=True)
+        print(f"  warning: <L^2> = {np.round(q, 4)} not all L(L+1): degenerate levels of different L mix", flush=True)
     # written under a temporary name and renamed, so a run starting meanwhile never reads half a file
-    f = ed_dir / f"{stem}{len(keep)}.npz"
-    part = ed_dir / f"{stem}{len(keep)}.part{os.getpid()}.npz"
-    np.savez(part, E=E[keep], V=V[:, keep])
+    part = ed_dir / f"{base}_nev_{args['ed_k']}.part{os.getpid()}.npz"
+    np.savez(part, E=E, V=V, L=L)
     os.replace(part, f)
-    return E[keep], V[:, keep], f"saved to {f}"
+    return E, V, L, f"saved to {f}"
 
 
 def ed_eigenvalue(V, U):
@@ -297,18 +293,21 @@ def ed_eigenvalue(V, U):
 
 
 def dense_readout():
-    """tr(S^-1 H), subspace fidelity with ED, Ritz values and tr(S^-1 L^2) - K lz(lz+1), the leak out of L = lz."""
+    """tr(S^-1 H), subspace fidelity with the ED targets, Ritz values with the L of their vectors (from <L^2>), and the
+    leak tr(S^-1 L^2) - sum_i L_i(L_i+1) out of the members' L's (0 on the exact span)."""
     P = np.stack([np.asarray(state.todense(dense_symm).psi, dtype=complex) for state in state_set.states], 1)
-    S = P.conj().T @ P
+    S = (P.conj().T @ P + (P.conj().T @ P).conj().T) / 2
     H_red = P.conj().T @ (H_sp @ P)
-    ritz = sp.linalg.eigh((H_red + H_red.conj().T) / 2, (S + S.conj().T) / 2, eigvals_only=True)
-    fidelity = np.linalg.norm(V_ED[:, :nstates].conj().T @ sp.linalg.orth(P))**2 / nstates
-    trL2 = np.real(np.trace(np.linalg.solve(S, P.conj().T @ (L2_sp @ P)))) - nstates * lz * (lz + 1)
-    return float(np.sum(ritz)), float(fidelity), ritz, float(trL2)
+    L2_red = P.conj().T @ (L2_sp @ P)
+    ritz, C = sp.linalg.eigh((H_red + H_red.conj().T) / 2, S)
+    q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
+    fidelity = np.linalg.norm(V_ED.conj().T @ sp.linalg.orth(P))**2 / nstates
+    leak = np.real(np.trace(np.linalg.solve(S, L2_red))) - sum(L * (L + 1) for L in Ls)
+    return float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak)
 
 
-# ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0); with --ry-ph-sect only the levels of
-# that eigenvalue are targets
+# ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
+# members the lowest levels of that L, as many as there are members of it (with --ry-ph-sect those of that eigenvalue)
 if do_ED:
     tms_H_ED = tms_H if int_dropped == 0 else hamiltonian()[0]
     dense_symm = LzUserBasisSymmetry(lz, sectors["z2"] or 0)
@@ -317,28 +316,34 @@ if do_ED:
     dim = H_sp.shape[0]
     ed_dir = Path(path if args["ed_dir"] is None else args["ed_dir"])
     ed_dir.mkdir(parents=True, exist_ok=True)
-    E_ED, V_ED, source = exact_levels()
-    if sectors["phry"] is not None:
-        ph_ED = ed_eigenvalue(V_ED, PHRyQH(1))
-        print(f"PH x Ry eigenvalue of the exact L={lz} levels {np.round(E_ED, 6)}: {np.round(ph_ED, 4)}", flush=True)
-        keep = np.flatnonzero(ph_ED * sectors["phry"] > 0.5)
-        if len(keep) < nstates:
-            raise SystemExit(f"only {len(keep)} of the {len(E_ED)} exact L={lz} levels have PH x Ry "
-                             f"{sectors['phry']:+d}, {nstates} members: raise --ed-nstates (and --ed-k)")
-        E_ED, V_ED = E_ED[keep], V_ED[:, keep]
-    print(f"Exact L={lz} levels: {np.round(E_ED, 6)} (lowest {nstates} sum to {np.sum(E_ED[:nstates]):.6f}); "
+    E_all, V_all, L_all, source = exact_levels()
+    keep = []
+    for L in sorted(set(Ls)):
+        found = np.flatnonzero(L_all == L)
+        if sectors["phry"] is not None:
+            ph = ed_eigenvalue(V_all[:, found], PHRyQH(1))
+            print(f"PH x Ry eigenvalue of the exact L={L} levels {np.round(E_all[found], 6)}: {np.round(ph, 4)}",
+                  flush=True)
+            found = found[ph * sectors["phry"] > 0.5]
+        if len(found) < Ls.count(L):
+            raise SystemExit(f"only {len(found)} exact L={L} levels in the sector among the lowest {len(E_all)}, "
+                             f"{Ls.count(L)} members: raise --ed-k")
+        keep += list(found[:Ls.count(L)])
+    keep = sorted(keep, key=lambda j: E_all[j])
+    E_ED, V_ED, L_ED = E_all[keep], V_all[:, keep], L_all[keep]
+    print("ED targets: " + " ".join(f"{e:.6f}(L{l})" for e, l in zip(E_ED, L_ED)) + f", sum {np.sum(E_ED):.6f}; "
           f"block dim {dim}, {source}", flush=True)
 
 
 meta = dict(args=args, ansatz_meta=str(args["ansatz_meta"]), N=N, lz=lz, z2=z2, h=h, K=nstates, lam=lam,
             theta=ansatz["theta"], continued_from=cont_run_id, int_dropped=int_dropped, symmetries=sectors,
             member_eigenvalues=member_eigvals,
-            members=[dict(k=m["k"], root=m["root"], file=f"state{i}_{run_id}.eqx",
+            members=[dict(k=m["k"], L=L, root=m["root"], file=f"state{i}_{run_id}.eqx",
                           spec=member_spec(model, m["spec"]["d"], m["spec"]["nb"], m["spec"]["nh"]))
-                     for i, (m, model) in enumerate(zip(ansatz["members"], models))],
+                     for i, (m, L, model) in enumerate(zip(ansatz["members"], Ls, models))],
             nparams_per_state=[int(n) for n in state_set.nparams_per_state])
 if do_ED:
-    meta["E_ED"] = E_ED.tolist()
+    meta["E_ED"], meta["L_ED"] = E_ED.tolist(), L_ED.tolist()
 
 
 def save_meta():
@@ -352,12 +357,13 @@ exact_rows = []
 
 def record_exact(sweep):
     """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
-    trE, fidelity, ritz, trL2 = dense_readout()
-    exact_rows.append((sweep, trE, fidelity, *ritz, trL2))
+    trE, fidelity, ritz, ritz_L, leak = dense_readout()
+    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
-               header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2")
-    return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)}, "
-            f"L^2 leak = {trL2:.2e}")
+               header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
+                      + " ".join(f"ritzL{k}" for k in range(nstates)))
+    return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
+            f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}")
 
 
 if do_ED:

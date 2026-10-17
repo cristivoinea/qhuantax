@@ -124,6 +124,17 @@ class H0Excitons:
         lam = -1.0 / a.sum() if mu == 0 else 0.0
         return np.vstack([np.eye(nm) + lam * np.outer(np.ones(nm), a), np.outer(np.ones(nm), a)])
 
+    def exciton_terms(self, ell: int, mu: int) -> tuple[list[np.ndarray], list[float]]:
+        r""":math:`k=1`: :math:`B_{\ell\mu}|\Uparrow\rangle` in the :math:`L_z=\mu` sector as a sum of
+        determinants, ``(orbital matrices, coefficients)``: ``exciton_orbitals`` alone where it is
+        exact, and at :math:`\mu=0,\ \ell\ge1` the determinant without the :math:`\lambda` term,
+        :math:`|\Uparrow\rangle+B_{\ell0}|\Uparrow\rangle`, minus the vacuum."""
+        if mu > 0 or ell == 0:
+            return [self.exciton_orbitals(ell, mu)], [1.0]
+        nm = self.nm
+        a = np.diag(self.t(ell, 0)).copy()
+        return [np.vstack([np.eye(nm), np.outer(np.ones(nm), a)]), self.vacuum_orbitals()], [1.0, -1.0]
+
     def exciton_energy(self, ell: int) -> float:
         r""":math:`E_\ell=E_H-\langle t^{\ell0}|K|t^{\ell0}\rangle/\langle t^{\ell0}|t^{\ell0}\rangle`,
         equal to the closed form :math:`\sum_l2V_l(2J+1)[\frac1{2s+1}-\{s\,s\,\ell;s\,s\,J\}]`."""
@@ -436,16 +447,18 @@ class KSectors:
             A = A + mu * (self.block(L2, k, k) - self.lz * (self.lz + 1) * identity(A.shape[0]))
         return A.tocsr()
 
-    def eigenstates(self, H0, k: int, nstates: int = 1, L2=None, nlevels: int = 20):
-        r"""Lowest ``nstates`` eigenstates of ``H0`` with exactly ``k`` flips and :math:`L=L_z` (when
-        ``L2`` is given; otherwise any :math:`L\ge L_z`). As in ``FuzzySphereNESTrain``: the lowest
-        ``nlevels`` levels of the block, every :math:`L`, keeping those with :math:`L=L_z` by
-        :math:`\langle L^2\rangle`; ``nlevels`` doubles until ``nstates`` of them are found.
+    def eigenstates(self, H0, k: int, nstates: int = 1, L2=None, nlevels: int = 20, L: int | None = None):
+        r"""Lowest ``nstates`` eigenstates of ``H0`` with exactly ``k`` flips and angular momentum ``L``
+        (default :math:`L_z`; when ``L2`` is given, otherwise any :math:`L\ge L_z`). As in
+        ``FuzzySphereNESTrain``: the lowest ``nlevels`` levels of the block, every :math:`L`, keeping
+        those with that :math:`L` by :math:`\langle L^2\rangle`; ``nlevels`` doubles until ``nstates``
+        of them are found.
 
         :return: ``(energies, vectors)``, ``vectors[:, i]`` on ``configs(k)``.
         """
         from scipy.sparse.linalg import eigsh
 
+        target = self.lz if L is None else L
         A = self.block(H0, k, k)
         L2k = None if L2 is None else self.block(L2, k, k)
         n = A.shape[0]
@@ -459,16 +472,16 @@ class KSectors:
             if L2k is None:
                 return e[:nstates], V[:, :nstates]
             q = np.einsum("si,si->i", V, L2k @ V)
-            L = np.round((-1 + np.sqrt(1 + 4 * np.clip(q, 0, None))) / 2)
-            keep = np.flatnonzero(L == self.lz)[:nstates]
+            Ls = np.round((-1 + np.sqrt(1 + 4 * np.clip(q, 0, None))) / 2)
+            keep = np.flatnonzero(Ls == target)[:nstates]
             if len(keep) == nstates or nlevels >= n - 1:
                 break
             nlevels = 2 * nlevels
         if len(keep) < nstates:
-            raise ValueError(f"k={k}: only {len(keep)} levels with L={self.lz} in the whole sector")
-        off = np.abs(q[keep] - self.lz * (self.lz + 1))
+            raise ValueError(f"k={k}: only {len(keep)} levels with L={target} in the whole sector")
+        off = np.abs(q[keep] - target * (target + 1))
         if np.any(off > 1e-6):
-            raise ValueError(f"k={k}: <L^2> of the L={self.lz} levels off by {off}: degenerate levels of "
+            raise ValueError(f"k={k}: <L^2> of the L={target} levels off by {off}: degenerate levels of "
                              "different L mix")
         return e[keep], V[:, keep]
 
@@ -767,6 +780,55 @@ def rotation_orbitals(nm: int, theta: float) -> np.ndarray:
     c, s = np.cos(theta / 2), np.sin(theta / 2)
     eye = np.eye(nm)
     return np.block([[c * eye, -s * eye], [s * eye, c * eye]])
+
+
+def rotated_vacuum_configs(nm: int, n: int, theta: float, lz: int = 0, both: bool = False,
+                           rng: np.random.Generator | None = None) -> np.ndarray:
+    r"""``n`` random configurations distributed like the rotated vacuum :math:`R(\theta)|\Uparrow\rangle`,
+    as starting points for Markov chains: one electron per orbital, each down with probability
+    :math:`\sin^2(\theta/2)` (with ``both``, each configuration takes :math:`\cos^2(\theta/2)` instead
+    with probability 1/2, the Z2 image). For :math:`L_z\ne0` random electrons are then moved up
+    (:math:`L_z>0`) or down, each by a random number of orbitals onto an empty mode of the target orbital
+    (either flavour), until the total is ``lz``. Quantax layout (up modes, then down modes), :math:`\pm1`."""
+    rng = np.random.default_rng() if rng is None else rng
+    if abs(lz) > nm * nm // 2:
+        raise ValueError(f"|Lz| = {abs(lz)} is out of reach of {nm} electrons in {nm} orbitals")
+    p = np.sin(theta / 2) ** 2
+    out = -np.ones((n, 2 * nm), np.int8)
+    for r in range(n):
+        q = 1 - p if both and rng.random() < 0.5 else p
+        occ = np.zeros((2, nm), bool)                     # occ[flavour, orbital]
+        occ[(rng.random(nm) < q).astype(int), np.arange(nm)] = True
+        left, tries = lz, 0
+        while left != 0:
+            tries += 1
+            if tries > 100 * nm * nm:
+                raise RuntimeError(f"could not reach Lz = {lz}")
+            f, m = rng.choice(np.argwhere(occ))
+            step = int(np.sign(left))
+            reach = min(abs(left), nm - 1 - m if step > 0 else m)
+            if reach < 1:
+                continue
+            t = m + step * int(rng.integers(1, reach + 1))
+            empty = np.flatnonzero(~occ[:, t])
+            if len(empty) == 0:
+                continue
+            occ[f, m], occ[rng.choice(empty), t] = False, True
+            left -= t - m
+        out[r, occ.ravel()] = 1
+    return out
+
+
+def rotated_vacuum_tuples(nm: int, ntuples: int, K: int, theta: float, lz: int = 0, both: bool = False,
+                          rng: np.random.Generator | None = None) -> np.ndarray:
+    """``(ntuples, K, 2 nm)`` seeds for the NES sampler from ``rotated_vacuum_configs``, the K of a tuple distinct
+    (rotated members are nonzero on all of them, so the tuple's determinant is too)."""
+    rng = np.random.default_rng() if rng is None else rng
+    out = rotated_vacuum_configs(nm, ntuples * K, theta, lz, both, rng).reshape(ntuples, K, 2 * nm)
+    for t in range(ntuples):
+        while len({row.tobytes() for row in out[t]}) < K:
+            out[t] = rotated_vacuum_configs(nm, K, theta, lz, both, rng)
+    return out
 
 
 def vacuum_angle(nm: int, ps_pot, h: float, z2: int, hamiltonian, xatol: float = 1e-6):
