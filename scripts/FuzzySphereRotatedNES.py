@@ -119,9 +119,10 @@ sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
 OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
 if sectors["ry"] is not None and (lz != 0 or sectors["ry"] == -1):
     parser.error("--ry-sect: Ry maps Lz to -Lz, so it exists at Lz = 0 only, where the L = 0 members are +1")
-if ansatz.get("ry_ph") is not None and sectors["phry"] != ansatz["ry_ph"]:
-    print(f"warning: the ansatz members were built in PH x Ry {ansatz['ry_ph']:+d}, but --ry-ph-sect is "
-          f"{'not given' if sectors['phry'] is None else format(sectors['phry'], '+d')}", flush=True)
+fit_ry_ph = ansatz.get("ry_ph")         # the ansatz fitted its members projected onto this PH x Ry sector
+if fit_ry_ph is not None and sectors["phry"] != fit_ry_ph:
+    parser.error(f"the ansatz fitted its members as PH x Ry {fit_ry_ph:+d} projected models, which only --ry-ph-sect "
+                 f"{fit_ry_ph:+d} reproduces: unprojected, they carry an unfitted part in the other sector")
 if sectors["z2"] is not None and sectors["z2"] != z2:
     print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was rotated by the angle of sector {z2:+d}",
           flush=True)
@@ -144,23 +145,38 @@ symm_label = ", ".join(f"{OPTION[name]} {e:+d}" for name, e in sectors.items() i
 ksectors = KSectors(N, lz)
 
 
-def member_eigenvalue(member, U):
+def member_eigenvalue(member, U, project=fit_ry_ph is not None):
     """<U> of an ansatz member at h=0, an exact sum over its sector k, which Ry and PH x Ry map onto itself: the
-    eigenvalue for an exact member; the projection onto the other sector would keep (1 - <U>)/2 of its weight."""
+    eigenvalue for an exact member; the projection onto the other sector would keep (1 - <U>)/2 of its weight. With
+    `project`, of the PH x Ry projected model the ansatz fitted and NES uses, psi_P(x) = [psi(x) + r sign psi(x')]/2."""
     model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"]).rebuild(theta=0.0)
     s = jnp.asarray(ksectors.configs(member["k"]))
     t, sign = jax.vmap(U.images)(s)
-    psi_s, psi_t = jax.vmap(model)(s), jax.vmap(model)(t[:, 1])
-    top = jnp.maximum(jnp.max(psi_s.logabs), jnp.max(psi_t.logabs))
-    a, b = (p.sign * jnp.exp(p.logabs - top) for p in (psi_s, psi_t))
+
+    def terms(x):                       # (coefficient, configurations) whose amplitudes add up to the member's at x
+        if not project:
+            return [(1.0, x)]
+        y, sign_y = jax.vmap(PHRyQH(1).images)(x)
+        return [(0.5, x), (0.5 * fit_ry_ph * sign_y[:, 1], y[:, 1])]
+
+    parts = [(c, jax.vmap(model)(x)) for x0 in (s, t[:, 1]) for c, x in terms(x0)]
+    top = max(jnp.max(p.logabs) for _, p in parts)
+    vals = [c * p.sign * jnp.exp(p.logabs - top) for c, p in parts]
+    a, b = sum(vals[:len(vals) // 2]), sum(vals[len(vals) // 2:])
     return float(jnp.sum(a * sign[:, 1] * b) / jnp.sum(a * a))
 
 
 # The members must lie in the imposed Ry and PH x Ry sectors, or the projection removes them (R(theta) commutes with
-# both)
+# both). Members the ansatz fitted projected are taken projected, so their PH x Ry needs no check; printed instead is the
+# share of the network's weight the projection keeps (a small share is a cancellation that float32 resolves poorly)
 member_eigvals = {}
+if cont_run_id is None and fit_ry_ph is not None:
+    kept = member_eigvals["phry_kept"] = [(1 + fit_ry_ph * member_eigenvalue(m, PHRyQH(1), project=False)) / 2
+                                          for m in ansatz["members"]]
+    print(f"members fitted as PH x Ry {fit_ry_ph:+d} projected models: the projection keeps {np.round(kept, 3)} of the "
+          "networks' weight", flush=True)
 for name, U in (("ry", RyQH(1)), ("phry", PHRyQH(1))):
-    if cont_run_id is None and sectors[name] is not None:
+    if cont_run_id is None and sectors[name] is not None and not (name == "phry" and fit_ry_ph is not None):
         ev = member_eigvals[name] = [member_eigenvalue(m, U) for m in ansatz["members"]]
         print(f"{OPTION[name]}: eigenvalue of the ansatz members at h=0 {np.round(ev, 4)}", flush=True)
         off = [i for i, e in enumerate(ev) if e * sectors[name] < 0.5]
