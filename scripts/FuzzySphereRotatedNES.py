@@ -270,7 +270,7 @@ def exact_levels():
     order = np.argsort(E)
     E, V, L, q = E[order], V[:, order], L[order], q[order]
     print("Lowest levels of the block, (L) from <L^2>: " + " ".join(f"{e:.6f}({l})" for e, l in zip(E, L)), flush=True)
-    if np.any(np.abs(q - L*(L + 1)) > 1e-3):
+    if np.any(np.abs(q - L*(L + 1)) > 0.05):         # float32 eigenvectors leave ~1e-2 (N=14); a mix is O(1)
         print(f"  warning: <L^2> = {np.round(q, 4)} not all L(L+1): degenerate levels of different L mix", flush=True)
     # written under a temporary name and renamed, so a run starting meanwhile never reads half a file
     part = ed_dir / f"{base}_nev_{args['ed_k']}.part{os.getpid()}.npz"
@@ -293,9 +293,25 @@ def ed_eigenvalue(V, U):
 
 
 def dense_readout():
-    """tr(S^-1 H), subspace fidelity with the ED targets, Ritz values with the L of their vectors (from <L^2>), and the
-    leak tr(S^-1 L^2) - sum_i L_i(L_i+1) out of the members' L's (0 on the exact span)."""
-    P = np.stack([np.asarray(state.todense(dense_symm).psi, dtype=complex) for state in state_set.states], 1)
+    """tr(S^-1 H), subspace fidelity with the ED targets, Ritz values with the L of their vectors (from <L^2>), the
+    leak tr(S^-1 L^2) - sum_i L_i(L_i+1) out of the members' L's (0 on the exact span), and log10 of each member's
+    largest amplitude. Every member enters divided by that amplitude, taken in log space: todense overflows float32
+    beyond e^88, and nothing here depends on a member's scale."""
+    basis_ints = dense_symm.basis.states
+    symm_norm = np.real(dense_symm.basis.get_amp(basis_ints))
+    P, top = [], []
+    for state in state_set.states:
+        psi = state[basis_ints]
+        logabs, sign = np.asarray(psi.logabs, float), np.asarray(psi.sign, float)
+        top.append(np.max(logabs[np.isfinite(logabs)]))
+        P.append(sign * np.exp(logabs - top[-1]) / symm_norm)
+    P = np.stack(P, 1)
+    bad = ~np.isfinite(P)
+    if bad.any():
+        s = qtx.utils.ints_to_array(basis_ints[np.flatnonzero(bad.any(1))[:3]])
+        raise SystemExit(f"dense readout: non-finite amplitudes of members {np.flatnonzero(bad.any(0)).tolist()} on "
+                         f"{bad.any(1).sum()} of {len(P)} configurations; electrons per orbital of the first: "
+                         f"{((s[:, :N] > 0).astype(int) + (s[:, N:] > 0).astype(int)).tolist()}")
     S = (P.conj().T @ P + (P.conj().T @ P).conj().T) / 2
     H_red = P.conj().T @ (H_sp @ P)
     L2_red = P.conj().T @ (L2_sp @ P)
@@ -303,7 +319,8 @@ def dense_readout():
     q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
     fidelity = np.linalg.norm(V_ED.conj().T @ sp.linalg.orth(P))**2 / nstates
     leak = np.real(np.trace(np.linalg.solve(S, L2_red))) - sum(L * (L + 1) for L in Ls)
-    return float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak)
+    return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
+            np.array(top) / np.log(10))
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -357,13 +374,15 @@ exact_rows = []
 
 def record_exact(sweep):
     """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
-    trE, fidelity, ritz, ritz_L, leak = dense_readout()
+    trE, fidelity, ritz, ritz_L, leak, top = dense_readout()
     exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
                header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
                       + " ".join(f"ritzL{k}" for k in range(nstates)))
+    # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
-            f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}")
+            f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}"
+            + (f", log10 of each member's largest amplitude {np.round(top, 1)}" if sweep < 0 else ""))
 
 
 if do_ED:
