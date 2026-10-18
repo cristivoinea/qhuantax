@@ -81,6 +81,11 @@ parser.add_argument("--rshift", type=float, default=None,
 parser.add_argument("--max-fs", type=float, default=0.0,
                     help="trust region: cap on 1 - F per sweep, F the fidelity of the spans before and after the "
                          "update, to second order dtheta^T S dtheta with S from the previous sweep; 0 disables")
+parser.add_argument("--warmup-fs", type=float, default=1e-4,
+                    help="the trust region (in place of --max-fs) for the first --warmup-sweeps sweeps of a fresh run, "
+                         "whose SR steps are mostly noise (their 1 - F 10-1000x larger on an independent batch than on "
+                         "their own) and push the members out of their L; not applied with --cont-run; 0 disables")
+parser.add_argument("--warmup-sweeps", type=int, default=None, help="sweeps under --warmup-fs; defaults to 2N")
 parser.add_argument("--diagnostics", action="store_true",
                     help="record the SR matrix spectrum every 5 sweeps and the sampler's acceptance every sweep")
 parser.add_argument("--profile", action="store_true",
@@ -451,9 +456,12 @@ if args["profile"]:
     optimizer.get_Ebar = timed("ebar", optimizer.get_Ebar)
     optimizer.get_Obar = timed("obar", optimizer.get_Obar)
     optimizer.solve = timed("solve", optimizer.solve)
-# The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with
-# --max-fs): on the batch the step was solved from, |Obar dtheta|^2 is biased low
-prev_Obar = optimizer.get_Obar(sampler.sweep()) if max_fs > 0 else None
+# The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
+# trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
+# sweeps of a fresh run, whose steps are mostly noise, to a smaller 1 - F
+warmup = 0 if cont_run_id is not None or args["warmup_fs"] <= 0 else \
+    (2 * N if args["warmup_sweeps"] is None else args["warmup_sweeps"])
+prev_Obar = optimizer.get_Obar(sampler.sweep()) if max_fs > 0 or warmup > 0 else None
 start_time = datetime.now()
 for i in range(args["nbr_sweeps"]):
     timings.clear()
@@ -475,8 +483,9 @@ for i in range(args["nbr_sweeps"]):
     dtheta = step * adaptive_learning_rate_inv(args["lr"], t0, i)
     fs_same = float(jnp.sum(jnp.abs(optimizer.last_Obar @ dtheta)**2))
     fs = fs_applied = np.nan if prev_Obar is None else float(jnp.sum(jnp.abs(prev_Obar @ dtheta)**2))
-    if 0 < max_fs < fs:
-        dtheta, fs_applied = dtheta * np.sqrt(max_fs / fs), max_fs
+    cap = args["warmup_fs"] if i < warmup else max_fs
+    if 0 < cap < fs:
+        dtheta, fs_applied = dtheta * np.sqrt(cap / fs), cap
     state_set.update(state_set.split_step(dtheta))
     prev_Obar = optimizer.last_Obar
     if args["profile"]:
