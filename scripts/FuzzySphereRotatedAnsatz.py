@@ -58,7 +58,8 @@ parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
                          "are counted within it (--k-root) and fitted as projected models, k=0 and k=1 must have it; "
                          "not imposed if omitted. Pass the same value to FuzzySphereRotatedNES.py")
 parser.add_argument("--theta", type=float, default=None,
-                    help="rotation angle in degrees; defaults to the optimal vacuum angle at h")
+                    help="rotation angle in degrees; defaults to the optimal angle of the Z2 = +1 vacuum at h, "
+                         "whatever --z2-sect")
 parser.add_argument("--ps-pot", default="4.75,1", help="inter-flavour pseudopotentials")
 parser.add_argument("--attn-dim", type=int, default=16, help="attention dimension of the transformer")
 parser.add_argument("--nbr-blocks", type=int, default=4, help="number of layers in the transformer")
@@ -232,10 +233,11 @@ def save_meta():
         json.dump(meta, f, indent=1, default=float)
 
 
-# The rotation angle: the one minimising the Z2-projected energy of the rotated vacuum, unless given
+# The rotation angle: the one minimising the Z2 = +1 projected energy of the rotated vacuum (the global vacuum), unless
+# given; the same for every --z2-sect, so the sectors share one rotated basis
 theta = 0.0
 if h != 0:
-    theta, E_vac, theta_hf = vacuum_angle(N, 2*pspot_inter, h, z2, tms_H)
+    theta, E_vac, theta_hf = vacuum_angle(N, 2*pspot_inter, h, 1, tms_H)
     meta.update(theta_vacuum=theta, E_vacuum=E_vac, theta_hf=theta_hf)
     print(f"h = {h}: optimal vacuum angle {np.degrees(theta):.4f} deg (projected energy {E_vac:.6f}; "
           f"closed-form HF {np.degrees(theta_hf):.4f} deg)", flush=True)
