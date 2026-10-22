@@ -4,9 +4,9 @@
 # determinants (W = 0, where the network has no gradient) given a small random backflow; the angle trains. The
 # L^- L^+ penalty vanishes on L = Lz and lifts a level of L > Lz by lambda [L(L+1) - Lz(Lz+1)], so it suits members that
 # all have L = Lz; with members of higher L (e.g. K=6 at Lz=0: four L=0 and the two L=2 levels below them) leave it off
-# and separate the converged span by L with NESSpanSpectrum.py. --lmlp-bump-var doubles lambda once its sampled variance
-# has come down. Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect (pi
-# rotation about y, (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in
+# and separate the converged span by L with NESSpanSpectrum.py. --lmlp-coeff auto takes lambda from the ED levels at h_c
+# (misc/iqh_gaps.py). Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect
+# (pi rotation about y, (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in
 # PRX 13, 021009). --exact-diag tracks the members against the lowest levels of their L's in the same sectors.
 #
 #   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_h_3.16_id04.json \
@@ -14,6 +14,7 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -58,14 +59,21 @@ parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 members: W = this x the default random init; 0 keeps W = 0")
 parser.add_argument("--gap", type=float, default=8.0,
                     help="k=2 members: up features suppressed by exp(-gap); <= 0 keeps the ansatz's")
-parser.add_argument("--lmlp-coeff", type=float, default=0.0, help="coefficient lambda of the L^- L^+ penalty")
+parser.add_argument("--lmlp-coeff", default="0",
+                    help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
+                         "lowest level of every L > Lz --lmlp-margin above the K-th L = Lz one, and at least the "
+                         "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-14, other "
+                         "N extrapolated). Every member must have L = Lz")
+parser.add_argument("--lmlp-margin", type=float, default=1.0,
+                    help="auto: energy by which the L > Lz levels must clear the K targets; the a + b/sqrt(N) "
+                         "extrapolation of the ED gaps misses by ~0.1-0.5 already from N = 9-12 to 14")
+parser.add_argument("--lmlp-floor-gap", type=float, default=20.0,
+                    help="auto: floor on lambda, kept when the levels need less, as the energy by which it lifts a "
+                         "random state of the Lz sector, taken for the L > Lz admixture the members pick up in "
+                         "training (mean L(L+1) - Lz(Lz+1) 241 at N=14, Lz=0, so 20 gives 0.083; ~N^3); 0 disables")
 parser.add_argument("--lmlp-every", type=int, default=None,
                     help="measure <L^- L^+> every this many sweeps, also at lambda = 0 (the gradient is unchanged; "
                          "~10-20%% per measured sweep); 0 never. Defaults to 1 with a penalty, 0 without")
-parser.add_argument("--lmlp-bump-var", type=float, default=0.0,
-                    help="double lambda once, when the sampled Var(L^- L^+) averaged over the last --lmlp-bump-window "
-                         "sweeps drops below this; 0 disables")
-parser.add_argument("--lmlp-bump-window", type=int, default=50, help="sweeps averaged for --lmlp-bump-var")
 parser.add_argument("--exact-diag", action="store_true", help="track the members against ED (feasible up to N=14)")
 parser.add_argument("--ed-every", type=int, default=5, help="ED readout every this many sweeps")
 parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the Lz block to compute, all L")
@@ -73,7 +81,7 @@ parser.add_argument("--ed-dir", default=None, help="ED cache folder, searched fi
 parser.add_argument("--nbr-sweeps", type=int, default=200, help="number of training iterations")
 parser.add_argument("--nbr-samples", type=int, default=512, help="number of sample tuples per iteration")
 parser.add_argument("--lr", type=float, default=1e-2, help="starting value of the learning rate")
-parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0); defaults to N")
+parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0), 0 for a constant lr; defaults to N")
 parser.add_argument("--norm-clip", type=float, default=0.0,
                     help="cap on the step norm before the learning rate; <= 0 disables")
 parser.add_argument("--rshift", type=float, default=None,
@@ -111,9 +119,8 @@ Ls = [m.get("L", lz) for m in ansatz["members"]]        # older ansatz metas: ev
 mixed_L = set(Ls) != {lz}
 h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
-lam, nsamples, max_fs, do_ED, path = (args[k] for k in ("lmlp_coeff", "nbr_samples", "max_fs", "exact_diag", "path"))
+nsamples, max_fs, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "exact_diag", "path"))
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
-lmlp_every = int(lam > 0) if args["lmlp_every"] is None else args["lmlp_every"]
 
 
 def run_name(run):
@@ -121,14 +128,6 @@ def run_name(run):
 
 
 run_id = run_name(args["run_id"])
-if lam <= 0 and not mixed_L and (lz != 0 or nstates >= 3):
-    print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window (at Lz = 0 and h_c, K >= 3 "
-          "already reaches some)", flush=True)
-if lam > 0 and mixed_L:
-    print(f"warning: --lmlp-coeff also lifts the members of L > Lz (L = {Ls}); the targets become the lowest K levels "
-          "of H + lambda L^- L^+", flush=True)
-if args["lmlp_bump_var"] > 0 and (lam <= 0 or lmlp_every != 1):
-    parser.error("--lmlp-bump-var needs --lmlp-coeff and the penalty measured every sweep (--lmlp-every 1)")
 sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
 OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
 if sectors["ry"] is not None and (lz != 0 or sectors["ry"] == -1):
@@ -140,6 +139,34 @@ if fit_ry_ph is not None and sectors["phry"] != fit_ry_ph:
 if sectors["z2"] is not None and sectors["z2"] != z2:
     print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was rotated by the angle of sector {z2:+d}",
           flush=True)
+
+lmlp_auto = args["lmlp_coeff"].strip().lower() == "auto"
+if lmlp_auto:
+    if mixed_L:
+        parser.error(f"--lmlp-coeff auto keeps the L > Lz levels out of the window, but the members have L = {Ls}")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "misc"))
+    from iqh_gaps import H_FIELD, PS_POT, min_lambda, random_state_LL
+    if not np.isclose(h, H_FIELD) or tuple(pspot_inter.tolist()) != PS_POT:
+        parser.error(f"--lmlp-coeff auto reads the ED levels at h = {H_FIELD}, V = {PS_POT}; this run has h = {h}, "
+                     f"V = {ansatz['args']['ps_pot']}")
+    try:
+        lam_need = min_lambda(N, lz, nstates, Z=sectors["z2"], ry_ph=sectors["phry"], ry=sectors["ry"],
+                              margin=args["lmlp_margin"])
+    except ValueError as err:
+        parser.error(f"--lmlp-coeff auto: {err}")
+    lam_floor = args["lmlp_floor_gap"] / random_state_LL(N, lz)
+    lam = max(lam_need, lam_floor)
+    print(f"--lmlp-coeff auto: lambda {lam:g} (the levels need {lam_need:g} at margin {args['lmlp_margin']:g}, "
+          f"floor {lam_floor:g} from gap {args['lmlp_floor_gap']:g})", flush=True)
+else:
+    lam = float(args["lmlp_coeff"])
+lmlp_every = int(lam > 0) if args["lmlp_every"] is None else args["lmlp_every"]
+if lam <= 0 and not lmlp_auto and not mixed_L and (lz != 0 or nstates >= 3):
+    print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window (at Lz = 0 and h_c, K >= 3 "
+          "already reaches some)", flush=True)
+if lam > 0 and mixed_L:
+    print(f"warning: --lmlp-coeff also lifts the members of L > Lz (L = {Ls}); the targets become the lowest K levels "
+          "of H + lambda L^- L^+", flush=True)
 
 cont_run_id = None if args["cont_run"] is None else run_name(args["cont_run"])
 if cont_run_id is not None:
@@ -233,7 +260,7 @@ if cont_run_id is None:
              f"k=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
 else:
     models = [load_member(m["spec"], N, f"{path}/{m['file']}") for m in cont_meta["members"]]
-    cont_lam = cont_meta.get("lam_bump", {}).get("lam_to", cont_meta["lam"])     # meta["lam"] is the opening one
+    cont_lam = cont_meta.get("lam_bump", {}).get("lam_to", cont_meta["lam"])     # older runs could double lambda
     start = f"continued from {cont_run_id} (lambda {cont_lam:g} at its end)"
     if lam < cont_lam:
         print(f"warning: --lmlp-coeff {lam:g} is below the lambda {cont_lam:g} that {cont_run_id} ended with",
@@ -324,8 +351,12 @@ def dense_readout():
     q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
     fidelity = np.linalg.norm(V_ED.conj().T @ sp.linalg.orth(P))**2 / nstates
     leak = np.real(np.trace(np.linalg.solve(S, L2_red))) - sum(L * (L + 1) for L in Ls)
+    # each member's L^2 outside the ED targets (exact L^2 eigenstates), per unit norm: blind to the members mixing among
+    # the targets, which the trace allows and which moves <L^2> between members of different L
+    A = V_ED.conj().T @ P
+    member_leak = np.real(np.diag(L2_red) - np.einsum("ta,t->a", np.abs(A)**2, L_ED * (L_ED + 1))) / np.real(np.diag(S))
     return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
-            np.array(top) / np.log(10))
+            member_leak, np.array(top) / np.log(10))
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -379,11 +410,12 @@ exact_rows = []
 
 def record_exact(sweep):
     """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
-    trE, fidelity, ritz, ritz_L, leak, top = dense_readout()
-    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L))
+    trE, fidelity, ritz, ritz_L, leak, member_leak, top = dense_readout()
+    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
                header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
-                      + " ".join(f"ritzL{k}" for k in range(nstates)))
+                      + " ".join(f"ritzL{k}" for k in range(nstates)) + " "
+                      + " ".join(f"outL2_{k}" for k in range(nstates)))
     # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
             f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}"
@@ -423,7 +455,7 @@ optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver,
                           penalty_every=lmlp_every, diagnostics=args["diagnostics"])
 
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
-rows = []
+rows, member_rows = [], []
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
@@ -486,6 +518,16 @@ for i in range(args["nbr_sweeps"]):
     cap = args["warmup_fs"] if i < warmup else max_fs
     if 0 < cap < fs:
         dtheta, fs_applied = dtheta * np.sqrt(cap / fs), cap
+    if args["diagnostics"] and prev_Obar is not None:
+        # each member's part of the applied step: |Obar_a dtheta_a|^2 on the previous batch and on its own (a ratio far
+        # above 1 is noise the step's batch fitted); its norm; cross terms between members are left out
+        edges = np.cumsum([0, *state_set.nparams_per_state])
+        blocks = list(zip(edges[:-1], edges[1:]))
+        member_rows.append((i, *(float(jnp.sum(jnp.abs(O[:, a:b] @ dtheta[a:b])**2))
+                                 for O in (prev_Obar, optimizer.last_Obar) for a, b in blocks),
+                            *(float(jnp.linalg.norm(dtheta[a:b])) for a, b in blocks)))
+        np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
+                   header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
     state_set.update(state_set.split_step(dtheta))
     prev_Obar = optimizer.last_Obar
     if args["profile"]:
@@ -503,19 +545,6 @@ for i in range(args["nbr_sweeps"]):
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
                       + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid")
-
-    # --lmlp-bump-var: lambda doubles once, from the next sweep, when the penalty's variance has come down
-    window = args["lmlp_bump_window"]
-    if args["lmlp_bump_var"] > 0 and "lam_bump" not in meta and len(rows) >= window:
-        var_penalty = np.mean([float(np.real(row[6])) for row in rows[-window:]])
-        if var_penalty < args["lmlp_bump_var"]:
-            meta["lam_bump"] = dict(sweep=i, var_penalty=var_penalty, lam_from=optimizer.penalty_coeff,
-                                    lam_to=2 * optimizer.penalty_coeff)
-            optimizer.penalty_coeff = 2 * optimizer.penalty_coeff
-            save_meta()
-            print(f"  sweep {i:5d}: Var(L^- L^+) over the last {window} sweeps {var_penalty:.3g} < "
-                  f"{args['lmlp_bump_var']:g}, lambda {meta['lam_bump']['lam_from']:g} -> {optimizer.penalty_coeff:g}",
-                  flush=True)
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
     timings["output"] = perf_counter() - t

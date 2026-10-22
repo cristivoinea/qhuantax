@@ -73,7 +73,8 @@ def adaptive_learning_rate_exp(lr0, delay, decay, baseline, iteration):
 
 
 def adaptive_learning_rate_inv(lr0, t0, iteration):
-    return lr0 / (1 + iteration/t0)
+    """lr0 / (1 + iteration / t0); constant for t0 <= 0."""
+    return lr0 if t0 <= 0 else lr0 / (1 + iteration/t0)
 
 
 def generate_spin_configs(L, N, lz, nsamples):
