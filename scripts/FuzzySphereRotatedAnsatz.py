@@ -28,7 +28,7 @@ import numpy as np
 import quantax as qtx
 import scipy as sp
 
-from qhuantax.quantumhall_excitons import H0Excitons, KSectors, spins_key, vacuum_angle
+from qhuantax.quantumhall_excitons import H0Excitons, KSectors, spins_key, vacuum_angle, vacuum_energy
 from qhuantax.quantumhall_operators import GetL2Terms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import PHRyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_transformer import Transformer
@@ -101,7 +101,7 @@ pspot_inter = np.array([float(v) for v in args["ps_pot"].split(",")])
 d, nb, nh = args["attn_dim"], args["nbr_blocks"], args["nbr_heads"]
 ndets = args["nbr_dets"]
 path = args["path"]
-run_id = f"n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_h_{h:g}_id0{args['run_id']}"
+run_id = f"n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_ryph_{ry_ph or 0}_h_{h:g}_id0{args['run_id']}"     # ryph 0: not imposed
 
 if any(k not in (0, 1, 2) for k in members):
     parser.error("--k-sect: only k = 0, 1, 2 are implemented")
@@ -236,15 +236,18 @@ def save_meta():
 # The rotation angle: the one minimising the Z2 = +1 projected energy of the rotated vacuum (the global vacuum), unless
 # given; the same for every --z2-sect, so the sectors share one rotated basis
 theta = 0.0
-if h != 0:
-    theta, E_vac, theta_hf = vacuum_angle(N, 2*pspot_inter, h, 1, tms_H)
-    meta.update(theta_vacuum=theta, E_vacuum=E_vac, theta_hf=theta_hf)
-    print(f"h = {h}: optimal vacuum angle {np.degrees(theta):.4f} deg (projected energy {E_vac:.6f}; "
-          f"closed-form HF {np.degrees(theta_hf):.4f} deg)", flush=True)
 if args["theta"] is not None:
     theta = np.radians(args["theta"])
+elif h != 0:
+    theta, _, theta_hf = vacuum_angle(N, 2*pspot_inter, h, 1, tms_H)
+    meta.update(theta_vacuum=theta, theta_hf=theta_hf)
+    print(f"h = {h}: optimal vacuum angle {np.degrees(theta):.4f} deg (closed-form HF {np.degrees(theta_hf):.4f} deg)",
+          flush=True)
 meta["theta"] = theta
-print(f"every member is rotated by {np.degrees(theta):.4f} deg", flush=True)
+# the vacuum rotated by theta and projected onto --z2-sect: an upper bound on that sector's lowest Lz = 0 level
+meta["E_vacuum"] = vacuum_energy(N, theta, z2, tms_H)
+print(f"every member is rotated by {np.degrees(theta):.4f} deg (rotated vacuum in Z2 = {z2:+d}: projected energy "
+      f"{meta['E_vacuum']:.6f})", flush=True)
 
 
 def k2_roots(L, need):

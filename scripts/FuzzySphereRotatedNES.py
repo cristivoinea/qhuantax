@@ -9,7 +9,7 @@
 # (pi rotation about y, (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in
 # PRX 13, 021009). --exact-diag tracks the members against the lowest levels of their L's in the same sectors.
 #
-#   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_h_3.16_id04.json \
+#   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_ryph_0_h_3.16_id04.json \
 #       --lmlp-coeff 3.0 --exact-diag --nbr-sweeps 200 --path runs/rotnes
 import argparse
 import json
@@ -123,12 +123,14 @@ nsamples, max_fs, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "exa
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
+sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
+
+
 def run_name(run):
-    return f"rotnes_n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_K_{nstates}_h_{h:g}_id0{run}"
+    return f"rotnes_n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_ryph_{sectors['phry'] or 0}_K_{nstates}_h_{h:g}_id0{run}"
 
 
 run_id = run_name(args["run_id"])
-sectors = dict(z2=args["z2_sect"], ry=args["ry_sect"], phry=args["ry_ph_sect"])
 OPTION = dict(z2="--z2-sect", ry="--ry-sect", phry="--ry-ph-sect")
 if sectors["ry"] is not None and (lz != 0 or sectors["ry"] == -1):
     parser.error("--ry-sect: Ry maps Lz to -Lz, so it exists at Lz = 0 only, where the L = 0 members are +1")
@@ -137,8 +139,8 @@ if fit_ry_ph is not None and sectors["phry"] != fit_ry_ph:
     parser.error(f"the ansatz fitted its members as PH x Ry {fit_ry_ph:+d} projected models, which only --ry-ph-sect "
                  f"{fit_ry_ph:+d} reproduces: unprojected, they carry an unfitted part in the other sector")
 if sectors["z2"] is not None and sectors["z2"] != z2:
-    print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was rotated by the angle of sector {z2:+d}",
-          flush=True)
+    print(f"warning: --z2-sect {sectors['z2']:+d}, but the ansatz was made for Z2 = {z2:+d} (older ansatz runs were "
+          "rotated by that sector's vacuum angle, newer ones by the Z2 = +1 angle in every sector)", flush=True)
 
 lmlp_auto = args["lmlp_coeff"].strip().lower() == "auto"
 if lmlp_auto:

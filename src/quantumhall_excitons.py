@@ -831,41 +831,60 @@ def rotated_vacuum_tuples(nm: int, ntuples: int, K: int, theta: float, lz: int =
     return out
 
 
+def _vacuum_energy(nm: int, theta: float, z2: int, hamiltonian) -> float:
+    """``vacuum_energy`` without the dtype switch; the caller holds a complex default dtype."""
+    from qhuantax.quantumhall_meanfield import HFVacuum, _ratio, chart, reduced_matrices
+
+    vac = HFVacuum(nm, float(theta))
+    U = chart(vac, np.zeros((nm, nm)))
+    if np.sin(theta) == 0:
+        # |Up> (or |Down>) and its Z2 image are orthogonal and H, at most two-body, does not couple them: the
+        # projection leaves the energy, while the projected Wick ratio is 0/0
+        return float(_ratio(U[None], np.ones(1), hamiltonian).real)
+    Hm, S = reduced_matrices(vac, U[None], 0, z2, 1, hamiltonian)
+    return float(Hm[0, 0] / S[0, 0])
+
+
+def _complex_dtype(fn):
+    """Runs ``fn()`` under a complex default dtype: the projected determinants carry complex
+    coefficients, which quantax's mean-field expectation accepts only then; restored afterwards."""
+    import jax.numpy as jnp
+    import quantax as qtx
+    from quantax.global_defs import get_default_dtype
+
+    previous = get_default_dtype()
+    qtx.set_default_dtype(jnp.complex128)
+    try:
+        return fn()
+    finally:
+        qtx.set_default_dtype(previous)
+
+
+def vacuum_energy(nm: int, theta: float, z2: int, hamiltonian) -> float:
+    r"""The exact :math:`Z_2`-projected energy of the vacuum rotated by ``theta``, in sector
+    ``z2``: Wick on the projected determinant pair (``quantumhall_meanfield.reduced_matrices``
+    with one gauge angle, exact at :math:`L_z=0`)."""
+    return _complex_dtype(lambda: _vacuum_energy(nm, theta, z2, hamiltonian))
+
+
 def vacuum_angle(nm: int, ps_pot, h: float, z2: int, hamiltonian, xatol: float = 1e-6):
     r"""The canting angle that minimises the exact :math:`Z_2`-projected energy of the rotated
     vacuum, and that energy.
 
-    The energy is evaluated by Wick on the projected determinant pair
-    (``quantumhall_meanfield.reduced_matrices`` with one gauge angle, exact at :math:`L_z=0`) and
-    minimised over :math:`\theta\in(0,\pi/2)`, which covers every distinct state since :math:`Z_2`
-    identifies :math:`\theta` with :math:`\pi-\theta`. The closed-form ``hf_vacuum`` angle is
-    returned alongside for comparison.
+    The energy (``vacuum_energy``) is minimised over :math:`\theta\in(0,\pi/2)`, which covers
+    every distinct state since :math:`Z_2` identifies :math:`\theta` with :math:`\pi-\theta`. The
+    closed-form ``hf_vacuum`` angle is returned alongside for comparison.
 
     :return: ``(theta, energy, theta_hf)``.
     """
-    import jax.numpy as jnp
-    import quantax as qtx
-    from quantax.global_defs import get_default_dtype
     from scipy.optimize import minimize_scalar
 
-    from qhuantax.quantumhall_meanfield import HFVacuum, chart, hf_vacuum, reduced_matrices
+    from qhuantax.quantumhall_meanfield import hf_vacuum
 
     theta_hf = hf_vacuum(nm, ps_pot, h, z2=z2).theta
-
-    def energy(theta):
-        vac = HFVacuum(nm, float(theta))
-        Hm, S = reduced_matrices(vac, chart(vac, np.zeros((nm, nm)))[None], 0, z2, 1, hamiltonian)
-        return float(Hm[0, 0] / S[0, 0])
-
-    # the projected determinants carry complex coefficients, which quantax's mean-field
-    # expectation accepts only under a complex default dtype; restored afterwards
-    previous = get_default_dtype()
-    qtx.set_default_dtype(jnp.complex128)
-    try:
-        res = minimize_scalar(energy, bounds=(1e-4, np.pi / 2 - 1e-4), method="bounded",
-                              options=dict(xatol=xatol))
-    finally:
-        qtx.set_default_dtype(previous)
+    res = _complex_dtype(lambda: minimize_scalar(lambda t: _vacuum_energy(nm, t, z2, hamiltonian),
+                                                 bounds=(1e-4, np.pi / 2 - 1e-4), method="bounded",
+                                                 options=dict(xatol=xatol)))
     return float(res.x), float(res.fun), float(theta_hf)
 
 
