@@ -27,8 +27,10 @@ import quantax as qtx
 import scipy as sp
 from quantax.global_defs import get_subkeys
 from quantax.nn import lecun_normal
+from quantax.utils import LogArray
 
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
+from qhuantax.nes.optimizer import NaturalTraceEnergyGrad
 from qhuantax.quantumhall_excitons import KSectors, rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
@@ -94,6 +96,14 @@ parser.add_argument("--warmup-fs", type=float, default=1e-4,
                          "whose SR steps are mostly noise (their 1 - F 10-1000x larger on an independent batch than on "
                          "their own) and push the members out of their L; not applied with --cont-run; 0 disables")
 parser.add_argument("--warmup-sweeps", type=int, default=None, help="sweeps under --warmup-fs; defaults to 2N")
+parser.add_argument("--max-dL", type=float, default=0.0,
+                    help="L trust region: cap on the L^- L^+ a step creates, the part of its change of "
+                         "tr(S^-1 L^- L^+) (the trLmLp column's units) quadratic in the step, measured like fs on the "
+                         "previous sweep's batch from the parameters before, after and before minus the step; "
+                         "applied after --max-fs to the step that one left. Costs 3 evaluations of the L^- L^+ trace "
+                         "per sweep; 0 disables")
+parser.add_argument("--max-dL-samples", type=int, default=0,
+                    help="--max-dL: measure on this many tuples of the previous batch (cost in proportion); 0 all")
 parser.add_argument("--diagnostics", action="store_true",
                     help="record the SR matrix spectrum every 5 sweeps and the sampler's acceptance every sweep")
 parser.add_argument("--profile", action="store_true",
@@ -119,7 +129,7 @@ Ls = [m.get("L", lz) for m in ansatz["members"]]        # older ansatz metas: ev
 mixed_L = set(Ls) != {lz}
 h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
-nsamples, max_fs, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "exact_diag", "path"))
+nsamples, max_fs, max_dL, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "max_dL", "exact_diag", "path"))
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
@@ -169,6 +179,13 @@ if lam <= 0 and not lmlp_auto and not mixed_L and (lz != 0 or nstates >= 3):
 if lam > 0 and mixed_L:
     print(f"warning: --lmlp-coeff also lifts the members of L > Lz (L = {Ls}); the targets become the lowest K levels "
           "of H + lambda L^- L^+", flush=True)
+if max_dL > 0 and mixed_L:
+    print(f"warning: --max-dL caps rises of tr(S^-1 L^- L^+), but with members of L > Lz (L = {Ls}) a leak of theirs "
+          "to a lower L lowers it and passes", flush=True)
+if args["max_dL_samples"] > 0:
+    # whole tuples per JAX device, as the full batch has
+    args["max_dL_samples"] = max(jax.device_count(), min(args["max_dL_samples"], nsamples)
+                                 // jax.device_count() * jax.device_count())
 
 cont_run_id = None if args["cont_run"] is None else run_name(args["cont_run"])
 if cont_run_id is not None:
@@ -326,11 +343,10 @@ def ed_eigenvalue(V, U):
     return np.array(out)
 
 
-def dense_readout():
-    """tr(S^-1 H), subspace fidelity with the ED targets, Ritz values with the L of their vectors (from <L^2>), the
-    leak tr(S^-1 L^2) - sum_i L_i(L_i+1) out of the members' L's (0 on the exact span), and log10 of each member's
-    largest amplitude. Every member enters divided by that amplitude, taken in log space: todense overflows float32
-    beyond e^88, and nothing here depends on a member's scale."""
+def dense_members():
+    """The members on the dense basis (columns), each divided by its largest amplitude, and the log of that amplitude.
+    Taken in log space: todense overflows float32 beyond e^88, and nothing read from them depends on a member's
+    scale."""
     basis_ints = dense_symm.basis.states
     symm_norm = np.real(dense_symm.basis.get_amp(basis_ints))
     P, top = [], []
@@ -346,19 +362,33 @@ def dense_readout():
         raise SystemExit(f"dense readout: non-finite amplitudes of members {np.flatnonzero(bad.any(0)).tolist()} on "
                          f"{bad.any(1).sum()} of {len(P)} configurations; electrons per orbital of the first: "
                          f"{((s[:, :N] > 0).astype(int) + (s[:, N:] > 0).astype(int)).tolist()}")
+    return P, np.array(top)
+
+
+def dense_leak(P=None):
+    """The leak tr(S^-1 L^2) - sum_i L_i(L_i+1) out of the members' L's (0 on the exact span), and S, L^2 reduced to
+    the members."""
+    P = dense_members()[0] if P is None else P
     S = (P.conj().T @ P + (P.conj().T @ P).conj().T) / 2
-    H_red = P.conj().T @ (H_sp @ P)
     L2_red = P.conj().T @ (L2_sp @ P)
+    return np.real(np.trace(np.linalg.solve(S, L2_red))) - sum(L * (L + 1) for L in Ls), S, L2_red
+
+
+def dense_readout():
+    """tr(S^-1 H), subspace fidelity with the ED targets, Ritz values with the L of their vectors (from <L^2>), the
+    leak (dense_leak), each member's L^2 outside the targets and log10 of its largest amplitude."""
+    P, top = dense_members()
+    leak, S, L2_red = dense_leak(P)
+    H_red = P.conj().T @ (H_sp @ P)
     ritz, C = sp.linalg.eigh((H_red + H_red.conj().T) / 2, S)
     q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
     fidelity = np.linalg.norm(V_ED.conj().T @ sp.linalg.orth(P))**2 / nstates
-    leak = np.real(np.trace(np.linalg.solve(S, L2_red))) - sum(L * (L + 1) for L in Ls)
     # each member's L^2 outside the ED targets (exact L^2 eigenstates), per unit norm: blind to the members mixing among
     # the targets, which the trace allows and which moves <L^2> between members of different L
     A = V_ED.conj().T @ P
     member_leak = np.real(np.diag(L2_red) - np.einsum("ta,t->a", np.abs(A)**2, L_ED * (L_ED + 1))) / np.real(np.diag(S))
     return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
-            member_leak, np.array(top) / np.log(10))
+            member_leak, top / np.log(10))
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -408,16 +438,17 @@ def save_meta():
 
 save_meta()
 exact_rows = []
+exact_dL = (np.nan, np.nan)      # --max-dL with --exact-diag: dL1, dL2 of the dense members at the readout sweeps
 
 
 def record_exact(sweep):
     """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
     trE, fidelity, ritz, ritz_L, leak, member_leak, top = dense_readout()
-    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak))
+    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, *exact_dL))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
                header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
                       + " ".join(f"ritzL{k}" for k in range(nstates)) + " "
-                      + " ".join(f"outL2_{k}" for k in range(nstates)))
+                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dL1 dL2")
     # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
             f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}"
@@ -456,12 +487,45 @@ solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift
 optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
                           penalty_every=lmlp_every, diagnostics=args["diagnostics"])
 
+# --max-dL: the step's change of tr(S^-1 L^- L^+) on the previous batch by correlated sampling (the same tuples at the
+# parameters before and after it). From a clean span the mean change is quadratic in the step, but every sample's is
+# linear: those linear parts average out and leave noise ~ |step|/sqrt(n) over a signal ~ |step|^2 (N=8: correlation
+# 0.3 with the exact change). The even part [dL(+step) + dL(-step)]/2 cancels them sample by sample and leaves the
+# quadratic part, the L^- L^+ the step creates; the odd part, the linear term (the penalty's restoring force, or H's
+# pull on junk already there), is logged with its noise. Its own operator object, so that --profile's eloc_LmLp
+# times the training's alone
+leak_trace = NaturalTraceEnergyGrad(tms_Lp.H @ tms_Lp)
+
+
+def batch_LmLp(samples):
+    """tr(S^-1 L^- L^+) of the members as they stand, on `samples`: weights |det A|^2 over the tuples' sampling
+    weights, which makes it exact for tuples drawn at other parameters (the previous sweep's)."""
+    t = jnp.real(leak_trace.local_energies(state_set, samples, resolve=False)[0])
+    logw = jnp.log(samples.reweight_factor) + 2 * (sampler.determinant(samples.spins).logabs
+                                                   - LogArray.from_value(samples.psi).logabs)
+    ok = jnp.isfinite(t) & jnp.isfinite(logw)
+    w = jnp.where(ok, jnp.exp(logw - jnp.max(jnp.where(ok, logw, -jnp.inf))), 0.0)
+    return float(jnp.sum(w * jnp.where(ok, t, 0.0)) / jnp.sum(w))
+
+
+def after_step(dtheta, fn, *args):
+    """fn(*args) after the update dtheta, the members restored afterwards: their models are put back rather than
+    stepped back, so no rounding remains (the jitted forwards take the model as an argument, nothing recompiles)."""
+    models = [state._model for state in state_set.states]
+    state_set.update(state_set.split_step(dtheta))
+    try:
+        return fn(*args)
+    finally:
+        for state, model in zip(state_set.states, models):
+            state._model = model
+
+
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
 rows, member_rows = [], []
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
-PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "solve", "update", "readout", "output")
+PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "solve", "update", "dL", "readout", "output")
 timings, profile_rows = {}, []
 
 
@@ -492,10 +556,11 @@ if args["profile"]:
     optimizer.solve = timed("solve", optimizer.solve)
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
 # trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
-# sweeps of a fresh run, whose steps are mostly noise, to a smaller 1 - F
+# sweeps of a fresh run, whose steps are mostly noise, to a smaller 1 - F. --max-dL measures on the same batch
 warmup = 0 if cont_run_id is not None or args["warmup_fs"] <= 0 else \
     (2 * N if args["warmup_sweeps"] is None else args["warmup_sweeps"])
-prev_Obar = optimizer.get_Obar(sampler.sweep()) if max_fs > 0 or warmup > 0 else None
+prev_samples = sampler.sweep() if max_fs > 0 or warmup > 0 or max_dL > 0 else None
+prev_Obar = None if prev_samples is None else optimizer.get_Obar(prev_samples)
 start_time = datetime.now()
 for i in range(args["nbr_sweeps"]):
     timings.clear()
@@ -520,6 +585,26 @@ for i in range(args["nbr_sweeps"]):
     cap = args["warmup_fs"] if i < warmup else max_fs
     if 0 < cap < fs:
         dtheta, fs_applied = dtheta * np.sqrt(cap / fs), cap
+    # then (--max-dL) the L^- L^+ the step creates, dL2 (scaling the step by c scales it by c^2), on the previous
+    # batch too; dL1 is the linear part of the change
+    dL1 = dL2 = dL_applied = np.nan
+    exact_dL = (np.nan, np.nan)
+    if max_dL > 0:
+        t_dL = perf_counter()
+        probe = prev_samples if args["max_dL_samples"] <= 0 else prev_samples[:args["max_dL_samples"]]
+        L0 = batch_LmLp(probe)
+        up, down = after_step(dtheta, batch_LmLp, probe) - L0, after_step(-dtheta, batch_LmLp, probe) - L0
+        dL1, dL2 = (up - down) / 2, (up + down) / 2
+        if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
+            # the same two parts from the dense members, for the readout: what sampling misses
+            L0 = dense_leak()[0]
+            up, down = (after_step(d, lambda: dense_leak()[0]) - L0 for d in (dtheta, -dtheta))
+            exact_dL = ((up - down) / 2, (up + down) / 2)
+        dL_applied = dL2
+        if dL2 > max_dL:
+            c = np.sqrt(max_dL / dL2)
+            dtheta, fs_applied, dL_applied = dtheta * c, fs_applied * c**2, max_dL
+        timings["dL"] = perf_counter() - t_dL
     if args["diagnostics"] and prev_Obar is not None:
         # each member's part of the applied step: |Obar_a dtheta_a|^2 on the previous batch and on its own (a ratio far
         # above 1 is noise the step's batch fitted); its norm; cross terms between members are left out
@@ -531,10 +616,10 @@ for i in range(args["nbr_sweeps"]):
         np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
                    header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
     state_set.update(state_set.split_step(dtheta))
-    prev_Obar = optimizer.last_Obar
+    prev_Obar, prev_samples = optimizer.last_Obar, samples
     if args["profile"]:
         jax.block_until_ready([st.model for st in state_set.states])
-        timings["update"] = perf_counter() - t
+        timings["update"] = perf_counter() - t - timings.get("dL", 0.0)
 
     t = perf_counter()
     g_norm = optimizer._buffers["g_norm"]
@@ -542,17 +627,19 @@ for i in range(args["nbr_sweeps"]):
     acceptance = sampler.acceptance if args["diagnostics"] else {}
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
-                 fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid")))
+                 fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
+                 dL1, dL2, dL_applied))
     np.savetxt(f"{path}/data_energy_{run_id}.txt",
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid")
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied")
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
     timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
+            + (f"  dL2 = {dL2:.2e}" if max_dL > 0 else "")
             + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         t = perf_counter()
