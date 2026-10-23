@@ -91,10 +91,11 @@ parser.add_argument("--rshift", type=float, default=None,
 parser.add_argument("--max-fs", type=float, default=0.0,
                     help="trust region: cap on 1 - F per sweep, F the fidelity of the spans before and after the "
                          "update, to second order dtheta^T S dtheta with S from the previous sweep; 0 disables")
-parser.add_argument("--warmup-fs", type=float, default=1e-4,
+parser.add_argument("--warmup-fs", type=float, default=0.0,
                     help="the trust region (in place of --max-fs) for the first --warmup-sweeps sweeps of a fresh run, "
                          "whose SR steps are mostly noise (their 1 - F 10-1000x larger on an independent batch than on "
-                         "their own) and push the members out of their L; not applied with --cont-run; 0 disables")
+                         "their own) and push the members out of their L, e.g. 1e-4; not applied with --cont-run; "
+                         "0 (the default) disables")
 parser.add_argument("--warmup-sweeps", type=int, default=None, help="sweeps under --warmup-fs; defaults to 2N")
 parser.add_argument("--max-dL", type=float, default=0.0,
                     help="L trust region: cap on the L^- L^+ a step creates, the part of its change of "
