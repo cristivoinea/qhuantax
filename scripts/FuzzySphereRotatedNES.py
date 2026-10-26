@@ -30,6 +30,7 @@ from quantax.nn import lecun_normal
 from quantax.utils import LogArray
 
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
+from qhuantax.nes.lmetric import SubspaceLMetricSolver, lplus_gram_rows
 from qhuantax.nes.optimizer import NaturalTraceEnergyGrad
 from qhuantax.quantumhall_excitons import KSectors, rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
@@ -65,7 +66,7 @@ parser.add_argument("--lmlp-coeff", default="0",
                     help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
                          "lowest level of every L > Lz --lmlp-margin above the K-th L = Lz one, and at least the "
                          "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-14, other "
-                         "N extrapolated). Every member must have L = Lz")
+                         "N extrapolated). With members of L > Lz, the floor alone")
 parser.add_argument("--lmlp-margin", type=float, default=1.0,
                     help="auto: energy by which the L > Lz levels must clear the K targets; the a + b/sqrt(N) "
                          "extrapolation of the ED gaps misses by ~0.1-0.5 already from N = 9-12 to 14")
@@ -105,6 +106,16 @@ parser.add_argument("--max-dL", type=float, default=0.0,
                          "per sweep; 0 disables")
 parser.add_argument("--max-dL-samples", type=int, default=0,
                     help="--max-dL: measure on this many tuples of the previous batch (cost in proportion); 0 all")
+parser.add_argument("--lmetric", type=float, default=0.0,
+                    help="L-aware metric: each of MinSR's directions is damped by the L^- L^+ it creates, "
+                         "w_j -> w_j (s_j^2 + eps) / (s_j^2 + eps + mu |R v_j|^2), the diagonal of S + mu Q in those "
+                         "directions (Q the curvature of tr(S^-1 L^- L^+)): a direction is damped once the L^- L^+ "
+                         "it creates per unit 1 - F exceeds ~1/mu. R: one Gram row of Q per sample of the previous "
+                         "batch (qhuantax.nes.lmetric), ~1 + N/(2K) times Obar's Jacobians. mu; 0 disables")
+parser.add_argument("--lmetric-sweeps", type=int, default=0,
+                    help="--lmetric only in this run's first this many sweeps, then plain SR; 0 throughout")
+parser.add_argument("--lmetric-t0", type=float, default=0.0,
+                    help="--lmetric decays as mu / (1 + sweep / t0), like the lr; 0 keeps it constant")
 parser.add_argument("--diagnostics", action="store_true",
                     help="record the SR matrix spectrum every 5 sweeps and the sampler's acceptance every sweep")
 parser.add_argument("--profile", action="store_true",
@@ -154,9 +165,14 @@ if sectors["z2"] is not None and sectors["z2"] != z2:
           "rotated by that sector's vacuum angle, newer ones by the Z2 = +1 angle in every sector)", flush=True)
 
 lmlp_auto = args["lmlp_coeff"].strip().lower() == "auto"
-if lmlp_auto:
-    if mixed_L:
-        parser.error(f"--lmlp-coeff auto keeps the L > Lz levels out of the window, but the members have L = {Ls}")
+if lmlp_auto and mixed_L:
+    # min_lambda keeps L > Lz levels above L = Lz targets; with members of L > Lz in the window only the floor applies
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "misc"))
+    from iqh_gaps import random_state_LL
+    lam = args["lmlp_floor_gap"] / random_state_LL(N, lz)
+    print(f"--lmlp-coeff auto: lambda {lam:g}, the floor from gap {args['lmlp_floor_gap']:g} alone (members of "
+          f"L = {Ls})", flush=True)
+elif lmlp_auto:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "misc"))
     from iqh_gaps import H_FIELD, PS_POT, min_lambda, random_state_LL
     if not np.isclose(h, H_FIELD) or tuple(pspot_inter.tolist()) != PS_POT:
@@ -183,6 +199,9 @@ if lam > 0 and mixed_L:
 if max_dL > 0 and mixed_L:
     print(f"warning: --max-dL caps rises of tr(S^-1 L^- L^+), but with members of L > Lz (L = {Ls}) a leak of theirs "
           "to a lower L lowers it and passes", flush=True)
+if args["lmetric"] > 0 and mixed_L:
+    print(f"warning: --lmetric damps directions by the L^- L^+ they create, which vanishes only on L = Lz; members of "
+          f"L > Lz (L = {Ls}) carry L^- L^+ even on their targets, so their own updates are damped too", flush=True)
 if args["max_dL_samples"] > 0:
     # whole tuples per JAX device, as the full batch has
     args["max_dL_samples"] = max(jax.device_count(), min(args["max_dL_samples"], nsamples)
@@ -479,12 +498,46 @@ class LoggedAdam(qtx.optimizer.Adam):
 
 
 class ObarKeepingSR(NaturalExcitedSR):
+    """Keeps the last Obar. With --lmetric the solver is a SubspaceLMetricSolver: every sweep the Gram rows of Q are
+    computed on the batch (`last_rows`) and the solve uses those of the previous batch, independent of the step's;
+    the solve then runs outside jit, which would freeze the first rows into the compiled solver."""
+    lmetric_mu = 0.0
+    last_rows = None
+    gram_LmLp = np.nan
+
     def get_Obar(self, samples):
         self.last_Obar = super().get_Obar(samples)
         return self.last_Obar
 
+    def get_step(self, samples):
+        if self.lmetric_mu <= 0:
+            if args["lmetric"] > 0:
+                self._solver.rows = None
+            self.last_rows, self.gram_LmLp = None, np.nan
+            return super().get_step(samples)
+        Ebar = self.get_Ebar(samples)
+        Obar = self.get_Obar(samples)
+        Ebar = jnp.where(self._finite_grad, Ebar, 0.0)
+        prev_rows = self.last_rows
+        self.last_rows, self.gram_LmLp = lmetric_rows(state_set, samples, self.Omean, args["reweight"], lmetric_rng)
+        self._solver.rows = self.last_rows if prev_rows is None else prev_rows        # the first sweep: its own
+        self._solver.mu = self.lmetric_mu
+        step, self._buffers = self.solve(Obar, Ebar, self._buffers)
+        return step
 
-solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
+    def solve(self, Obar, Ebar, buffers):
+        if args["lmetric"] <= 0:
+            return super().solve(Obar, Ebar, buffers)
+        return self._updater.update(self.solve_equation, Obar, Ebar, buffers)
+
+
+lmetric_rows, lmetric_rng = lplus_gram_rows, np.random.default_rng(args["seed"] + 1)
+
+
+if args["lmetric"] > 0:
+    solver = SubspaceLMetricSolver() if args["rshift"] is None else SubspaceLMetricSolver(rshift=args["rshift"])
+else:
+    solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
 optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
                           penalty_every=lmlp_every, diagnostics=args["diagnostics"])
 
@@ -526,7 +579,8 @@ rows, member_rows = [], []
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
-PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "solve", "update", "dL", "readout", "output")
+PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "lmetric", "solve", "update", "dL", "readout",
+                   "output")
 timings, profile_rows = {}, []
 
 
@@ -555,6 +609,7 @@ if args["profile"]:
     optimizer.get_Ebar = timed("ebar", optimizer.get_Ebar)
     optimizer.get_Obar = timed("obar", optimizer.get_Obar)
     optimizer.solve = timed("solve", optimizer.solve)
+    lmetric_rows = timed("lmetric", lmetric_rows)
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
 # trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
 # sweeps of a fresh run, whose steps are mostly noise, to a smaller 1 - F. --max-dL measures on the same batch
@@ -567,6 +622,8 @@ for i in range(args["nbr_sweeps"]):
     timings.clear()
     t_sweep = perf_counter()
     samples = sampler.sweep()
+    optimizer.lmetric_mu = (adaptive_learning_rate_inv(args["lmetric"], args["lmetric_t0"], i)
+                            if args["lmetric_sweeps"] <= 0 or i < args["lmetric_sweeps"] else 0.0)
     step = optimizer.get_step(samples)
 
     # checked before `update`, so the saved checkpoints remain the last good state
@@ -606,6 +663,9 @@ for i in range(args["nbr_sweeps"]):
             c = np.sqrt(max_dL / dL2)
             dtheta, fs_applied, dL_applied = dtheta * c, fs_applied * c**2, max_dL
         timings["dL"] = perf_counter() - t_dL
+    # --lmetric: the L^- L^+ the applied step creates by the Gram rows, dtheta^T Q dtheta, on this batch (the solve
+    # used the previous one's, so this is an independent estimate)
+    dLq = np.nan if optimizer.last_rows is None else float(jnp.sum((optimizer.last_rows @ dtheta) ** 2))
     if args["diagnostics"] and prev_Obar is not None:
         # each member's part of the applied step: |Obar_a dtheta_a|^2 on the previous batch and on its own (a ratio far
         # above 1 is noise the step's batch fitted); its norm; cross terms between members are left out
@@ -629,11 +689,13 @@ for i in range(args["nbr_sweeps"]):
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
-                 dL1, dL2, dL_applied))
+                 dL1, dL2, dL_applied, optimizer.lmetric_mu, optimizer.gram_LmLp, dLq,
+                 optimizer._solver.kept if optimizer.last_rows is not None else np.nan))
     np.savetxt(f"{path}/data_energy_{run_id}.txt",
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied")
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied "
+                      "lmetric gramLmLp dLq lmetric_kept")
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
     timings["output"] = perf_counter() - t
@@ -641,6 +703,7 @@ for i in range(args["nbr_sweeps"]):
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
             + (f"  dL2 = {dL2:.2e}" if max_dL > 0 else "")
+            + (f"  dLq = {dLq:.2e}" if optimizer.last_rows is not None else "")
             + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         t = perf_counter()
