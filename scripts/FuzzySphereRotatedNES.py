@@ -8,6 +8,11 @@
 # (misc/iqh_gaps.py). Symmetries are imposed only when their quantum number is given: --z2-sect (Ising Z2), --ry-sect
 # (pi rotation about y, (-1)^L, Lz = 0 only) and --ry-ph-sect (particle-hole x Ry, P (-1)^L at any Lz, P as in
 # PRX 13, 021009). --exact-diag tracks the members against the lowest levels of their L's in the same sectors.
+# --deflate-meta (converged NES runs at a higher Lz) or --deflate-ed (exact, small N) lift the levels of L > Lz that
+# intrude into the window, e.g. the two L=2 below the 3rd and 4th L=0 at Lz=0, by beta x the projector onto their
+# lowered highest-weight states, in place of (or under a small) L^- L^+ penalty (qhuantax.nes.deflation).
+# --grow-nb appends identity blocks to the members' networks (no amplitude changes), e.g. with --cont-run to go on from a
+# run converged at fewer blocks.
 #
 #   python FuzzySphereRotatedNES.py --ansatz-meta runs/rot/meta_n_8_2s_7_lz_0_z2_1_ryph_0_h_3.16_id04.json \
 #       --lmlp-coeff 3.0 --exact-diag --nbr-sweeps 200 --path runs/rotnes
@@ -30,11 +35,14 @@ from quantax.nn import lecun_normal
 from quantax.utils import LogArray
 
 from qhuantax.nes import NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalStateSet
+from qhuantax.nes.deflation import (DeflatedTraceEnergyGrad, DeflationGroup, DeflationProjector, applied_lplus,
+                                    log_amplitudes, sample_bank)
 from qhuantax.nes.lmetric import SubspaceLMetricSolver, lplus_gram_rows
 from qhuantax.nes.optimizer import NaturalTraceEnergyGrad
 from qhuantax.quantumhall_excitons import KSectors, rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
+from qhuantax.quantumhall_transformer import grow_depth
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 from qhuantax.quantumhall_utils import adaptive_learning_rate_inv
 from qhuantax.rotated import load_member, member_spec, set_gap, untie
@@ -83,6 +91,9 @@ parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the L
 parser.add_argument("--ed-dir", default=None, help="ED cache folder, searched first; defaults to --path")
 parser.add_argument("--nbr-sweeps", type=int, default=200, help="number of training iterations")
 parser.add_argument("--nbr-samples", type=int, default=512, help="number of sample tuples per iteration")
+parser.add_argument("--save-every", type=int, default=10,
+                    help="write the checkpoints and the data files every this many sweeps, at the end and before a "
+                         "non-finite update stops the run (every sweep, they took ~20%% of an N=14 sweep)")
 parser.add_argument("--lr", type=float, default=1e-2, help="starting value of the learning rate")
 parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0), 0 for a constant lr; defaults to N")
 parser.add_argument("--norm-clip", type=float, default=0.0,
@@ -95,8 +106,8 @@ parser.add_argument("--max-fs", type=float, default=0.0,
 parser.add_argument("--warmup-fs", type=float, default=0.0,
                     help="the trust region (in place of --max-fs) for the first --warmup-sweeps sweeps of a fresh run, "
                          "whose SR steps are mostly noise (their 1 - F 10-1000x larger on an independent batch than on "
-                         "their own) and push the members out of their L, e.g. 1e-4; not applied with --cont-run; "
-                         "0 (the default) disables")
+                         "their own) and push the members out of their L, e.g. 1e-4; not applied with --cont-run "
+                         "unless --grow-nb adds blocks; 0 (the default) disables")
 parser.add_argument("--warmup-sweeps", type=int, default=None, help="sweeps under --warmup-fs; defaults to 2N")
 parser.add_argument("--max-dL", type=float, default=0.0,
                     help="L trust region: cap on the L^- L^+ a step creates, the part of its change of "
@@ -116,6 +127,24 @@ parser.add_argument("--lmetric-sweeps", type=int, default=0,
                     help="--lmetric only in this run's first this many sweeps, then plain SR; 0 throughout")
 parser.add_argument("--lmetric-t0", type=float, default=0.0,
                     help="--lmetric decays as mu / (1 + sweep / t0), like the lr; 0 keeps it constant")
+parser.add_argument("--deflate-meta", nargs="+", default=None,
+                    help="deflation (qhuantax.nes.deflation): meta files of converged NES runs at a higher Lz whose "
+                         "members (highest weight, L = their Lz, in this run's symmetry sectors) are lowered to this "
+                         "Lz and lifted by --deflate-beta, e.g. the Lz=2 run's two L=2 states for Lz=0 K=4. The "
+                         "lowering amplifies their junk of L by ~[L(L+1)]^p/24: their tr L^- L^+ must be small "
+                         "(~1e-3 junk weight per state at N=8 still holds)")
+parser.add_argument("--deflate-ed", nargs="+", default=None, metavar="LZ:K",
+                    help="deflation with exact states instead (small N): the K lowest levels of L = LZ at Lz = LZ "
+                         "in this run's sectors, from ED")
+parser.add_argument("--deflate-beta", type=float, default=5.0,
+                    help="deflation strength; must exceed the energy by which the lowered levels undercut the K-th "
+                         "target (N=24, Lz=0, K=4: 2.5) plus a margin")
+parser.add_argument("--deflate-bank", type=int, default=4096,
+                    help="deflation: tuples of the deflated states sampled once; M's relative error ~1/sqrt of it")
+parser.add_argument("--deflate-chains", type=int, default=512, help="deflation: Markov chains for the bank")
+parser.add_argument("--deflate-check", type=int, default=2048,
+                    help="deflation: bank tuples for the junk amplification check at the start, ~(N/2)^4/32 "
+                         "evaluations each (N=24, 2048: ~4e7); 0 skips it")
 parser.add_argument("--diagnostics", action="store_true",
                     help="record the SR matrix spectrum every 5 sweeps and the sampler's acceptance every sweep")
 parser.add_argument("--profile", action="store_true",
@@ -132,6 +161,10 @@ parser.add_argument("--run-id", type=int, default=1)
 parser.add_argument("--cont-run", type=int, default=None,
                     help="run id under --path to continue from: its members as they are (no release); the sweep "
                          "counter, the lr schedule and Adam restart, so --lr is the rate this run opens with")
+parser.add_argument("--grow-nb", type=int, default=None,
+                    help="append blocks to every member's network up to this many before training, with no amplitude "
+                         "change (the new blocks' output weights start at 0); every weight trains. With --cont-run, "
+                         "the growth step of a run converged at fewer blocks")
 parser.add_argument("--path", required=True, help="output directory")
 args = vars(parser.parse_args())
 
@@ -142,6 +175,8 @@ mixed_L = set(Ls) != {lz}
 h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 nsamples, max_fs, max_dL, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "max_dL", "exact_diag", "path"))
+if args["save_every"] < 1:
+    parser.error("--save-every must be at least 1")
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
@@ -165,13 +200,15 @@ if sectors["z2"] is not None and sectors["z2"] != z2:
           "rotated by that sector's vacuum angle, newer ones by the Z2 = +1 angle in every sector)", flush=True)
 
 lmlp_auto = args["lmlp_coeff"].strip().lower() == "auto"
-if lmlp_auto and mixed_L:
-    # min_lambda keeps L > Lz levels above L = Lz targets; with members of L > Lz in the window only the floor applies
+deflating = bool(args["deflate_meta"] or args["deflate_ed"])
+if lmlp_auto and (mixed_L or deflating):
+    # min_lambda keeps L > Lz levels above L = Lz targets; with members of L > Lz in the window, or the intruders
+    # deflated, only the floor applies
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "misc"))
     from iqh_gaps import random_state_LL
     lam = args["lmlp_floor_gap"] / random_state_LL(N, lz)
-    print(f"--lmlp-coeff auto: lambda {lam:g}, the floor from gap {args['lmlp_floor_gap']:g} alone (members of "
-          f"L = {Ls})", flush=True)
+    print(f"--lmlp-coeff auto: lambda {lam:g}, the floor from gap {args['lmlp_floor_gap']:g} alone ("
+          + ("intruders deflated" if deflating else f"members of L = {Ls}") + ")", flush=True)
 elif lmlp_auto:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "misc"))
     from iqh_gaps import H_FIELD, PS_POT, min_lambda, random_state_LL
@@ -190,7 +227,7 @@ elif lmlp_auto:
 else:
     lam = float(args["lmlp_coeff"])
 lmlp_every = int(lam > 0) if args["lmlp_every"] is None else args["lmlp_every"]
-if lam <= 0 and not lmlp_auto and not mixed_L and (lz != 0 or nstates >= 3):
+if lam <= 0 and not lmlp_auto and not mixed_L and not deflating and (lz != 0 or nstates >= 3):
     print("warning: no --lmlp-coeff, so nothing keeps the L > Lz levels out of the window (at Lz = 0 and h_c, K >= 3 "
           "already reaches some)", flush=True)
 if lam > 0 and mixed_L:
@@ -304,7 +341,14 @@ else:
     if lam < cont_lam:
         print(f"warning: --lmlp-coeff {lam:g} is below the lambda {cont_lam:g} that {cont_run_id} ended with",
               flush=True)
-member_states = [qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
+grown_from = None       # --grow-nb: the members' block counts before
+if args["grow_nb"] is not None:
+    grown_from = [int(model.net.nblocks) for model in models]
+    if args["grow_nb"] <= max(grown_from):
+        parser.error(f"--grow-nb {args['grow_nb']}: the members already have {grown_from} blocks")
+    models = [model.rebuild(net=grow_depth(model.net, args["grow_nb"])) for model in models]
+    start += f"; networks grown from {grown_from} to {args['grow_nb']} blocks"
+member_states =[qtx.state.Variational(model, symm=symm, max_parallel=16384, use_ref=False) for model in models]
 state_set = NaturalStateSet(member_states)
 print(f"N={N}, Lz={lz}, h={h}, K={nstates}, symmetries imposed: {symm_label}; members (k, L) = "
       f"{[(m['k'], L) for m, L in zip(ansatz['members'], Ls)]}, {start}; {state_set.nparams_per_state} parameters per "
@@ -350,13 +394,14 @@ def exact_levels():
     return E, V, L, f"saved to {f}"
 
 
-def ed_eigenvalue(V, U):
-    """The eigenvalue of each ED vector (columns of V, dense basis) under U, from <s|U|v> = u v(s) on its largest
-    entries (the levels are non-degenerate within the block)."""
-    states = qtx.utils.ints_to_array(dense_symm.basis.states)
+def ed_eigenvalue(V, U, symm=None):
+    """The eigenvalue of each ED vector (columns of V, dense basis of `symm`, default the run's) under U, from
+    <s|U|v> = u v(s) on its largest entries (the levels are non-degenerate within the block)."""
+    symm = dense_symm if symm is None else symm
+    states = qtx.utils.ints_to_array(symm.basis.states)
     out = []
     for v in V.T:
-        ds = qtx.state.DenseState(np.asarray(v), dense_symm)
+        ds = qtx.state.DenseState(np.asarray(v), symm)
         s = states[np.argsort(-np.abs(v))[:8]]
         t, sign = jax.vmap(U.images)(jnp.asarray(s))
         out.append(float(np.median(np.asarray(sign[:, 1]) * ds(np.asarray(t[:, 1])) / ds(s))))
@@ -407,8 +452,11 @@ def dense_readout():
     # the targets, which the trace allows and which moves <L^2> between members of different L
     A = V_ED.conj().T @ P
     member_leak = np.real(np.diag(L2_red) - np.einsum("ta,t->a", np.abs(A)**2, L_ED * (L_ED + 1))) / np.real(np.diag(S))
+    # --deflate-*: the exact tr(S^-1 Pi), Pi as the estimator normalises it (see the deflation block)
+    tr_Pi = np.nan if defl_B is None else float(np.real(np.trace(np.linalg.solve(S, (P.conj().T @ defl_B)
+                                                                                   @ (defl_B.T @ P)))))
     return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
-            member_leak, top / np.log(10))
+            member_leak, top / np.log(10), tr_Pi)
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -440,13 +488,96 @@ if do_ED:
           f"block dim {dim}, {source}", flush=True)
 
 
+# --deflate-meta / --deflate-ed: the states to lift, one group per Lz above this run's, each with its bank of tuples
+deflation_info, defl_B = [], None
+if deflating:
+    groups, sources = [], []
+    for meta_file in args["deflate_meta"] or []:
+        dmeta = json.load(open(meta_file))
+        if dmeta["N"] != N:
+            parser.error(f"--deflate-meta {meta_file}: N = {dmeta['N']}, this run has N = {N}")
+        dL = [m.get("L", dmeta["lz"]) for m in dmeta["members"]]
+        if set(dL) != {dmeta["lz"]}:
+            parser.error(f"--deflate-meta {meta_file}: members of L = {dL}; deflation lowers highest-weight states, "
+                         f"L = Lz = {dmeta['lz']}")
+        dsymm = fuzzy_sphere_symmetry(**dmeta["symmetries"])
+        phis = [qtx.state.Variational(load_member(m["spec"], N, Path(meta_file).parent / m["file"]), symm=dsymm,
+                                      max_parallel=16384, use_ref=False) for m in dmeta["members"]]
+        for key in ("z2", "phry"):
+            if dmeta["symmetries"].get(key) != sectors[key]:
+                print(f"warning: --deflate-meta {meta_file} has {OPTION[key]} {dmeta['symmetries'].get(key)}, this "
+                      f"run {sectors[key]}: L^- keeps the sector, so its states may not be the intruders", flush=True)
+        sources.append((f"meta {meta_file}", dmeta["lz"], phis))
+    for spec in args["deflate_ed"] or []:
+        lz_phi, k = (int(v) for v in spec.split(":"))
+        symm_phi = LzUserBasisSymmetry(lz_phi, sectors["z2"] or 0)
+        E_phi, V_phi = (tms_H if int_dropped == 0 else hamiltonian()[0]).diagonalize(symm=symm_phi, k=args["ed_k"])
+        q = np.real(np.einsum("si,si->i", V_phi.conj(), GetL2Terms(N, 2).get_quspin_op(symm_phi).tocsr() @ V_phi))
+        L_phi = np.round((-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2).astype(int)
+        found = np.flatnonzero(L_phi == lz_phi)
+        found = found[np.argsort(E_phi[found])]
+        if sectors["phry"] is not None:
+            found = found[ed_eigenvalue(V_phi[:, found], PHRyQH(1), symm_phi) * sectors["phry"] > 0.5]
+        if len(found) < k:
+            parser.error(f"--deflate-ed {spec}: only {len(found)} L={lz_phi} levels in the sector among the lowest "
+                         f"{len(E_phi)} at Lz={lz_phi}: raise --ed-k")
+        print(f"--deflate-ed {spec}: exact L={lz_phi} levels {np.round(E_phi[found[:k]], 6)}", flush=True)
+        sources.append((f"ED Lz={lz_phi}", lz_phi,
+                        [qtx.state.DenseState(V_phi[:, j], symm_phi) for j in found[:k]]))
+    for label, lz_phi, phis in sources:
+        if lz_phi <= lz:
+            parser.error(f"deflation lowers: {label} is at Lz = {lz_phi}, not above this run's {lz}")
+        t_bank = perf_counter()
+        seeds = rotated_vacuum_tuples(N, args["deflate_chains"], len(phis), ansatz["theta"], lz_phi,
+                                      both=sectors["z2"] is not None, rng=np.random.default_rng(args["seed"] + 7))
+        bank = sample_bank(phis, args["deflate_bank"], args["deflate_chains"], seeds, flip_prob=args["flip_prob"])
+        groups.append(DeflationGroup(phis, lz_phi, lz_phi - lz, N, bank))
+        t_amp = perf_counter()
+        amplification = (groups[-1].amplification(min(args["deflate_check"], len(bank))) if args["deflate_check"] > 0
+                         else np.full(len(phis), np.nan))
+        deflation_info.append(dict(source=label, lz=lz_phi, J=len(phis), power=lz_phi - lz, bank=len(bank),
+                                   amplification=amplification.tolist()))
+        print(f"deflation: {len(phis)} states of L = Lz = {lz_phi} ({label}), lowered by (L^-)^{lz_phi - lz}, bank of "
+              f"{len(bank)} tuples in {t_amp - t_bank:.1f} s; beta {args['deflate_beta']:g}. Junk amplification of "
+              f"the lowered states {np.round(amplification, 3)} ({perf_counter() - t_amp:.1f} s): 1 for clean states, "
+              "the lowered direction is 1 - 1/that junk; N=8 held to ~2, failed by ~8", flush=True)
+    projector = DeflationProjector(groups)
+    if do_ED:
+        # Pi = B B^T on the dense basis, with the estimator's normalisation (c G_phi): the exact tr(S^-1 Pi) for the
+        # readout. The lowered states' <L^2> and <H> show how much of their junk the lowering amplified
+        reps = qtx.utils.ints_to_array(dense_symm.basis.states)
+        amp = np.real(dense_symm.basis.get_amp(dense_symm.basis.states))
+        Bs = []
+        for g in groups:
+            symm_phi = LzUserBasisSymmetry(lz + g.power, sectors["z2"] or 0)
+            reps_phi = qtx.utils.ints_to_array(symm_phi.basis.states)
+            amp_phi = np.real(symm_phi.basis.get_amp(symm_phi.basis.states))
+            Phi_s, Phi_l = (np.stack(v, 1) for v in zip(*[log_amplitudes(p, np.asarray(reps_phi), 65536)
+                                                           for p in g.states]))
+            d = np.max(np.where(np.isfinite(Phi_l), Phi_l, -np.inf), axis=0)
+            Phi = Phi_s * np.exp(Phi_l - d) / amp_phi[:, None]
+            C = np.concatenate([(lambda s, l: s * np.exp(l - d))(*applied_lplus(g.states, reps[c:c + 65536], g.power,
+                                                                                N, up=True))
+                                for c in range(0, len(reps), 65536)]) / amp[:, None]
+            w, U = np.linalg.eigh(g.c_norm * (Phi.T @ Phi))
+            Bs.append(C @ U / np.sqrt(w))
+            Cn = C / np.linalg.norm(C, axis=0)
+            E_chi = np.einsum('si,si->i', Cn, H_sp @ Cn)
+            print(f"  lowered states on the dense basis: <L^2> {np.round(np.einsum('si,si->i', Cn, L2_sp @ Cn), 4)}, "
+                  f"<H> {np.round(E_chi, 4)}, {E_ED[-1] - np.min(E_chi):.3f} below the K-th target (beta must exceed "
+                  f"it); max overlap with the targets {np.max(np.abs(V_ED.T @ Cn)):.1e}", flush=True)
+        defl_B = np.concatenate(Bs, axis=1)
+
+
 meta = dict(args=args, ansatz_meta=str(args["ansatz_meta"]), N=N, lz=lz, z2=z2, h=h, K=nstates, lam=lam,
-            theta=ansatz["theta"], continued_from=cont_run_id, int_dropped=int_dropped, symmetries=sectors,
-            member_eigenvalues=member_eigvals,
+            theta=ansatz["theta"], continued_from=cont_run_id, grown_from=grown_from, int_dropped=int_dropped,
+            symmetries=sectors, member_eigenvalues=member_eigvals,
+            # the block count from the model itself, which --grow-nb (here or in a run continued from) changes
             members=[dict(k=m["k"], L=L, root=m["root"], file=f"state{i}_{run_id}.eqx",
-                          spec=member_spec(model, m["spec"]["d"], m["spec"]["nb"], m["spec"]["nh"]))
+                          spec=member_spec(model, m["spec"]["d"], int(model.net.nblocks), m["spec"]["nh"]))
                      for i, (m, L, model) in enumerate(zip(ansatz["members"], Ls, models))],
-            nparams_per_state=[int(n) for n in state_set.nparams_per_state])
+            nparams_per_state=[int(n) for n in state_set.nparams_per_state],
+            deflation=dict(beta=args["deflate_beta"], groups=deflation_info) if deflating else None)
 if do_ED:
     meta["E_ED"], meta["L_ED"] = E_ED.tolist(), L_ED.tolist()
 
@@ -463,15 +594,16 @@ exact_dL = (np.nan, np.nan)      # --max-dL with --exact-diag: dL1, dL2 of the d
 
 def record_exact(sweep):
     """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
-    trE, fidelity, ritz, ritz_L, leak, member_leak, top = dense_readout()
-    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, *exact_dL))
+    trE, fidelity, ritz, ritz_L, leak, member_leak, top, tr_Pi = dense_readout()
+    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, *exact_dL, tr_Pi))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
                header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
                       + " ".join(f"ritzL{k}" for k in range(nstates)) + " "
-                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dL1 dL2")
+                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dL1 dL2 trPi")
     # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
             f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}"
+            + (f", tr Pi = {tr_Pi:.2e}" if defl_B is not None else "")
             + (f", log10 of each member's largest amplitude {np.round(top, 1)}" if sweep < 0 else ""))
 
 
@@ -539,7 +671,10 @@ if args["lmetric"] > 0:
 else:
     solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
 optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
-                          penalty_every=lmlp_every, diagnostics=args["diagnostics"])
+                          penalty_every=lmlp_every, diagnostics=args["diagnostics"],
+                          grad=DeflatedTraceEnergyGrad(tms_H, projector, args["deflate_beta"], penalty=tms_LmLp,
+                                                       penalty_coeff=lam, penalty_every=lmlp_every)
+                          if deflating else None)
 
 # --max-dL: the step's change of tr(S^-1 L^- L^+) on the previous batch by correlated sampling (the same tuples at the
 # parameters before and after it). From a clean span the mean change is quadratic in the step, but every sample's is
@@ -580,7 +715,7 @@ rows, member_rows = [], []
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
 PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "lmetric", "solve", "update", "dL", "readout",
-                   "output")
+                   "output", "deflate")
 timings, profile_rows = {}, []
 
 
@@ -602,6 +737,24 @@ def profile_summary(first=2):
             + ", ".join(f"{c} {m / mean[1]:.0%}" for c, m in zip(PROFILE_COLUMNS + ("rest",), mean[2:])))
 
 
+def write_outputs():
+    """The data files from the rows so far and the members as they stand: every --save-every sweeps, at the end and
+    before an abort. data_energy_exact is written at its own readouts."""
+    np.savetxt(f"{path}/data_energy_{run_id}.txt",
+               np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
+               header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
+                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied "
+                      "lmetric gramLmLp dLq lmetric_kept trPi VarPi")
+    if member_rows:
+        np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
+                   header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
+    if profile_rows:
+        np.savetxt(f"{path}/data_profile_{run_id}.txt", np.array(profile_rows),
+                   header="seconds: sweep total " + " ".join(PROFILE_COLUMNS) + " rest")
+    for index, state in enumerate(state_set.states):
+        state.save(f"{path}/state{index}_{run_id}.eqx")
+
+
 if args["profile"]:
     sampler.sweep = timed("sample", sampler.sweep)
     tms_H.Oloc = timed("eloc_H", tms_H.Oloc)
@@ -610,10 +763,14 @@ if args["profile"]:
     optimizer.get_Obar = timed("obar", optimizer.get_Obar)
     optimizer.solve = timed("solve", optimizer.solve)
     lmetric_rows = timed("lmetric", lmetric_rows)
+    if deflating:
+        projector.refresh = timed("deflate", projector.refresh)
+        projector.Oloc = timed("deflate", projector.Oloc)
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
 # trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
-# sweeps of a fresh run, whose steps are mostly noise, to a smaller 1 - F. --max-dL measures on the same batch
-warmup = 0 if cont_run_id is not None or args["warmup_fs"] <= 0 else \
+# sweeps of a fresh run (or of one just grown: the new blocks' directions are fresh), whose steps are mostly noise, to
+# a smaller 1 - F. --max-dL measures on the same batch
+warmup = 0 if (cont_run_id is not None and grown_from is None) or args["warmup_fs"] <= 0 else \
     (2 * N if args["warmup_sweeps"] is None else args["warmup_sweeps"])
 prev_samples = sampler.sweep() if max_fs > 0 or warmup > 0 or max_dL > 0 else None
 prev_Obar = None if prev_samples is None else optimizer.get_Obar(prev_samples)
@@ -626,8 +783,9 @@ for i in range(args["nbr_sweeps"]):
                             if args["lmetric_sweeps"] <= 0 or i < args["lmetric_sweeps"] else 0.0)
     step = optimizer.get_step(samples)
 
-    # checked before `update`, so the saved checkpoints remain the last good state
+    # checked before `update`, so the checkpoints written here are the last good state
     if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
+        write_outputs()
         raise RuntimeError(f"Non-finite update at sweep {i}: energy={optimizer.energy}, "
                            f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc, "
                            f"{optimizer.nonfinite_grad} for the log-derivative")
@@ -674,8 +832,6 @@ for i in range(args["nbr_sweeps"]):
         member_rows.append((i, *(float(jnp.sum(jnp.abs(O[:, a:b] @ dtheta[a:b])**2))
                                  for O in (prev_Obar, optimizer.last_Obar) for a, b in blocks),
                             *(float(jnp.linalg.norm(dtheta[a:b])) for a, b in blocks)))
-        np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
-                   header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
     state_set.update(state_set.split_step(dtheta))
     prev_Obar, prev_samples = optimizer.last_Obar, samples
     if args["profile"]:
@@ -690,20 +846,17 @@ for i in range(args["nbr_sweeps"]):
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
                  dL1, dL2, dL_applied, optimizer.lmetric_mu, optimizer.gram_LmLp, dLq,
-                 optimizer._solver.kept if optimizer.last_rows is not None else np.nan))
-    np.savetxt(f"{path}/data_energy_{run_id}.txt",
-               np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
-               header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied "
-                      "lmetric gramLmLp dLq lmetric_kept")
-    for index, state in enumerate(state_set.states):
-        state.save(f"{path}/state{index}_{run_id}.eqx")
+                 optimizer._solver.kept if optimizer.last_rows is not None else np.nan,
+                 getattr(optimizer._grad, "deflation_value", None), getattr(optimizer._grad, "VarDeflation", None)))
+    if (i + 1) % args["save_every"] == 0:
+        write_outputs()         # the profile file one sweep behind: this sweep's row includes this write
     timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
             + (f"  dL2 = {dL2:.2e}" if max_dL > 0 else "")
             + (f"  dLq = {dLq:.2e}" if optimizer.last_rows is not None else "")
+            + (f"  trPi = {float(optimizer._grad.deflation_value):.2e}" if deflating else "")
             + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         t = perf_counter()
@@ -714,14 +867,14 @@ for i in range(args["nbr_sweeps"]):
 
     if args["profile"]:
         total = perf_counter() - t_sweep
-        timings["ebar_rest"] = timings.get("ebar", 0.0) - timings.get("eloc_H", 0.0) - timings.get("eloc_LmLp", 0.0)
+        timings["ebar_rest"] = (timings.get("ebar", 0.0) - timings.get("eloc_H", 0.0) - timings.get("eloc_LmLp", 0.0)
+                                - timings.get("deflate", 0.0))
         parts = [timings.get(c, 0.0) for c in PROFILE_COLUMNS]
         profile_rows.append([i, total, *parts, total - sum(parts)])
-        np.savetxt(f"{path}/data_profile_{run_id}.txt", np.array(profile_rows),
-                   header="seconds: sweep total " + " ".join(PROFILE_COLUMNS) + " rest")
         if i in (10, 50) or i == args["nbr_sweeps"] - 1:
             print("  profile: " + profile_summary(), flush=True)
 
+write_outputs()
 print("NES training completed in: ", datetime.now() - start_time)
 meta["time"] = str(datetime.now() - start_time)
 save_meta()

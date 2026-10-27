@@ -216,8 +216,15 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
         penalty_every: int = 1,
         diagnostics: bool = False,
         diagnostics_every: int = 5,
+        grad: Optional[NaturalTraceEnergyGrad] = None,
     ):
         r"""
+        :param grad:
+            The gradient source, in place of the default
+            ``NaturalTraceEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every)``,
+            e.g. a `~qhuantax.nes.deflation.DeflatedTraceEnergyGrad`; it then owns the
+            Hamiltonian and the penalty, and those arguments are ignored.
+
         :param penalty:
             Operator optimized as ``hamiltonian + penalty_coeff * penalty``, kept
             separate so that `~qhuantax.nes.NaturalExcitedSR.energy_H` and
@@ -279,9 +286,10 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
                     f"state {index} differs from state 0."
                 )
 
-        grad = NaturalTraceEnergyGrad(
-            hamiltonian, penalty, penalty_coeff, penalty_every
-        )
+        if grad is None:
+            grad = NaturalTraceEnergyGrad(
+                hamiltonian, penalty, penalty_coeff, penalty_every
+            )
         if updater is None:
             updater = qtx.optimizer.PlainUpdater()
         super().__init__(
