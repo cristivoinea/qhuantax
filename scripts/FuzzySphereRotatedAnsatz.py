@@ -1,8 +1,11 @@
 # Rotation-closed exciton members at transverse field h: the starting set of FuzzySphereRotatedNES.py.
 # Every member is built at h = 0, where the exciton number k is conserved, in the Lz sector --lz with its own angular
 # momentum L >= Lz (--L-sect, default L = Lz), and then rotated exactly to h:
-#   k=0  the vacuum |Up> (L = Lz = 0), one determinant (W = 0)
-#   k=1  the exciton B_{L,Lz}|Up>, one determinant (W = 0); at Lz = 0 and L >= 1 that determinant minus the vacuum
+#   k=0  the vacuum |Up> (L = Lz = 0), one determinant with a random W and the down features suppressed by exp(-gap),
+#        exact for any W (--k01-backflow live, the default; zero: W = 0)
+#   k=1  the exciton B_{L,Lz}|Up>, one block determinant as k=2's (holes t^{L,Lz}_{j+Lz,j}, particles all ones; exact
+#        at W = 0 at every Lz) with W fitted (live); zero: the plain determinant with W = 0, at Lz = 0 and L >= 1 that
+#        determinant minus the vacuum
 #   k=2  --nbr-dets charge-only block determinants on one shared network, fitted once to the exact
 #        two-exciton state; 1-F is reported (a stuck fit plateaus at 1e-3 - 1e-2: more dets or another seed)
 # With charge-only features R(theta) only rotates the orbital rows, so setting theta is the rotation.
@@ -33,8 +36,8 @@ from qhuantax.quantumhall_operators import GetL2Terms, GetSpinfulDenIntTerms, Ge
 from qhuantax.quantumhall_symmetries import PHRyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_transformer import Transformer
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
-from qhuantax.rotated import (RotatedDetBackflow, RotatedMultiDetBackflow, load_member, member_spec,
-                              multidet_block_reference, pretrain_exact)
+from qhuantax.rotated import (RotatedDetBackflow, RotatedMultiDetBackflow, k1_block_reference, live_vacuum,
+                              load_member, member_spec, multidet_block_reference, pretrain_exact)
 
 
 S1 = np.array([[1, 0], [0, 0]])
@@ -65,7 +68,14 @@ parser.add_argument("--attn-dim", type=int, default=16, help="attention dimensio
 parser.add_argument("--nbr-blocks", type=int, default=4, help="number of layers in the transformer")
 parser.add_argument("--nbr-heads", type=int, default=4, help="number of attention heads in the transformer")
 parser.add_argument("--nbr-dets", type=int, default=6, help="k=2: number of block determinants")
-parser.add_argument("--gap", type=float, default=20.0, help="k=2: up features suppressed by exp(-gap)")
+parser.add_argument("--gap", type=float, default=20.0,
+                    help="k>=1: up features suppressed by exp(-gap); k=0 with --k01-backflow live: down features")
+parser.add_argument("--k01-backflow", default="live", choices=("live", "zero"),
+                    help="live: k=0 is the vacuum with a random W and the down features suppressed (exact for any "
+                         "W), k=1 a block determinant like k=2's (exact at W=0 at every Lz) with W fitted, so that "
+                         "their networks have gradients from the start and --max-fs sees their steps; zero: the exact "
+                         "determinants with W = 0 of the older ansatz runs (NES/VMC then release them with a small "
+                         "random W)")
 parser.add_argument("--pretrain-steps", type=int, default=4000, help="k=2: number of fit steps")
 parser.add_argument("--pretrain-lr", type=float, default=1e-2, help="k=2: fit learning rate")
 parser.add_argument("--pretrain-lr-t0", type=float, default=None,
@@ -205,6 +215,41 @@ def fit_k2(i, root, spins2, target, E_exact, H2):
                        E_model_h0=E, history=[(int(s), float(v)) for s, v in hist[:-1]])
 
 
+def live_k01(i, k, L):
+    """Member i, k = 0 or 1 with --k01-backflow live: the vacuum with a random W and the down features suppressed
+    (exact for any W, nothing to fit), or the k=1 block determinant with W fitted to the sector's L state at h = 0 as
+    the k=2 members are (projected with --ry-ph-sect). Also reports the weight it puts in the neighbouring sectors,
+    O(e^-2gap)."""
+    start_time = time.time()
+    label = f"member {i} (k={k} L={L}):"
+    configs = ksectors.configs(k)
+    E_exact, V = ksectors.eigenstates(tms_H0, k, nstates=1, L2=tms_L2, L=L)
+    target = V[:, 0]
+    images = None if ry_ph is None else image_map(configs)
+    if images is not None and eigenvalue(target, images) * ry_ph < 0.5:
+        raise SystemExit(f"--ry-ph-sect {ry_ph:+d}: the k={k} L={L} state has PH x Ry {eigenvalue(target, images):+.4f}")
+    hist = []
+    if k == 0:
+        model = live_vacuum(new_net(), d, N, gap=args["gap"])
+    else:
+        model, masks = k1_block_reference(new_net(), d, N, L, lz, gap=args["gap"], seed=args["seed"] + i)
+        model, hist, _ = pretrain_exact(model, configs, target, masks, steps=args["pretrain_steps"],
+                                        lr=args["pretrain_lr"], lr_t0=args["pretrain_lr_t0"], abort_at=None,
+                                        log_every=args["pretrain_log_every"], log_prefix=label,
+                                        projection=None if images is None else (*images, ry_ph))
+    near = [q for q in (k - 1, k + 1) if q >= 0 and len(ksectors.configs(q))]
+    a_all = amplitudes(model, np.concatenate([configs] + [ksectors.configs(q) for q in near]))
+    a = a_all[:len(configs)]
+    if images is not None:
+        a = 0.5 * (a + ry_ph * images[1] * a[images[0]])
+    infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
+    leak = float(np.sum(a_all[len(configs):]**2) / np.sum(a_all[:len(configs)]**2))
+    print(f"{label} live backflow, h=0 1-F {infidelity:.3e} against the sector's L={L} state, weight in sectors {near} "
+          f"{leak:.1e}, |W| {float(jnp.linalg.norm(model.W)):.2f} [{time.time() - start_time:.0f}s]", flush=True)
+    return save_member(i, k, 0, model, start_time, E_h0=float(E_exact[0]), infidelity_h0=float(infidelity),
+                       leak_h0=leak, backflow="live", history=[(int(s), float(v)) for s, v in hist[:-1]])
+
+
 # --parallel child: one k=2 member from the parent's targets; its meta entry goes back through a file
 if args["fit_member"] is not None:
     i = args["fit_member"]
@@ -307,7 +352,9 @@ if args["parallel"] and len(k2) > 1:
 # The members, built at h = 0 and rotated by setting theta; with --parallel the k=2 ones come from the children
 models = []
 for i, (k, L, root) in enumerate(zip(members, Ls, roots)):
-    if k < 2:
+    if k < 2 and args["k01_backflow"] == "live":
+        info, model = live_k01(i, k, L)
+    elif k < 2:
         # exact: one determinant, or two that cancel the vacuum term (k=1 at Lz = 0, L >= 1); no backflow (W = 0)
         Us, coeffs = ([excitons.vacuum_orbitals()], [1.0]) if k == 0 else excitons.exciton_terms(L, lz)
         if len(Us) == 1:
@@ -327,7 +374,7 @@ for i, (k, L, root) in enumerate(zip(members, Ls, roots)):
         print(f"member {i} (k={k} L={L}): exact construction, h=0 1-F {infidelity:.1e} against the sector's L={L} "
               f"state", flush=True)
         info, model = save_member(i, k, root, model, time.time(), infidelity_h0=float(infidelity),
-                                  E_h0=0.0 if k == 0 else float(excitons.exciton_energy(L)))
+                                  E_h0=0.0 if k == 0 else float(excitons.exciton_energy(L)), backflow="zero")
     elif i in children:
         if children[i].wait() != 0:
             raise SystemExit(f"member {i}: its fit failed (exit code {children[i].returncode}); inputs in {work}*")

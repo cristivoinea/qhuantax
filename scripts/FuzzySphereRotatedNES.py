@@ -69,7 +69,8 @@ parser.add_argument("--no-untie", action="store_true", help="keep the features c
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 members: W = this x the default random init; 0 keeps W = 0")
 parser.add_argument("--gap", type=float, default=8.0,
-                    help="k=2 members: up features suppressed by exp(-gap); <= 0 keeps the ansatz's")
+                    help="k=2 members, and k=1 ones with a live backflow: up features suppressed by exp(-gap); the "
+                         "live k=0 one: down features; <= 0 keeps the ansatz's")
 parser.add_argument("--lmlp-coeff", default="0",
                     help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
                          "lowest level of every L > Lz --lmlp-margin above the K-th L = Lz one, and at least the "
@@ -115,6 +116,13 @@ parser.add_argument("--max-dL", type=float, default=0.0,
                          "previous sweep's batch from the parameters before, after and before minus the step; "
                          "applied after --max-fs to the step that one left. Costs 3 evaluations of the L^- L^+ trace "
                          "per sweep; 0 disables")
+parser.add_argument("--fs-exact-sweeps", type=int, default=10,
+                    help="in this run's first this many sweeps (continuations too: Adam restarts) --max-fs and "
+                         "--warmup-fs act on the step's actual 1 - F of the span, estimated from the tuple ratios "
+                         "det A_new / det A on the previous sweep's batch, not on the linear |Obar dtheta|^2: the step "
+                         "is shrunk until that is below the cap (one determinant per tuple per try). The linear "
+                         "estimate misses the steps that move small parameters by many times their size, as AdamSR's "
+                         "first step does (N=8, K=2: fs 6e-4 for an exact 1 - F of 0.08). 0 disables, -1 throughout")
 parser.add_argument("--max-dL-samples", type=int, default=0,
                     help="--max-dL: measure on this many tuples of the previous batch (cost in proportion); 0 all")
 parser.add_argument("--lmetric", type=float, default=0.0,
@@ -321,8 +329,9 @@ def release(member):
     model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"])
     if not args["no_untie"]:
         model = untie(model)
-    if member["k"] >= 2 and args["gap"] > 0:               # the block fits
-        model = set_gap(model, args["gap"])
+    live = member.get("backflow") == "live"            # k = 0, 1 with a live backflow (older ansatz runs: W = 0)
+    if (member["k"] >= 2 or live) and args["gap"] > 0:     # the fits; the live vacuum suppresses its down features
+        model = set_gap(model, args["gap"], flavour="down" if member["k"] == 0 else "up")
     if member["k"] < 2 and args["det_backflow_scale"] > 0 and not jnp.any(model.W):    # the exact determinant(s)
         # relative to U0, whose std is 1 unless the ansatz script scaled the member to unit norm
         W = lecun_normal(get_subkeys(), model.W.shape, dtype=model.W.dtype) / 10 * float(jnp.std(model.U0))
@@ -447,7 +456,8 @@ def dense_readout():
     H_red = P.conj().T @ (H_sp @ P)
     ritz, C = sp.linalg.eigh((H_red + H_red.conj().T) / 2, S)
     q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
-    fidelity = np.linalg.norm(V_ED.conj().T @ sp.linalg.orth(P))**2 / nstates
+    Q = sp.linalg.orth(P)
+    fidelity = np.linalg.norm(V_ED.conj().T @ Q)**2 / nstates
     # each member's L^2 outside the ED targets (exact L^2 eigenstates), per unit norm: blind to the members mixing among
     # the targets, which the trace allows and which moves <L^2> between members of different L
     A = V_ED.conj().T @ P
@@ -456,7 +466,7 @@ def dense_readout():
     tr_Pi = np.nan if defl_B is None else float(np.real(np.trace(np.linalg.solve(S, (P.conj().T @ defl_B)
                                                                                    @ (defl_B.T @ P)))))
     return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
-            member_leak, top / np.log(10), tr_Pi)
+            member_leak, top / np.log(10), tr_Pi, Q)
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -589,21 +599,28 @@ def save_meta():
 
 save_meta()
 exact_rows = []
+last_span = None
 exact_dL = (np.nan, np.nan)      # --max-dL with --exact-diag: dL1, dL2 of the dense members at the readout sweeps
 
 
 def record_exact(sweep):
-    """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary."""
-    trE, fidelity, ritz, ritz_L, leak, member_leak, top, tr_Pi = dense_readout()
-    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, *exact_dL, tr_Pi))
+    """Dense readout at this sweep, appended to data_energy_exact; returns the printed summary. dF is the exact 1 - F
+    of the span since the previous readout (the product of the cos^2 of the principal angles): with --ed-every 1 the
+    step's own, against the trust region's fs_applied / fs_exact."""
+    global last_span
+    trE, fidelity, ritz, ritz_L, leak, member_leak, top, tr_Pi, Q = dense_readout()
+    dF = np.nan if last_span is None else 1 - float(np.prod(np.linalg.svd(last_span.conj().T @ Q, compute_uv=False)**2))
+    last_span = Q
+    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, *exact_dL, tr_Pi, dF))
     np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
                header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
                       + " ".join(f"ritzL{k}" for k in range(nstates)) + " "
-                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dL1 dL2 trPi")
+                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dL1 dL2 trPi dF")
     # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
             f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}"
             + (f", tr Pi = {tr_Pi:.2e}" if defl_B is not None else "")
+            + (f", dF = {dF:.2e}" if np.isfinite(dF) else "")
             + (f", log10 of each member's largest amplitude {np.round(top, 1)}" if sweep < 0 else ""))
 
 
@@ -709,13 +726,29 @@ def after_step(dtheta, fn, *args):
             state._model = model
 
 
+def span_infidelity(dtheta, samples, current):
+    """1 - F of the span between the members and the members after dtheta, F = |<Psi|Psi'>|^2 / (<Psi|Psi> <Psi'|Psi'>)
+    for the tuple amplitude Psi = det A (the product of the cos^2 of the principal angles): from r = det A' / det A on
+    `samples`, drawn at earlier parameters and reweighted to these by w = rw |det A / det A_sampled|^2, F = |<w r>|^2 /
+    (<w> <w r^2>). `current` is det A on the samples (LogArray)."""
+    new = after_step(dtheta, sampler.determinant, samples.spins)
+    log_c = jnp.asarray(current.logabs)
+    logw = jnp.log(samples.reweight_factor) + 2 * (log_c - LogArray.from_value(samples.psi).logabs)
+    logr = jnp.asarray(new.logabs) - log_c
+    ok = jnp.isfinite(logw) & jnp.isfinite(logr)
+    w = jnp.where(ok, jnp.exp(logw - jnp.max(jnp.where(ok, logw, -jnp.inf))), 0.0)
+    r = jnp.where(ok, jnp.real(new.sign * current.sign)
+                  * jnp.exp(jnp.where(ok, logr, 0.0) - jnp.max(jnp.where(ok, logr, -jnp.inf))), 0.0)
+    return float(1 - jnp.sum(w * r)**2 / (jnp.sum(w) * jnp.sum(w * r**2)))
+
+
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
 rows, member_rows = [], []
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
 PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "lmetric", "solve", "update", "dL", "readout",
-                   "output", "deflate")
+                   "output", "deflate", "fs_exact")
 timings, profile_rows = {}, []
 
 
@@ -744,7 +777,7 @@ def write_outputs():
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
                       + " ".join(DIAGNOSTICS_COLUMNS) + " fs fs_applied fs_same lambda moved valid dL1 dL2 dL_applied "
-                      "lmetric gramLmLp dLq lmetric_kept trPi VarPi")
+                      "lmetric gramLmLp dLq lmetric_kept trPi VarPi fs_exact")
     if member_rows:
         np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
                    header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
@@ -801,6 +834,19 @@ for i in range(args["nbr_sweeps"]):
     cap = args["warmup_fs"] if i < warmup else max_fs
     if 0 < cap < fs:
         dtheta, fs_applied = dtheta * np.sqrt(cap / fs), cap
+    # then (--fs-exact-sweeps) the actual 1 - F of the span on the previous batch: shrunk until within the cap, the
+    # scale 0.9 x the quadratic guess per try
+    fs_exact = np.nan
+    if (args["fs_exact_sweeps"] < 0 or i < args["fs_exact_sweeps"]) and cap > 0 and prev_samples is not None:
+        t_fx = perf_counter()
+        current = sampler.determinant(prev_samples.spins)
+        for _ in range(12):
+            fs_exact = span_infidelity(dtheta, prev_samples, current)
+            if not fs_exact > cap:
+                break
+            c = 0.9 * np.sqrt(cap / fs_exact) if np.isfinite(fs_exact) else 0.25
+            dtheta, fs_applied = dtheta * c, fs_applied * c**2
+        timings["fs_exact"] = perf_counter() - t_fx
     # then (--max-dL) the L^- L^+ the step creates, dL2 (scaling the step by c scales it by c^2), on the previous
     # batch too; dL1 is the linear part of the change
     dL1 = dL2 = dL_applied = np.nan
@@ -836,7 +882,7 @@ for i in range(args["nbr_sweeps"]):
     prev_Obar, prev_samples = optimizer.last_Obar, samples
     if args["profile"]:
         jax.block_until_ready([st.model for st in state_set.states])
-        timings["update"] = perf_counter() - t - timings.get("dL", 0.0)
+        timings["update"] = perf_counter() - t - timings.get("dL", 0.0) - timings.get("fs_exact", 0.0)
 
     t = perf_counter()
     g_norm = optimizer._buffers["g_norm"]
@@ -847,13 +893,15 @@ for i in range(args["nbr_sweeps"]):
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
                  dL1, dL2, dL_applied, optimizer.lmetric_mu, optimizer.gram_LmLp, dLq,
                  optimizer._solver.kept if optimizer.last_rows is not None else np.nan,
-                 getattr(optimizer._grad, "deflation_value", None), getattr(optimizer._grad, "VarDeflation", None)))
+                 getattr(optimizer._grad, "deflation_value", None), getattr(optimizer._grad, "VarDeflation", None),
+                 fs_exact))
     if (i + 1) % args["save_every"] == 0:
         write_outputs()         # the profile file one sweep behind: this sweep's row includes this write
     timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
+            + (f"  fs_exact = {fs_exact:.2e}" if np.isfinite(fs_exact) else "")
             + (f"  dL2 = {dL2:.2e}" if max_dL > 0 else "")
             + (f"  dLq = {dLq:.2e}" if optimizer.last_rows is not None else "")
             + (f"  trPi = {float(optimizer._grad.deflation_value):.2e}" if deflating else "")
