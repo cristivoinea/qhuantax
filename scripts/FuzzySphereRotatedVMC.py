@@ -493,7 +493,9 @@ def log_amplitudes(spins):
 def step_infidelity(dtheta, batch, current):
     """1 - F between the state and the state after dtheta, from r = psi_new/psi on `batch`, drawn from an earlier
     state (the previous sweep's) and reweighted to this one by w = rw |psi/psi_sampled|^2: F = |<w r>|^2 /
-    (<w> <w |r|^2>). `current` is (log|psi|, sign) of the state on the batch."""
+    (<w> <w |r|^2>). `current` is (log|psi|, sign) of the state on the batch. A configuration on which psi_new is NaN
+    or infinite gives inf: the step broke the state there, and dropping it would hide that (psi_new = 0 is a genuine
+    r = 0 and stays in)."""
     spins, log_s, _, rw = batch
     log_c, sign_c = current
     model = state._model
@@ -504,9 +506,14 @@ def step_infidelity(dtheta, batch, current):
         state._model = model
     logw = np.log(rw) + 2 * (log_c - log_s)
     logr = log_n - log_c
-    ok = np.isfinite(logw) & np.isfinite(logr)
+    ok = np.isfinite(logw) & np.isfinite(log_c)
+    if np.any(ok & (np.isnan(logr) | (logr == np.inf))):
+        return np.inf
+    live = ok & np.isfinite(logr)
+    if not live.any():
+        return 1.0
     w = np.where(ok, np.exp(logw - np.max(logw[ok])), 0.0)
-    r = np.where(ok, sign_n * sign_c * np.exp(np.where(ok, logr, 0.0) - np.max(logr[ok])), 0.0)
+    r = np.where(live, sign_n * sign_c * np.exp(np.where(live, logr, 0.0) - np.max(logr[live])), 0.0)
     return float(1 - np.sum(w * r)**2 / (np.sum(w) * np.sum(w * r**2)))
 
 
@@ -533,14 +540,17 @@ for i in range(args["nbr_sweeps"]):
     fs_exact = np.nan
     exact_now = args["fs_exact_sweeps"] < 0 or i < args["fs_exact_sweeps"]
     if exact_now and cap > 0 and prev_batch is not None:
-        # shrink until the actual 1 - F is within the cap: the scale 0.9 x the quadratic guess per try
+        # shrink until the actual 1 - F is within the cap: the scale 0.9 x the quadratic guess per try, 1/4 while the
+        # step leaves psi non-finite; a step that still does after every try is dropped
         current = log_amplitudes(prev_batch[0])
         for _ in range(12):
             fs_exact = step_infidelity(dtheta, prev_batch, current)
-            if not fs_exact > cap:
+            if fs_exact <= cap:
                 break
             c = 0.9 * np.sqrt(cap / fs_exact) if np.isfinite(fs_exact) else 0.25
             dtheta, fs_applied = dtheta * c, fs_applied * c**2
+        if not np.isfinite(fs_exact):
+            dtheta, fs_applied = jnp.zeros_like(dtheta), 0.0
     state.update(dtheta)
     prev_Obar = optimizer.last_Obar
     if exact_now:
@@ -556,7 +566,8 @@ for i in range(args["nbr_sweeps"]):
 
     line = (f"  sweep {i:5d}  E = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
-            + (f"  fs_exact = {fs_exact:.2e}" if np.isfinite(fs_exact) else ""))
+            + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
+            + ("  (step dropped)" if np.isinf(fs_exact) else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         line += "  | " + record_exact(i)
     if i < 5 or i % 10 == 0 or i == args["nbr_sweeps"] - 1:

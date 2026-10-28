@@ -730,15 +730,22 @@ def span_infidelity(dtheta, samples, current):
     """1 - F of the span between the members and the members after dtheta, F = |<Psi|Psi'>|^2 / (<Psi|Psi> <Psi'|Psi'>)
     for the tuple amplitude Psi = det A (the product of the cos^2 of the principal angles): from r = det A' / det A on
     `samples`, drawn at earlier parameters and reweighted to these by w = rw |det A / det A_sampled|^2, F = |<w r>|^2 /
-    (<w> <w r^2>). `current` is det A on the samples (LogArray)."""
+    (<w> <w r^2>). `current` is det A on the samples (LogArray). A tuple on which det A' is NaN or infinite gives
+    inf: the step broke the members there, and dropping the tuple would hide it (det A' = 0 is a genuine r = 0 and
+    stays in)."""
     new = after_step(dtheta, sampler.determinant, samples.spins)
     log_c = jnp.asarray(current.logabs)
     logw = jnp.log(samples.reweight_factor) + 2 * (log_c - LogArray.from_value(samples.psi).logabs)
     logr = jnp.asarray(new.logabs) - log_c
-    ok = jnp.isfinite(logw) & jnp.isfinite(logr)
+    ok = jnp.isfinite(logw) & jnp.isfinite(log_c)
+    if bool(jnp.any(ok & (jnp.isnan(logr) | (logr == jnp.inf)))):
+        return np.inf
+    live = ok & jnp.isfinite(logr)
+    if not bool(jnp.any(live)):
+        return 1.0
     w = jnp.where(ok, jnp.exp(logw - jnp.max(jnp.where(ok, logw, -jnp.inf))), 0.0)
-    r = jnp.where(ok, jnp.real(new.sign * current.sign)
-                  * jnp.exp(jnp.where(ok, logr, 0.0) - jnp.max(jnp.where(ok, logr, -jnp.inf))), 0.0)
+    r = jnp.where(live, jnp.real(new.sign * current.sign)
+                  * jnp.exp(jnp.where(live, logr, 0.0) - jnp.max(jnp.where(live, logr, -jnp.inf))), 0.0)
     return float(1 - jnp.sum(w * r)**2 / (jnp.sum(w) * jnp.sum(w * r**2)))
 
 
@@ -835,17 +842,20 @@ for i in range(args["nbr_sweeps"]):
     if 0 < cap < fs:
         dtheta, fs_applied = dtheta * np.sqrt(cap / fs), cap
     # then (--fs-exact-sweeps) the actual 1 - F of the span on the previous batch: shrunk until within the cap, the
-    # scale 0.9 x the quadratic guess per try
+    # scale 0.9 x the quadratic guess per try, 1/4 while the step leaves det A non-finite; a step that still does
+    # after every try is dropped
     fs_exact = np.nan
     if (args["fs_exact_sweeps"] < 0 or i < args["fs_exact_sweeps"]) and cap > 0 and prev_samples is not None:
         t_fx = perf_counter()
         current = sampler.determinant(prev_samples.spins)
         for _ in range(12):
             fs_exact = span_infidelity(dtheta, prev_samples, current)
-            if not fs_exact > cap:
+            if fs_exact <= cap:
                 break
             c = 0.9 * np.sqrt(cap / fs_exact) if np.isfinite(fs_exact) else 0.25
             dtheta, fs_applied = dtheta * c, fs_applied * c**2
+        if not np.isfinite(fs_exact):
+            dtheta, fs_applied = jnp.zeros_like(dtheta), 0.0
         timings["fs_exact"] = perf_counter() - t_fx
     # then (--max-dL) the L^- L^+ the step creates, dL2 (scaling the step by c scales it by c^2), on the previous
     # batch too; dL1 is the linear part of the change
@@ -901,7 +911,8 @@ for i in range(args["nbr_sweeps"]):
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
-            + (f"  fs_exact = {fs_exact:.2e}" if np.isfinite(fs_exact) else "")
+            + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
+            + ("  (step dropped)" if np.isinf(fs_exact) else "")
             + (f"  dL2 = {dL2:.2e}" if max_dL > 0 else "")
             + (f"  dLq = {dLq:.2e}" if optimizer.last_rows is not None else "")
             + (f"  trPi = {float(optimizer._grad.deflation_value):.2e}" if deflating else "")
