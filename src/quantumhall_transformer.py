@@ -159,6 +159,34 @@ class Transformer(Sequential):
         super().__init__(layers)
 
 
+def grow_depth(net: Transformer, nblocks: int) -> Transformer:
+    """`net` with blocks appended up to `nblocks`, every output unchanged.
+
+    A new block's output weights (`W0`, and `W2`, `b2`) are zero, so with the residual it is the
+    identity; its other weights keep their random init and get a gradient from the second step on,
+    once the output weights have moved off zero. The final layer divides by sqrt(nblocks + 1), so
+    every write into the residual stream (`E`, `P`, the old blocks' `W0`, `W2`, `b2`) is scaled by
+    c = sqrt((nblocks + 1) / (nb + 1)): the LayerNorms remove c inside the blocks and the final
+    division removes it at the output. Exact up to the LayerNorms' eps: amplitudes change by
+    ~1e-6 relative, as much again from float32 rounding.
+    """
+    nb = (len(net.layers) - 2) // 2
+    if nblocks < nb:
+        raise ValueError(f"cannot grow {nb} blocks to {nblocks}")
+    grown = Transformer(nblocks, net.d, net.heads, net.final_activation, net.final_sum, net.dtype, net.out_dtype)
+    c = ((nblocks + 1) / (nb + 1)) ** 0.5
+    emb = net.layers[0]
+    old = [eqx.tree_at(lambda e: (e.E, e.P), emb, (c * emb.E, c * emb.P))]
+    for mhsa, ffn in zip(net.layers[1:-1:2], net.layers[2:-1:2]):
+        old += [eqx.tree_at(lambda l: l.W0, mhsa, c * mhsa.W0),
+                eqx.tree_at(lambda l: (l.W2, l.b2), ffn, (c * ffn.W2, c * ffn.b2))]
+    new = []
+    for mhsa, ffn in zip(grown.layers[1 + 2 * nb:-1:2], grown.layers[2 + 2 * nb:-1:2]):
+        new += [eqx.tree_at(lambda l: l.W0, mhsa, jnp.zeros_like(mhsa.W0)),
+                eqx.tree_at(lambda l: (l.W2, l.b2), ffn, (jnp.zeros_like(ffn.W2), jnp.zeros_like(ffn.b2)))]
+    return eqx.tree_at(lambda n: n.layers, grown, (*old, *new, grown.layers[-1]))
+
+
 def transformer_backflow_state(
     index: int,
     L: int,
