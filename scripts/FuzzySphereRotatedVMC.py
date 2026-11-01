@@ -59,6 +59,12 @@ parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
 parser.add_argument("--int-cutoff", type=float, default=1e-15,
                     help="train without the interaction hopping terms below this |U|; their summed |U| (printed) "
                          "bounds the shift of every energy. ED keeps the full H")
+parser.add_argument("--tail", type=float, default=0.0,
+                    help="sample the connected configurations whose |matrix element| is below this instead of "
+                         "evaluating them all: each kept with probability |H_ss'| / tail and weighted by its inverse. "
+                         "Unbiased (H exact on average, unlike --int-cutoff) at an extra Eloc variance below tail x "
+                         "sum |H_ss'| |psi(s')/psi(s)|^2 over the sampled ones; e.g. 1e-3 or 1e-2 for a cheaper first "
+                         "phase, then --cont-run without it. 0 (the default) evaluates every connection")
 parser.add_argument("--no-untie", action="store_true", help="keep the features charge-only")
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 member: W = this x the default random init; 0 keeps W = 0")
@@ -87,8 +93,10 @@ parser.add_argument("--lmlp-floor-gap", type=float, default=20.0,
                     help="auto: floor on lambda, kept when the levels need less, as the energy by which it lifts a "
                          "random state of the Lz sector (0.083 at N=14, ~N^3); 0 disables")
 parser.add_argument("--lmlp-every", type=int, default=None,
-                    help="measure <L^- L^+> every this many sweeps, also at lambda = 0 (the gradient is unchanged); "
-                         "0 never. Defaults to 1 with a penalty, 0 without")
+                    help="at lambda = 0, measure <L^- L^+> every this many sweeps (the gradient is unchanged; it costs "
+                         "the connections L^- L^+ does not share with H, ~9%% per measured sweep at N=24); 0 never. With "
+                         "a penalty it is measured every sweep for free, pooled with H. Defaults to 1 with a penalty, "
+                         "0 without")
 parser.add_argument("--exact-diag", action="store_true", help="track the member against ED (feasible up to N=14)")
 parser.add_argument("--ed-every", type=int, default=5, help="ED readout every this many sweeps")
 parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the Lz block to compute, all L")
@@ -454,8 +462,8 @@ class LoggedAdam(qtx.optimizer.Adam):
 class ObarKeepingSR(PenalizedAdamSR):
     """`PenalizedAdamSR` with `LoggedAdam`, keeping the last Obar for the trust region."""
 
-    def __init__(self, state, hamiltonian, penalty, penalty_coeff, penalty_every, solver=None):
-        grad = PenalizedEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every)
+    def __init__(self, state, hamiltonian, penalty, penalty_coeff, penalty_every, solver=None, tail=0.0):
+        grad = PenalizedEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
         qtx.optimizer.StochasticQNGD.__init__(self, state, grad, solver=solver, updater=LoggedAdam())
 
     def get_Obar(self, samples):
@@ -464,7 +472,7 @@ class ObarKeepingSR(PenalizedAdamSR):
 
 
 solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
-optimizer = ObarKeepingSR(state, tms_H, tms_LmLp, lam, lmlp_every, solver=solver)
+optimizer = ObarKeepingSR(state, tms_H, tms_LmLp, lam, lmlp_every, solver=solver, tail=args["tail"])
 
 rows = []
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a

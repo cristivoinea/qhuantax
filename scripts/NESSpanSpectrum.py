@@ -20,7 +20,7 @@ from quantax.utils import LogArray, to_distributed_array
 
 from qhuantax.nes import NaturalLzDetFlavourFlipSampler, NaturalStateSet
 from qhuantax.quantumhall_excitons import rotated_vacuum_configs, rotated_vacuum_tuples
-from qhuantax.quantumhall_operators import GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
+from qhuantax.quantumhall_operators import GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms, PooledOperator
 from qhuantax.quantumhall_samplers import FermionDipoleConsFlavourFlip
 from qhuantax.quantumhall_symmetries import FlavourPermQH, fuzzy_sphere_symmetry
 from qhuantax.rotated import load_member
@@ -53,6 +53,7 @@ if h != 0:
     tms_H = tms_H - h * GetSpinfulPolTerms(nm=N, mat=SX)
 tms_Lp = GetLpTerms(N, 2)
 operators = dict(H=tms_H, L=tms_Lp.H @ tms_Lp)
+pooled = PooledOperator(list(operators.values()))     # every connected configuration of both, once per member
 symm = fuzzy_sphere_symmetry(**symmetries) if "symmetries" in meta else FlavourPermQH(eigval=meta["z2"])
 states = [qtx.state.Variational(load_member(m["spec"], N, meta_file.parent / m["file"]), symm=symm,
                                 max_parallel=16384, use_ref=False) for m in meta["members"]]
@@ -87,13 +88,13 @@ for sweep in range(args["sweeps"]):
     spins = np.asarray(samples.spins)
     rw = np.ones(n) if samples.reweight_factor is None else np.asarray(samples.reweight_factor, float).reshape(n)
     flat = to_distributed_array(spins.reshape(n * K, 2 * N))
-    sign, logabs, oloc = [], [], {name: [] for name in operators}
-    for state in states:
-        psi = state(flat)
+    sign, logabs = [], []
+    psis = [state(flat) for state in states]
+    for psi in psis:
         s, l = logval(psi)
         sign.append(s); logabs.append(l)
-        for name, op in operators.items():
-            oloc[name].append(np.real(np.asarray(op.Oloc(state, Samples(flat, psi)))))
+    local = np.real(np.asarray(pooled.Oloc(states, flat, psi=psis)))         # (n K configurations, K members, ops)
+    oloc = {name: list(local[:, :, c].T) for c, name in enumerate(operators)}
     sign, logabs = np.array(sign), np.array(logabs)                 # (K members, n K configurations)
     if shift is None:
         shift = logabs.max(1, keepdims=True)

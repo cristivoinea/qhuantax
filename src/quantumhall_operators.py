@@ -1,7 +1,17 @@
+from functools import partial
 from typing import Sequence
 import numpy as np
 import sympy.physics.wigner as spw
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 import quantax as qtx
+from quantax.global_defs import get_default_dtype, get_sites, get_subkeys
+from quantax.operator.operator import OpTerm, OpTermJAX, _apply_site_operator, _get_Olocx
+from quantax.operator.update_mode_filters import DIAGONAL_OPS
+from quantax.sampler import Samples
+from quantax.state import State
+from quantax.utils import chunk_map, get_replicated_sharding, to_distributed_array
 
 
 def get_int_matrix(nm : int, ps_pot : Sequence[int]):
@@ -279,3 +289,255 @@ def GetIdTerms(nm : int, nflav: int) -> qtx.operator.Operator:
             Op += (qtx_create(f, m) @ qtx_annihilate(f, m))
 
     return Op
+
+
+def _flip_set(opstr: str, indices) -> tuple:
+    """The sites a term flips whenever it does not annihilate the configuration: those carrying an odd number of
+    off-diagonal characters (+, -, x, y). Terms with the same flip set connect s to the same s'."""
+    count = {}
+    for op, i in zip(opstr, indices):
+        if op not in DIAGONAL_OPS:
+            count[int(i)] = count.get(int(i), 0) + 1
+    return tuple(sorted(i for i, c in count.items() if c % 2))
+
+
+@eqx.filter_jit
+@partial(eqx.filter_vmap, in_axes=(0, None))
+def _term_factors(s: jax.Array, op_terms: tuple) -> jax.Array:
+    """Quantax's `_apply_off_diag` without the connected configurations: the factor every unit-strength term picks
+    up on s (fermion sign, the 1/2 of x and y, ...), NaN where it annihilates s."""
+    apply_fn = jax.vmap(_apply_site_operator, in_axes=(0, None, 0, 0))
+    factors = []
+    for op_term in op_terms:
+        strength = op_term.strength
+        s_conn = jnp.repeat(s[None, :], strength.size, axis=0)
+        for op, idx in zip(reversed(op_term.opstr), op_term.indices.T[::-1]):
+            s_conn, strength = apply_fn(s_conn, op, strength, idx)
+        factors.append(strength)
+    return jnp.concatenate(factors)
+
+
+@partial(jax.jit, static_argnums=3)
+def _group_weights(factors: jax.Array, term_group: jax.Array, term_J: jax.Array, ngroups: int) -> jax.Array:
+    """<s'|O_c|s> of every flip-set group, (nsamples, ngroups, ncomp): the terms' factors times their strengths,
+    summed over the terms of a group. A factor of 0 is an `n` that vanishes on s, NaN a term that annihilates s."""
+    valid = jnp.isfinite(factors) & (factors != 0)
+    w = jnp.where(valid[..., None], factors[..., None] * term_J, 0)
+    W = jnp.zeros((factors.shape[0], ngroups, term_J.shape[1]), w.dtype)
+    return W.at[:, term_group].add(w)
+
+
+@jax.jit
+def _thin(W: jax.Array, key: jax.Array, tail: float) -> jax.Array:
+    """Keep every connection with probability p = min(1, max_c |W| / tail), weighted by 1/p: unbiased, exact above
+    `tail`, and the minimum-variance choice for a given expected number of connections below it."""
+    p = jnp.minimum(1.0, jnp.max(jnp.abs(W), axis=-1) / tail)
+    keep = jax.random.uniform(key, p.shape) < p
+    return jnp.where(keep[..., None], W / jnp.where(keep, p, 1.0)[..., None], 0)
+
+
+@partial(jax.jit, static_argnums=1)
+def _live_size(live: jax.Array, multiple: int | None) -> jax.Array:
+    """The largest number of live connections on one device, rounded up to `multiple` (the state's forward chunk,
+    as Quantax's `_get_conn_size` does, so that the compacted batch takes few distinct shapes)."""
+    size = jnp.max(jnp.sum(live.reshape(jax.device_count(), -1), axis=1))
+    if multiple is not None:
+        size = (size + multiple - 1) // multiple * multiple
+    return size
+
+
+@partial(jax.jit, static_argnums=4)
+def _compact(spins: jax.Array, W: jax.Array, live: jax.Array, flips: jax.Array, size: int):
+    """The live connections, laid out as Quantax's `_get_conn` does: (segment, s', <s'|O_c|s>). s' is s with the
+    group's flip set flipped, built for the live connections only; padding repeats s with zero weight."""
+    ndevices = jax.device_count()
+    nsamples, ngroups, ncomp = W.shape
+    Nmodes = spins.shape[-1]
+
+    def device_conn(spins, W, live):
+        segment, group = jnp.nonzero(live, size=size, fill_value=-1)
+        pad = segment == -1
+        s_conn = spins[segment] * jnp.where(pad[:, None], 1, flips[group]).astype(spins.dtype)
+        W = jnp.where(pad[:, None], 0, W[segment, group])
+        return segment, s_conn, W
+
+    segment, s_conn, W = jax.vmap(device_conn)(
+        spins.reshape(ndevices, -1, Nmodes), W.reshape(ndevices, -1, ngroups, ncomp),
+        live.reshape(ndevices, -1, ngroups))
+    segment += jnp.arange(ndevices)[:, None] * (nsamples // ndevices)
+    return segment.flatten(), s_conn.reshape(-1, Nmodes), W.reshape(-1, ncomp)
+
+
+def _by_opstr(keys) -> dict:
+    """{opstr: [indices, ...]} of (opstr, indices) keys."""
+    out = {}
+    for opstr, inds in keys:
+        out.setdefault(opstr, []).append(inds)
+    return out
+
+
+class PooledOperator:
+    r"""
+    Several operators evaluated together, so that every distinct connected configuration costs one forward pass.
+
+    Quantax's ``Operator.__add__`` concatenates term lists and ``Oloc`` evaluates one connected configuration per
+    term, so :math:`H + \lambda L^-L^+` pays twice for the moves the two share, a term like
+    :math:`c^\dagger_a c_b c^\dagger_b c_a` pays a forward pass on :math:`s` itself, and every separate ``Oloc`` on
+    the same samples enumerates the terms again. Here the off-diagonal terms of all `operators` (the components) are
+    grouped by their flip set: a term that does not annihilate :math:`s` turns it into :math:`s` with that set
+    flipped, so a group is one connected configuration, whatever its terms and whatever :math:`s`. Its matrix element
+    is kept per component. The empty set (terms that come back to :math:`s`) needs no forward pass.
+
+    ``Oloc(states, samples)`` then returns every component for every state from one enumeration per chunk of
+    samples and one forward pass of each state per distinct connection: exact, the same numbers as the separate
+    ``Oloc`` calls up to summation order.
+
+    :param operators: the components, e.g. ``[H, L^- L^+]``.
+    :param tail: sample the small matrix elements instead of evaluating them all: a connection is kept with
+        probability :math:`p = \min(1, \max_c |\langle s'|O_c|s\rangle| / \mathrm{tail})` and weighted by
+        :math:`1/p`. Unbiased, so exact on average, at an extra variance below
+        :math:`\mathrm{tail}\sum_{s'} |O_{ss'}| |\psi(s')/\psi(s)|^2` over the sampled connections. 0 (the default)
+        evaluates every connection.
+    """
+
+    def __init__(self, operators: Sequence[qtx.operator.Operator], tail: float = 0.0):
+        self.operators = list(operators)
+        self.tail = float(tail)
+        ncomp = len(self.operators)
+        terms, diag = {}, [{} for _ in range(ncomp)]
+        for c, op in enumerate(self.operators):
+            for term in op.op_list:
+                for J, inds in zip(term.strength, term.indices):
+                    key = (term.opstr, tuple(int(i) for i in inds))
+                    if all(ch in DIAGONAL_OPS for ch in term.opstr):
+                        diag[c][key] = diag[c].get(key, 0) + J
+                    else:
+                        terms.setdefault(key, np.zeros(ncomp, complex))[c] += J
+
+        groups, by_opstr = {}, {}
+        for (opstr, inds), J in terms.items():
+            if np.any(J != 0):
+                g = groups.setdefault(_flip_set(opstr, inds), len(groups))
+                by_opstr.setdefault(opstr, []).append((inds, J, g))
+        self._by_opstr = by_opstr
+        self._groups = list(groups)
+        self._empty = groups.get(())
+        self._diag = [qtx.operator.Operator([OpTerm(opstr, [d[(opstr, i)] for i in ii], [list(i) for i in ii])
+                                             for opstr, ii in _by_opstr(d).items()]) if d else None for d in diag]
+        self._jax = None
+
+    @property
+    def ncomp(self) -> int:
+        return len(self.operators)
+
+    @property
+    def nterms(self) -> int:
+        """Distinct off-diagonal terms, every component's pooled."""
+        return sum(len(t) for t in self._by_opstr.values())
+
+    @property
+    def ngroups(self) -> int:
+        """Distinct moves (flip sets) among them, the empty one included."""
+        return len(self._groups)
+
+    def _arrays(self) -> dict:
+        """The jax arrays, built on first use (under the dtype and sites then set, as Quantax does)."""
+        if self._jax is None:
+            sharding = get_replicated_sharding()
+            dtype = get_default_dtype()
+            op_terms, J, group = [], [], []
+            for opstr, entries in self._by_opstr.items():
+                ones = jnp.ones(len(entries), dtype, device=sharding)
+                indices = jnp.asarray([e[0] for e in entries], jnp.int32, device=sharding)
+                op_terms.append(OpTermJAX(opstr, ones, indices))
+                J.extend(e[1] for e in entries)
+                group.extend(e[2] for e in entries)
+            J = np.asarray(J, complex).reshape(-1, self.ncomp)
+            J = J if jnp.issubdtype(dtype, jnp.complexfloating) else J.real
+            flips = np.ones((self.ngroups, get_sites().Nmodes), np.int8)
+            for g, sites in enumerate(self._groups):
+                flips[g, list(sites)] = -1
+            self._jax = dict(op_terms=tuple(op_terms), J=jnp.asarray(J, dtype, device=sharding),
+                             group=jnp.asarray(group, jnp.int32, device=sharding),
+                             flips=jnp.asarray(flips, device=sharding))
+        return self._jax
+
+    def _weights(self, spins: jax.Array, key=None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """(W, live, ratio-one part) of a batch: the group weights, with the tail sampled when `key` is given."""
+        a = self._arrays()
+        if a["op_terms"]:
+            W = _group_weights(_term_factors(spins, a["op_terms"]), a["group"], a["J"], self.ngroups)
+        else:
+            W = jnp.zeros((spins.shape[0], 0, self.ncomp), get_default_dtype())
+        extra = jnp.zeros((spins.shape[0], self.ncomp), W.dtype)
+        if self._empty is not None:
+            extra = W[:, self._empty]
+            W = W.at[:, self._empty].set(0)
+        if key is not None and self.tail > 0 and W.shape[1]:
+            W = _thin(W, key, self.tail)
+        live = jnp.any(jnp.abs(W) > 1e-8, axis=-1)      # Quantax's isclose(H_conn, 0)
+        return W, live, extra
+
+    def _diagonal(self, spins: jax.Array, dtype) -> jax.Array:
+        cols = [jnp.zeros(spins.shape[0], dtype) if d is None else d.apply_diag(spins).astype(dtype)
+                for d in self._diag]
+        return jnp.stack(cols, axis=-1)
+
+    def connection_count(self, spins: jax.Array, sampled: bool = False) -> jax.Array:
+        """Forward passes per sample: the distinct connected configurations s' != s; with `sampled`, those kept by
+        one draw of the tail sampling."""
+        spins = to_distributed_array(jnp.asarray(spins))
+        _, live, _ = self._weights(spins, get_subkeys() if sampled else None)
+        return jnp.sum(live, axis=1)
+
+    def Oloc(self, states, samples, psi=None) -> jax.Array:
+        r"""
+        :math:`\sum_{s'} \langle s|O_c|s'\rangle \psi(s')/\psi(s)` of every component and state.
+
+        :param states: a state, or a sequence of states sharing the samples (the members of an NES set).
+        :param samples: `Samples` or configurations.
+        :param psi: the amplitudes on the samples, one per state (a list for a sequence of states); computed where
+            missing. For a single state it defaults to ``samples.psi``.
+        :return: ``(nsamples, ncomp)`` for a single state, ``(nsamples, nstates, ncomp)`` for a sequence.
+        """
+        single = isinstance(states, State)
+        states = [states] if single else list(states)
+        if not isinstance(samples, Samples):
+            samples = Samples(to_distributed_array(jnp.asarray(samples)))
+        spins = samples.spins
+        if psi is None:
+            psi = [samples.psi if single else None] * len(states)
+        elif single:
+            psi = [psi]
+        psi = [state(spins) if p is None else p for state, p in zip(states, psi)]
+
+        if any(state.use_ref for state in states):
+            # reference updates need Quantax's per-term update modes: no pooling, every operator on its own
+            out = jnp.stack([jnp.stack([op.Oloc(state, Samples(spins, p)) for op in self.operators], axis=-1)
+                             for state, p in zip(states, psi)], axis=1)
+            return out[:, 0] if single else out
+
+        forward_chunk = getattr(states[0], "forward_chunk", None)
+        chunk = getattr(states[0], "ref_chunk", forward_chunk)
+        sampled = self.tail > 0
+        nchunks = 1 if chunk is None else -(-spins.shape[0] // chunk)
+        keys = iter(jax.random.split(get_subkeys(), nchunks)) if sampled else None
+
+        def fn(spins, psi):
+            W, live, extra = self._weights(spins, next(keys) if sampled else None)
+            size = int(_live_size(live, forward_chunk).item())
+            if size > 0:
+                segment, s_conn, W_conn = _compact(spins, W, live, self._arrays()["flips"], size)
+            out = []
+            for state, p in zip(states, psi):
+                if size == 0:
+                    out.append(jnp.zeros((spins.shape[0], self.ncomp), W.dtype))
+                    continue
+                psi_conn = state(s_conn)
+                out.append(jnp.stack([_get_Olocx(p, segment, psi_conn, W_conn[:, c]) for c in range(self.ncomp)],
+                                     axis=-1))
+            out = jnp.stack(out, axis=1)
+            return out + (self._diagonal(spins, out.dtype) + extra.astype(out.dtype))[:, None]
+
+        out = chunk_map(fn, chunk_size=chunk)(spins, psi)
+        return out[:, 0] if single else out

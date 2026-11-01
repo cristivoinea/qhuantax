@@ -65,6 +65,12 @@ parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
 parser.add_argument("--int-cutoff", type=float, default=1e-15,
                     help="train without the interaction hopping terms below this |U|; their summed |U| (printed) "
                          "bounds the shift of every energy. ED keeps the full H")
+parser.add_argument("--tail", type=float, default=0.0,
+                    help="sample the connected configurations whose |matrix element| is below this instead of "
+                         "evaluating them all: each kept with probability |H_ss'| / tail and weighted by its inverse. "
+                         "Unbiased (H exact on average, unlike --int-cutoff) at an extra Eloc variance below tail x "
+                         "sum |H_ss'| |psi(s')/psi(s)|^2 over the sampled ones; e.g. 1e-3 or 1e-2 for a cheaper first "
+                         "phase, then --cont-run without it. 0 (the default) evaluates every connection")
 parser.add_argument("--no-untie", action="store_true", help="keep the features charge-only")
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 members: W = this x the default random init; 0 keeps W = 0")
@@ -84,8 +90,10 @@ parser.add_argument("--lmlp-floor-gap", type=float, default=20.0,
                          "random state of the Lz sector, taken for the L > Lz admixture the members pick up in "
                          "training (mean L(L+1) - Lz(Lz+1) 241 at N=14, Lz=0, so 20 gives 0.083; ~N^3); 0 disables")
 parser.add_argument("--lmlp-every", type=int, default=None,
-                    help="measure <L^- L^+> every this many sweeps, also at lambda = 0 (the gradient is unchanged; "
-                         "~10-20%% per measured sweep); 0 never. Defaults to 1 with a penalty, 0 without")
+                    help="at lambda = 0, measure <L^- L^+> every this many sweeps (the gradient is unchanged; it costs "
+                         "the connections L^- L^+ does not share with H, ~9%% per measured sweep at N=24); 0 never. With "
+                         "a penalty it is measured every sweep for free, pooled with H. Defaults to 1 with a penalty, "
+                         "0 without")
 parser.add_argument("--exact-diag", action="store_true", help="track the members against ED (feasible up to N=14)")
 parser.add_argument("--ed-every", type=int, default=5, help="ED readout every this many sweeps")
 parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the Lz block to compute, all L")
@@ -688,9 +696,10 @@ if args["lmetric"] > 0:
 else:
     solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
 optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
-                          penalty_every=lmlp_every, diagnostics=args["diagnostics"],
+                          penalty_every=lmlp_every, diagnostics=args["diagnostics"], tail=args["tail"],
                           grad=DeflatedTraceEnergyGrad(tms_H, projector, args["deflate_beta"], penalty=tms_LmLp,
-                                                       penalty_coeff=lam, penalty_every=lmlp_every)
+                                                       penalty_coeff=lam, penalty_every=lmlp_every,
+                                                       tail=args["tail"])
                           if deflating else None)
 
 # --max-dL: the step's change of tr(S^-1 L^- L^+) on the previous batch by correlated sampling (the same tuples at the
@@ -698,8 +707,8 @@ optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver,
 # linear: those linear parts average out and leave noise ~ |step|/sqrt(n) over a signal ~ |step|^2 (N=8: correlation
 # 0.3 with the exact change). The even part [dL(+step) + dL(-step)]/2 cancels them sample by sample and leaves the
 # quadratic part, the L^- L^+ the step creates; the odd part, the linear term (the penalty's restoring force, or H's
-# pull on junk already there), is logged with its noise. Its own operator object, so that --profile's eloc_LmLp
-# times the training's alone
+# pull on junk already there), is logged with its noise. Its own gradient object, so that --profile's eloc times
+# the training's alone
 leak_trace = NaturalTraceEnergyGrad(tms_Lp.H @ tms_Lp)
 
 
@@ -754,7 +763,7 @@ rows, member_rows = [], []
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
-PROFILE_COLUMNS = ("sample", "eloc_H", "eloc_LmLp", "ebar_rest", "obar", "lmetric", "solve", "update", "dL", "readout",
+PROFILE_COLUMNS = ("sample", "eloc", "ebar_rest", "obar", "lmetric", "solve", "update", "dL", "readout",
                    "output", "deflate", "fs_exact")
 timings, profile_rows = {}, []
 
@@ -797,8 +806,8 @@ def write_outputs():
 
 if args["profile"]:
     sampler.sweep = timed("sample", sampler.sweep)
-    tms_H.Oloc = timed("eloc_H", tms_H.Oloc)
-    tms_LmLp.Oloc = timed("eloc_LmLp", tms_LmLp.Oloc)
+    for pooled in optimizer._grad.pooled_operators:        # H alone, and H with L^- L^+: one pooled evaluation each
+        pooled.Oloc = timed("eloc", pooled.Oloc)
     optimizer.get_Ebar = timed("ebar", optimizer.get_Ebar)
     optimizer.get_Obar = timed("obar", optimizer.get_Obar)
     optimizer.solve = timed("solve", optimizer.solve)
@@ -926,7 +935,7 @@ for i in range(args["nbr_sweeps"]):
 
     if args["profile"]:
         total = perf_counter() - t_sweep
-        timings["ebar_rest"] = (timings.get("ebar", 0.0) - timings.get("eloc_H", 0.0) - timings.get("eloc_LmLp", 0.0)
+        timings["ebar_rest"] = (timings.get("ebar", 0.0) - timings.get("eloc", 0.0)
                                 - timings.get("deflate", 0.0))
         parts = [timings.get(c, 0.0) for c in PROFILE_COLUMNS]
         profile_rows.append([i, total, *parts, total - sum(parts)])

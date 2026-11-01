@@ -69,6 +69,7 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
         penalty: Optional[qtx.operator.Operator] = None,
         penalty_coeff: float = 0.0,
         penalty_every: int = 1,
+        tail: float = 0.0,
     ):
         r"""
         :param penalty:
@@ -82,19 +83,24 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
             as a pure measurement.
 
         :param penalty_every:
-            How often to resolve :math:`\left< H \right>` and :math:`\left< P \right>`
-            separately. ``0`` never does, so ``penalty`` is never evaluated and the run
-            costs exactly what it would without one. ``1`` does it every step, for the
-            cost of the second ``Oloc`` call. Above ``1``, the intermediate steps
-            evaluate the summed operator instead -- the same gradient either way, but
-            `energy_H` and `penalty_value` read ``nan`` in between.
+            How often to measure :math:`\left< P \right>` when it is not penalized
+            (``penalty_coeff=0``): ``0`` never, so the run costs exactly what it would
+            without a penalty; ``1`` every step, for the cost of P's own connected
+            configurations (those it shares with H are evaluated once). With a nonzero
+            coefficient P enters every step and both components are resolved for free.
+            `energy_H` and `penalty_value` read ``nan`` on the steps without P.
+
+        :param tail:
+            Sample the matrix elements below this instead of evaluating them all, see
+            `~qhuantax.quantumhall_operators.PooledOperator`; ``0`` (the default)
+            evaluates every connected configuration.
 
         Measuring and penalizing are independent: ``penalty_coeff=0`` with
         ``penalty_every=1`` labels the members by :math:`\left< P \right>` without
-        biasing them, and ``penalty_every=0`` penalizes without measuring.
+        biasing them.
         """
         super().__init__(hamiltonian)
-        self._init_penalty(hamiltonian, penalty, penalty_coeff, penalty_every)
+        self._init_penalty(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
 
     def local_energies(
         self, states: NaturalStateSet, samples: Samples, resolve: bool = True
@@ -102,24 +108,18 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
         r"""
         Return ``(tr(S^-1 (H + lambda P)), tr(S^-1 H), tr(S^-1 P))``.
 
-        Both ``Oloc`` and the trace are linear in the operator, so with ``resolve`` the
-        two traces come out of one pass: they share the psi matrix, the single
-        ``pinv``, and the connected configurations, since Quantax's
-        ``Operator.__add__`` concatenates term lists without merging them and
-        ``_Oloc`` emits one connected configuration per term. ``(H + lambda P).Oloc``
-        therefore visits exactly the configurations that ``H.Oloc`` and ``P.Oloc``
-        visit between them -- measured equal, not assumed.
+        Nothing is evaluated twice. The amplitudes are computed once per member and serve
+        as the psi matrix, the column prefactor and the denominator of the local values.
+        The local values of every member and component come from one
+        `~qhuantax.quantumhall_operators.PooledOperator` call: one enumeration of the
+        terms per chunk of samples, shared by the members, and one forward pass of each
+        member per distinct connected configuration of H and P together, which carries
+        both matrix elements. Both ``Oloc`` and the trace are linear in the operator, so
+        the two traces share the psi matrix and the single ``pinv``.
 
-        What the second call does duplicate is Quantax's per-``Oloc`` overhead: its
-        internal evaluation of ``psi(s)`` on the sampled configurations, the host sync
-        in ``_get_conn_size``, and the rounding of the connected batch up to
-        ``max_parallel``. The first of those is removed here by computing the
-        amplitudes once per member and passing them down through `Samples`, so they
-        serve as the psi matrix, the column prefactor and the denominator inside both
-        calls; the rest is what ``penalty_every`` exists to amortize.
-
-        Without ``resolve`` the summed operator is evaluated instead, for the same
-        gradient in one call, and the two components come back as ``nan``.
+        ``resolve`` asks for P on this step even at zero coefficient (a measurement);
+        without it, and without a coefficient, P is left out and its trace comes back as
+        ``nan``.
         """
         tuple_spins = jnp.asarray(samples.spins)
         nsamples, Nstates, Nmodes = tuple_spins.shape
@@ -139,16 +139,14 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
             psi_matrix.reshape(nsamples, Nstates, Nstates)
         )
 
-        resolve = resolve and self._penalty_op is not None
-        operators = self._operators(self.hamiltonian, resolve)
-        columns = [[] for _ in operators]
-
-        for state, psi_column in zip(states.states, psi_columns):
-            flat_samples = Samples(flat_spins, psi_column)
-            psi = jnp.asarray(psi_column)
-            for operator, operator_columns in zip(operators, columns):
-                Oloc = operator.Oloc(state, flat_samples).astype(get_default_dtype())
-                operator_columns.append(Oloc * psi)
+        with_penalty = self._with_penalty(resolve)
+        pooled = self.pooled_operator(with_penalty)
+        local = pooled.Oloc(states.states, flat_spins, psi=psi_columns).astype(get_default_dtype())
+        columns = [[local[:, a, c] * jnp.asarray(psi) for a, psi in enumerate(psi_columns)]
+                   for c in range(pooled.ncomp)]
+        for operator in self._extra_local_operators():
+            columns.append([operator.Oloc(state, Samples(flat_spins, psi)).astype(get_default_dtype())
+                            * jnp.asarray(psi) for state, psi in zip(states.states, psi_columns)])
 
         Sinv = jnp.linalg.pinv(S_scaled)
         # B gets the same row and column scalings as A, see `_scale_psi_matrix`
@@ -164,7 +162,12 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
                 jnp.trace(Sinv_O, axis1=-2, axis2=-1).astype(get_default_dtype())
             )
 
-        return self._combine(traces, resolve)
+        return self._combine(traces, with_penalty)
+
+    def _extra_local_operators(self) -> list:
+        """Operators that are no Quantax operators to pool, evaluated per member after the pooled ones and handed to
+        `_combine` last (the deflation projector)."""
+        return []
 
     def local_energy(self, states: NaturalStateSet, samples: Samples) -> jax.Array:
         """The optimized local energy, i.e. the first entry of `local_energies`."""
@@ -217,6 +220,7 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
         diagnostics: bool = False,
         diagnostics_every: int = 5,
         grad: Optional[NaturalTraceEnergyGrad] = None,
+        tail: float = 0.0,
     ):
         r"""
         :param grad:
@@ -235,10 +239,13 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
             The multiplier on ``penalty``; zero leaves the gradient untouched.
 
         :param penalty_every:
-            How often to separate the two, see
-            `~NaturalTraceEnergyGrad.local_energies`. The gradient does not depend on
-            it; raising it trades resolution of the components for the ~10-20% that
-            the second ``Oloc`` call costs.
+            How often to measure P when ``penalty_coeff`` is zero, see
+            `NaturalTraceEnergyGrad`. The gradient does not depend on it; with a nonzero
+            coefficient both components are resolved on every step for free.
+
+        :param tail:
+            Sample the matrix elements below this, see
+            `~qhuantax.quantumhall_operators.PooledOperator`; 0 evaluates them all.
 
         :param updater:
             The update strategy, default to `~quantax.optimizer.PlainUpdater`, i.e. plain
@@ -288,7 +295,7 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
 
         if grad is None:
             grad = NaturalTraceEnergyGrad(
-                hamiltonian, penalty, penalty_coeff, penalty_every
+                hamiltonian, penalty, penalty_coeff, penalty_every, tail
             )
         if updater is None:
             updater = qtx.optimizer.PlainUpdater()

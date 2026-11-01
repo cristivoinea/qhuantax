@@ -9,6 +9,8 @@ from quantax.operator.operator import _get_conn_size, _get_conn, _get_Olocx
 from quantax.optimizer import EnergyGrad, OverlapGrad
 from quantax.utils import chunk_map, ints_to_array
 
+from .quantumhall_operators import PooledOperator
+
 
 class ERDipoleCons(qtx.optimizer.QNGD):
     r"""
@@ -360,13 +362,18 @@ class PenaltySplitGrad:
     quantity actually being minimized -- with a penalty on, only the latter is what the
     optimizer descends, and only the former is comparable to ED.
 
-    The two operators reach the same connected configurations as their sum, but Quantax
-    pays a per-``Oloc`` overhead of order 10-20% for the second call, so ``penalty_every``
-    above 1 evaluates the sum instead on the steps in between and reports the components
-    as ``nan`` there. The gradient does not depend on the choice.
+    Both are evaluated by one `~qhuantax.quantumhall_operators.PooledOperator`: every
+    distinct connected configuration of H and P costs one forward pass and comes back with
+    both matrix elements, so a step that evaluates P at all resolves the two components for
+    free. P is evaluated whenever it is penalized (nonzero ``penalty_coeff``); at zero
+    coefficient ``penalty_every`` sets how often it is measured, for the cost of P's own
+    connections, and the steps in between report it as ``nan``.
 
-    Subclasses evaluate the local energies of `_operators`, then hand them to `_combine`
-    and `_record`.
+    ``tail > 0`` samples the matrix elements below it instead of evaluating them all (see
+    `PooledOperator`): unbiased, at a variance cost.
+
+    Subclasses evaluate the local energies of `pooled_operator`, then hand them to
+    `_combine` and `_record`.
     """
 
     _energy_H = None
@@ -376,30 +383,42 @@ class PenaltySplitGrad:
     _Eloc_max_dev = None
     _nonfinite = None
 
-    def _init_penalty(self, hamiltonian, penalty, penalty_coeff, penalty_every) -> None:
-        self._penalty_every = max(0, int(penalty_every))
+    def _init_penalty(self, hamiltonian, penalty, penalty_coeff, penalty_every, tail=0.0) -> None:
         # Measuring and penalizing are independent: a zero coefficient still lets the
-        # penalty label the state without biasing it, and 0 penalizes without measuring.
-        self._penalty_op = penalty if self._penalty_every else None
+        # penalty label the state without biasing it.
+        self._penalty_every = max(0, int(penalty_every))
         self._penalty_terms = (hamiltonian, penalty)
+        # One pooled operator for the steps with P and one for those without, built once:
+        # their jitted enumeration is reused, and a script can time them.
+        self._pooled = {
+            False: PooledOperator([hamiltonian], tail),
+            True: None if penalty is None else PooledOperator([hamiltonian, penalty], tail),
+        }
         self._set_penalty_coeff(penalty_coeff)
         self._steps = 0
 
     def _set_penalty_coeff(self, penalty_coeff) -> None:
         self._penalty_coeff = float(penalty_coeff)
-        hamiltonian, penalty = self._penalty_terms
-        # Only built when it is actually reached, since summing the operators is not
-        # free -- and with a zero coefficient the sum is just the Hamiltonian.
-        self._merged_op = (
-            hamiltonian + self._penalty_coeff * penalty
-            if penalty is not None and self._penalty_coeff and self._penalty_every != 1
-            else None
-        )
 
     @property
     def penalty(self):
-        """The measured penalty operator, ``None`` when ``penalty_every`` is 0."""
-        return self._penalty_op
+        """The penalty operator, ``None`` when it is never evaluated (no coefficient and ``penalty_every`` 0)."""
+        penalty = self._penalty_terms[1]
+        return penalty if self._penalty_every or self._penalty_coeff else None
+
+    @property
+    def tail(self) -> float:
+        """Matrix elements below this are sampled, see `PooledOperator`; 0 evaluates them all."""
+        return self._pooled[False].tail
+
+    @property
+    def pooled_operators(self) -> list:
+        """The `PooledOperator` s the steps evaluate: H alone, and H with P."""
+        return [op for op in self._pooled.values() if op is not None]
+
+    def pooled_operator(self, with_penalty: bool) -> PooledOperator:
+        """H and P pooled when `with_penalty`, H alone otherwise; the components in `_combine`'s order."""
+        return self._pooled[with_penalty]
 
     @property
     def penalty_coeff(self) -> float:
@@ -476,27 +495,23 @@ class PenaltySplitGrad:
         return self._nonfinite
 
     def _resolve(self) -> bool:
-        """Whether this step separates the two operators. Advances the step counter."""
-        resolve = bool(self._penalty_every) and self._steps % self._penalty_every == 0
+        """Whether this step evaluates P (and so resolves both components). Advances the step counter."""
+        measured = bool(self._penalty_every) and self._steps % self._penalty_every == 0
         self._steps += 1
-        return resolve and self._penalty_op is not None
+        return self._with_penalty(measured)
 
-    def _operators(self, hamiltonian, resolve: bool) -> list:
-        """The operators to evaluate this step, in the order `_combine` expects."""
-        if resolve:
-            return [hamiltonian, self._penalty_op]
-        # `_merged_op` is None whenever the sum degenerates to the Hamiltonian.
-        return [self._merged_op or hamiltonian]
+    def _with_penalty(self, measured: bool) -> bool:
+        """P enters whenever it is penalized, and when it is measured."""
+        return self._penalty_terms[1] is not None and (measured or self._penalty_coeff != 0)
 
-    def _combine(self, values, resolve: bool):
-        """``(local H + lambda P, local H, local P)`` from the evaluated operators."""
-        if not resolve:
+    def _combine(self, values, with_penalty: bool):
+        """``(local H + lambda P, local H, local P)`` from the evaluated components."""
+        if not with_penalty:
             # `nan` rather than 0 for the penalty: it was not measured, which is not the
-            # same statement as it having vanished.
+            # same statement as it having vanished. Without P nothing is added to the
+            # Hamiltonian, so the optimized energy is the bare one.
             Eloc = values[0]
-            unresolved = jnp.full_like(Eloc, jnp.nan)
-            # With nothing added to the Hamiltonian the optimized energy is the bare one.
-            return Eloc, (unresolved if self._penalty_coeff else Eloc), unresolved
+            return Eloc, Eloc, jnp.full_like(Eloc, jnp.nan)
 
         Eloc_H, Eloc_P = values
         return Eloc_H + self._penalty_coeff * Eloc_P, Eloc_H, Eloc_P
@@ -516,9 +531,8 @@ class PenaltySplitGrad:
             \log \sum_{s'} |H_{ss'}| \;+\; \max_{s'} \log|\psi(s')| \;-\; \log|\psi(s)|
             \;>\; \log(\mathrm{finfo.max})
 
-        and the first term is not a rounding detail: a large ``penalty_coeff`` on
-        :math:`L^- L^+` dominates it, so the threshold moves as :math:`\log \lambda` and
-        the merged-operator steps are more exposed than the resolved ones. Such a sample
+        and the first term is not a rounding detail: the O(N^2) matrix elements of
+        :math:`L^- L^+` dominate it. Such a sample
         carries a negligible reweight factor, so dropping it costs nothing; keeping it is
         not free, because the centering below is an *unweighted* mean and one ``nan``
         propagates to every entry of the returned vector.
@@ -564,9 +578,9 @@ class PenaltySplitGrad:
 class PenalizedEnergyGrad(PenaltySplitGrad, EnergyGrad):
     r"""Single-state energy gradient against :math:`H + \lambda P`, see `PenaltySplitGrad`."""
 
-    def __init__(self, hamiltonian, penalty=None, penalty_coeff=0.0, penalty_every=1):
+    def __init__(self, hamiltonian, penalty=None, penalty_coeff=0.0, penalty_every=1, tail=0.0):
         super().__init__(hamiltonian)
-        self._init_penalty(hamiltonian, penalty, penalty_coeff, penalty_every)
+        self._init_penalty(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
 
     def ebar(self, state, samples) -> jax.Array:
         if not isinstance(samples, qtx.sampler.Samples):
@@ -576,10 +590,9 @@ class PenalizedEnergyGrad(PenaltySplitGrad, EnergyGrad):
         else:
             reweight_factor = samples.reweight_factor
 
-        resolve = self._resolve()
-        values = [op.Oloc(state, samples).astype(get_default_dtype())
-                  for op in self._operators(self.hamiltonian, resolve)]
-        return self._record(*self._combine(values, resolve), reweight_factor)
+        with_penalty = self._resolve()
+        values = self.pooled_operator(with_penalty).Oloc(state, samples).astype(get_default_dtype())
+        return self._record(*self._combine(list(values.T), with_penalty), reweight_factor)
 
 
 class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
@@ -604,8 +617,9 @@ class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
         mu: float = 0.95,
         beta: float = 0.995,
         norm_clip: Optional[float] = None,
+        tail: float = 0.0,
     ):
-        grad = PenalizedEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every)
+        grad = PenalizedEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
         updater = qtx.optimizer.Adam(mu, beta, norm_clip)
         super().__init__(state, grad, imag_time, solver, updater, file)
 

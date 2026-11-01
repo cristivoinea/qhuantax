@@ -318,14 +318,14 @@ class DeflationProjector:
 class DeflatedTraceEnergyGrad(NaturalTraceEnergyGrad):
     r"""
     `NaturalTraceEnergyGrad` of :math:`H + \beta\Pi (+ \lambda P)`. :math:`\Pi` is always evaluated as its own
-    operator (it is no Quantax operator to merge); `energy_H` and `penalty_value` keep their meaning, and
+    operator (it is no Quantax operator to pool); `energy_H` and `penalty_value` keep their meaning, and
     `deflation_value` is :math:`\mathrm{tr}(S^{-1}\Pi)`, the summed weight of the lowered states in the span (0 to
     J), with `VarDeflation` its sample variance.
     """
 
     def __init__(self, hamiltonian, projector: DeflationProjector, beta: float, penalty=None,
-                 penalty_coeff: float = 0.0, penalty_every: int = 1):
-        super().__init__(hamiltonian, penalty, penalty_coeff, penalty_every)
+                 penalty_coeff: float = 0.0, penalty_every: int = 1, tail: float = 0.0):
+        super().__init__(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
         self.projector, self.beta = projector, float(beta)
         self._deflation_value = self._VarDeflation = None
 
@@ -341,12 +341,12 @@ class DeflatedTraceEnergyGrad(NaturalTraceEnergyGrad):
         self.projector.refresh(states)
         return super().local_energies(states, samples, resolve=resolve)
 
-    def _operators(self, hamiltonian, resolve: bool) -> list:
-        return super()._operators(hamiltonian, resolve) + [self.projector]
+    def _extra_local_operators(self) -> list:
+        return [self.projector]
 
-    def _combine(self, values, resolve: bool):
+    def _combine(self, values, with_penalty: bool):
         *values, Eloc_Pi = values
-        Eloc, Eloc_H, Eloc_P = super()._combine(values, resolve)
+        Eloc, Eloc_H, Eloc_P = super()._combine(values, with_penalty)
         self._Eloc_Pi = Eloc_Pi
         self._Eloc_total = Eloc + self.beta * Eloc_Pi
         return self._Eloc_total, Eloc_H, Eloc_P
