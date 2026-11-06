@@ -135,18 +135,15 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
         flat_spins = to_distributed_array(tuple_spins.reshape(nsamples * Nstates, Nmodes))
         psi_columns = [state(flat_spins) for state in states.states]
         psi_matrix = _stack_psi_arrays(psi_columns, axis=-1)
-        S_scaled, row_shift, col_shift = _scale_psi_matrix(
-            psi_matrix.reshape(nsamples, Nstates, Nstates)
-        )
+        # kept for readouts that need nothing else, e.g. `~qhuantax.nes.subspace.sampled_overlap`
+        self.last_psi_matrix = psi_matrix.reshape(nsamples, Nstates, Nstates)
+        S_scaled, row_shift, col_shift = _scale_psi_matrix(self.last_psi_matrix)
 
         with_penalty = self._with_penalty(resolve)
         pooled = self.pooled_operator(with_penalty)
         local = pooled.Oloc(states.states, flat_spins, psi=psi_columns).astype(get_default_dtype())
         columns = [[local[:, a, c] * jnp.asarray(psi) for a, psi in enumerate(psi_columns)]
                    for c in range(pooled.ncomp)]
-        for operator in self._extra_local_operators():
-            columns.append([operator.Oloc(state, Samples(flat_spins, psi)).astype(get_default_dtype())
-                            * jnp.asarray(psi) for state, psi in zip(states.states, psi_columns)])
 
         Sinv = jnp.linalg.pinv(S_scaled)
         # B gets the same row and column scalings as A, see `_scale_psi_matrix`
@@ -163,11 +160,6 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
             )
 
         return self._combine(traces, with_penalty)
-
-    def _extra_local_operators(self) -> list:
-        """Operators that are no Quantax operators to pool, evaluated per member after the pooled ones and handed to
-        `_combine` last (the deflation projector)."""
-        return []
 
     def local_energy(self, states: NaturalStateSet, samples: Samples) -> jax.Array:
         """The optimized local energy, i.e. the first entry of `local_energies`."""
@@ -226,8 +218,8 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
         :param grad:
             The gradient source, in place of the default
             ``NaturalTraceEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every)``,
-            e.g. a `~qhuantax.nes.deflation.DeflatedTraceEnergyGrad`; it then owns the
-            Hamiltonian and the penalty, and those arguments are ignored.
+            e.g. a subclass with extra terms; it then owns the Hamiltonian and the
+            penalty, and those arguments are ignored.
 
         :param penalty:
             Operator optimized as ``hamiltonian + penalty_coeff * penalty``, kept

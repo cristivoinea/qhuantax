@@ -558,6 +558,96 @@ def _mix_flavour_flips(key: Key, old_spins: jax.Array, pair_spins: jax.Array,
     return jnp.where(use_flip[:, None], flip_spins, pair_spins)
 
 
+def _pair_hop_offsets(n_neighbor: Union[int, Sequence[int]]) -> jax.Array:
+    """The orbital shifts d of the first electron of a pair hop, from hop distances as in ``n_neighbor``."""
+    dist = np.atleast_1d(np.asarray(n_neighbor, dtype=np.int32))
+    return jnp.asarray(np.sort(np.concatenate([-dist, dist])), dtype=jnp.int32)
+
+
+def _pair_hop_weights(occ: jax.Array, offsets: jax.Array, nparticles: int):
+    r"""
+    The valid moves of `_propose_valid_pair_hop`, counted per first electron and first target.
+
+    ``occ`` is ``(nconf, 2 Norb)`` booleans, up modes first, orbitals on an open chain (the sphere's m). A pair hop
+    takes two distinct electrons p and q in orbitals m_p and m_q, sends p to a mode of orbital m_p + d (either
+    flavour, d in ``offsets``) or to the other flavour of its own orbital (d = 0), and q to orbital m_q - d in
+    either flavour, which keeps :math:`L_z`. It is valid when both targets are in range, empty and distinct: the
+    move set of `_propose_exchange_dipolecons` (with ``n_neighbor`` the hop distances) without its null proposals.
+
+    Returns the electrons' modes ``(nconf, nparticles)``, the first move's target modes and shifts
+    ``(nconf, nparticles, W)`` and ``(W,)``, and the number of valid partner moves of each first move
+    ``(nconf, nparticles, W)``, zero where its target is unavailable; W = 2 len(offsets) + 1. Their sum over the
+    last two axes is the number of valid pair hops (ordered in p and q) of each configuration.
+    """
+    nconf, Nmodes = occ.shape
+    Norb = Nmodes // 2
+    noff = offsets.shape[0]
+    shift = jnp.concatenate([offsets, offsets, jnp.zeros(1, jnp.int32)])                # (W,)
+    flavour = jnp.concatenate([jnp.zeros(noff, jnp.int32), jnp.ones(noff, jnp.int32), -jnp.ones(1, jnp.int32)])
+
+    pos = jax.vmap(lambda o: jnp.flatnonzero(o, size=nparticles))(occ)                    # (nconf, Np)
+    m_p, f_p = pos % Norb, pos // Norb
+    m_t = m_p[..., None] + shift                                                          # (nconf, Np, W)
+    f_t = jnp.where(flavour == -1, 1 - f_p[..., None], flavour)
+    in_range = (m_t >= 0) & (m_t < Norb)
+    target = f_t * Norb + jnp.clip(m_t, 0, Norb - 1)
+    free = in_range & ~jnp.take_along_axis(occ, target.reshape(nconf, -1), axis=1).reshape(target.shape)
+
+    # Per orbital: c electrons, h = 2 - c empty modes; padded with zeros so that out-of-range orbitals count none.
+    # Partner moves of a first move with shift d: sum over electrons q != p of h(m_q - d), less the one partner
+    # target equal to p's for each q in orbital m_p + 2d (q != p).
+    c = occ[:, :Norb].astype(jnp.int32) + occ[:, Norb:].astype(jnp.int32)
+    pad = 2 * int(np.max(np.abs(np.asarray(offsets))))
+    cp = jnp.pad(c, ((0, 0), (pad, pad)))
+    hp = jnp.pad(2 - c, ((0, 0), (pad, pad)))
+    total = jnp.einsum("cm,cwm->cw", c, hp[:, jnp.arange(Norb)[None, :] - shift[:, None] + pad])   # (nconf, W)
+    gather = lambda arr, idx: jnp.take_along_axis(arr, idx.reshape(nconf, -1), axis=1).reshape(idx.shape)
+    own = gather(hp, m_p[..., None] - shift + pad)
+    clash = gather(cp, m_p[..., None] + 2 * shift + pad) - (shift == 0)
+    weights = jnp.where(free, total[:, None, :] - own - clash, 0)
+    return pos, target, shift, weights
+
+
+def _propose_valid_pair_hop(key: Key, old_spins: jax.Array, offsets: jax.Array,
+                            nparticles: int) -> Tuple[jax.Array, jax.Array]:
+    r"""
+    A pair hop drawn uniformly among the valid ones of each configuration (see `_pair_hop_weights`): the first
+    electron and its target with probability proportional to their number of valid partner moves, then one of
+    those uniformly. A configuration without valid hops stays put.
+
+    Returns the new spins and the number n(s) of valid hops of each old configuration. A hop s -> s' is proposed
+    with probability c / n(s), c the number of its labels: 2 (either electron drawn first) or 4 (when the electrons
+    can also take each other's target). c is the same for s' -> s, so the proposal ratio :math:`P(s|s')/P(s'|s)`
+    is ``n(s) / n(s')``.
+    """
+    occ = old_spins == 1
+    nconf, Nmodes = old_spins.shape
+    Norb = Nmodes // 2
+    arange = jnp.arange(nconf)
+    pos, target, shift, weights = _pair_hop_weights(occ, offsets, nparticles)
+    nvalid = jnp.sum(weights, axis=(1, 2))
+    W = shift.shape[0]
+
+    key_first, key_partner = jr.split(key)
+    first = jr.categorical(key_first, jnp.log(weights.reshape(nconf, -1).astype(jnp.float32)), axis=-1)
+    p, e = first // W, first % W
+    target_p = target[arange, p, e]
+    d = shift[e]
+
+    m_q = pos % Norb - d[:, None]                                                         # (nconf, Np)
+    target_q = jnp.arange(2)[None, None, :] * Norb + jnp.clip(m_q, 0, Norb - 1)[..., None]   # (nconf, Np, 2)
+    allowed = (((m_q >= 0) & (m_q < Norb))[..., None]
+               & ~jnp.take_along_axis(occ, target_q.reshape(nconf, -1), axis=1).reshape(target_q.shape)
+               & (target_q != target_p[:, None, None])
+               & (jnp.arange(nparticles)[None, :, None] != p[:, None, None]))
+    second = jr.categorical(key_partner, jnp.where(allowed, 0.0, -jnp.inf).reshape(nconf, -1), axis=-1)
+    q, g = second // 2, second % 2
+
+    new_spins = (old_spins.at[arange, pos[arange, p]].set(-1).at[arange, pos[arange, q]].set(-1)
+                 .at[arange, target_p].set(1).at[arange, target_q[arange, q, g]].set(1))
+    return jnp.where((nvalid > 0)[:, None], new_spins, old_spins), nvalid
+
+
 class FermionTwoBodyDipoleConsSymmetricSqueezed(qtx.sampler.Metropolis):
     """
     Symmetric spinless dipole-conserving sampler restricted to the squeezed basis.
