@@ -378,6 +378,9 @@ class PenaltySplitGrad:
 
     _energy_H = None
     _VarE_H = None
+    _ErrE_H = None
+    _ErrPenalty = None
+    _n_eff = None
     _penalty_value = None
     _VarPenalty = None
     _Eloc_max_dev = None
@@ -470,6 +473,30 @@ class PenaltySplitGrad:
     def VarPenalty(self):
         r"""Sample variance of :math:`P` over the last batch."""
         return self._VarPenalty
+
+    @property
+    def ErrE_H(self):
+        r"""
+        Statistical error of ``energy_H`` over the last batch,
+        :math:`\sqrt{\sum_s w_s^2 |E_H(s) - \bar E_H|^2} / \sum_s w_s` with the reweight factors
+        :math:`w`: ``sqrt(VarE_H / n)`` when :math:`w = 1`. What a sampler changes, unlike ``VarE_H``,
+        which is a property of the state.
+        """
+        return self._ErrE_H
+
+    @property
+    def ErrPenalty(self):
+        r"""Statistical error of ``penalty_value`` over the last batch, as ``ErrE_H``."""
+        return self._ErrPenalty
+
+    @property
+    def n_eff(self):
+        r"""
+        Effective number of samples of the last batch, :math:`(\sum_s w_s)^2 / \sum_s w_s^2`: ``n``
+        when :math:`w = 1`. Tempering keeps it a steady fraction of ``n``; a collapse to a few means
+        a few samples carry the batch.
+        """
+        return self._n_eff
 
     @property
     def Eloc_max_dev(self):
@@ -567,6 +594,17 @@ class PenaltySplitGrad:
         Pmean = jnp.mean(Eloc_P * reweight_factor)
         self._penalty_value = Pmean.real
         self._VarPenalty = jnp.mean(jnp.abs(Eloc_P - Pmean) ** 2 * reweight_factor).real
+
+        # The statistical error of those means and the effective number of samples. The
+        # chains of a batch are independent, so these hold within the step; correlation
+        # between steps comes on top when averaging over them. Unweighted sampling has
+        # err^2 = Var / n and n_eff = n; tempering lowers n_eff deliberately, and the error
+        # is what it buys.
+        w2 = reweight_factor ** 2
+        wsum2 = jnp.sum(reweight_factor) ** 2
+        self._ErrE_H = jnp.sqrt(jnp.sum(w2 * jnp.abs(Eloc_H - Hmean) ** 2) / wsum2)
+        self._ErrPenalty = jnp.sqrt(jnp.sum(w2 * jnp.abs(Eloc_P - Pmean) ** 2) / wsum2)
+        self._n_eff = wsum2 / jnp.sum(w2)
 
         # Over the surviving samples: `jnp.mean` would divide by `nsamples` and pull the
         # centre towards zero by whatever the discarded ones would have contributed. With

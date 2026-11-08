@@ -369,6 +369,21 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
         return getattr(self._grad, "VarPenalty", None)
 
     @property
+    def ErrE_H(self) -> Optional[jax.Array]:
+        r"""Statistical error of ``energy_H`` over the last batch, see the gradient source."""
+        return getattr(self._grad, "ErrE_H", None)
+
+    @property
+    def ErrPenalty(self) -> Optional[jax.Array]:
+        r"""Statistical error of ``penalty_value`` over the last batch, see the gradient source."""
+        return getattr(self._grad, "ErrPenalty", None)
+
+    @property
+    def n_eff(self) -> Optional[jax.Array]:
+        r"""Effective number of samples of the last batch, see the gradient source."""
+        return getattr(self._grad, "n_eff", None)
+
+    @property
     def penalty_coeff(self) -> float:
         r"""The multiplier :math:`\lambda` on the penalty; setting it takes effect from the next step."""
         return self._grad.penalty_coeff

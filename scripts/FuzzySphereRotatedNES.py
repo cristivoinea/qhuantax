@@ -621,7 +621,8 @@ def write_outputs():
                np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
                header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
                       + " ".join(DIAGNOSTICS_COLUMNS)
-                      + " fs fs_applied fs_same lambda moved valid fs_exact overlap_cond overlap_max")
+                      + " fs fs_applied fs_same lambda moved valid fs_exact overlap_cond overlap_max errE_H errLmLp "
+                        "n_eff")
     if member_rows:
         np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
                    header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
@@ -712,12 +713,13 @@ for i in range(args["nbr_sweeps"]):
     rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
-                 fs_exact, overlap_cond, overlap_max))
+                 fs_exact, overlap_cond, overlap_max, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff))
     if (i + 1) % args["save_every"] == 0:
         write_outputs()         # the profile file one sweep behind: this sweep's row includes this write
     timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
+            f"err E_H = {float(optimizer.ErrE_H):.1e}  n_eff/n = {float(optimizer.n_eff) / nsamples:.2f}  "
             f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}  overlap cond = {overlap_cond:.1f}"
             + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
             + ("  (step dropped)" if np.isinf(fs_exact) else "")

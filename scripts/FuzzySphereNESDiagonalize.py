@@ -2,7 +2,7 @@ import quantax as qtx
 import jax.numpy as jnp
 import numpy as np
 import scipy as sp
-from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms
+from qhuantax.quantumhall_operators import GetSpinfulDenIntTerms, GetSpinfulPolTerms, GetLpTerms, PooledOperator
 from qhuantax.quantumhall_samplers import FermionTwoBodyDipoleCons
 from qhuantax.quantumhall_symmetries import ParticleHoleQH, FlavourPermQH, IdentityQH
 from qhuantax.quantumhall_utils import generate_spin_configs, read_meta_file
@@ -162,6 +162,8 @@ else:
     S = np.zeros((nmeas, nstates, nstates))
     S_var = np.zeros((nmeas, nstates, nstates))
 
+    members = getattr(states, "states", states)
+    pooled = PooledOperator([tms_O])
     for i in range(nmeas):
         samples = sampler.sweep()
         spins = jnp.asarray(samples.spins)
@@ -177,14 +179,10 @@ else:
 
         denom = jnp.abs(sampling_psi) ** 2
         scale = jnp.where(denom > 0, reweight / denom, 0.0)
-        psi = jnp.stack([jnp.asarray(state(spins)) for state in states], axis=-1)
-        eloc = jnp.stack(
-            [
-                tms_O.Oloc(state, spins).astype(psi.dtype)
-                for state in states
-            ],
-            axis=-1,
-        )
+        psis = [state(spins) for state in members]
+        psi = jnp.stack([jnp.asarray(p) for p in psis], axis=-1)
+        # one enumeration for all states, their amplitudes reused as the denominators
+        eloc = pooled.Oloc(members, spins, psi=psis)[..., 0].astype(psi.dtype)
         S_sample = scale[:,None,None] * psi.conj()[:,:,None] * psi[:,None,:]
         H_sample = scale[:,None,None] * psi.conj()[:,:,None] * psi[:,None,:] * eloc[:,None,:]
 
