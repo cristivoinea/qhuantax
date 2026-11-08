@@ -120,8 +120,9 @@ parser.add_argument("--thermal-steps", type=int, default=None,
                     help="sampler thermalisation steps; defaults to the sampler's")
 parser.add_argument("--sweep-steps", type=int, default=None,
                     help="Metropolis steps between samples; defaults to the sampler's")
-parser.add_argument("--reweight", type=float, default=1.0,
-                    help="sample from |psi|^reweight. 2 traps the k=0 member (N=8): the charge-fluctuating configurations "
+parser.add_argument("--reweight", type=float, default=2.0,
+                    help="sample from |psi|^reweight, weighted back to |psi|^2 (2, the default, needs no weights). Pass 1 "
+                         "for the k=0 member, which 2 traps (N=8): the charge-fluctuating configurations "
                          "keep ~1e-4 of the weight but ~98%% of the exact variance, |psi|^2 never samples them, and "
                          "training stalls at fidelity 0.991 with a sampled VarE of 1e-6")
 parser.add_argument("--flip-prob", type=float, default=0.5, help="fraction of flavour-flip proposals")

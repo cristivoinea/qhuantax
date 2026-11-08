@@ -129,7 +129,9 @@ parser.add_argument("--sweep-steps", type=int, default=None,
                     help="Metropolis steps between samples; defaults to the sampler's: K Nmodes (pair-row) or 2 K Nmodes "
                          "(flip, pair), Nmodes = 2N. A pair-row step costs 1/K of a joint one: K x the steps of a flip "
                          "run is the same cost")
-parser.add_argument("--reweight", type=float, default=1.0, help="reweight factor for training sampling")
+parser.add_argument("--reweight", type=float, default=2.0,
+                    help="sample the tuples from |det A|^reweight, weighted back to |det A|^2; 2 (the default) needs no "
+                         "weights")
 parser.add_argument("--soft-min", type=float, default=None, metavar="P",
                     help="sample the tuples from |det A|^2 sum_i u_i^-P in place of |det A|^reweight (u_i^2 = sum_a "
                          "|psi_a(s_i)|^2 / c_a, the span's density at configuration i, c_a the members' norms, "
