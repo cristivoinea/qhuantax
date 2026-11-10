@@ -12,6 +12,7 @@ from quantax.sampler import Samples
 from quantax.utils import LogArray, PsiArray, to_distributed_array
 
 from ..quantumhall_optimizers import PenaltySplitGrad
+from ..sr_solvers import default_solver
 from .state_set import NaturalStateSet, _stack_psi_arrays
 
 
@@ -336,7 +337,8 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
             states,
             grad,
             imag_time=imag_time,
-            solver=solver,
+            # qhuantax's default (shift_eig: quantax's shifted solve by eigendecomposition) unless given
+            solver=default_solver() if solver is None else solver,
             updater=updater,
             file=file,
         )

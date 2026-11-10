@@ -10,6 +10,7 @@ from quantax.optimizer import EnergyGrad, OverlapGrad
 from quantax.utils import chunk_map, ints_to_array
 
 from .quantumhall_operators import PooledOperator
+from .sr_solvers import default_solver
 
 
 class ERDipoleCons(qtx.optimizer.QNGD):
@@ -38,13 +39,15 @@ class ERDipoleCons(qtx.optimizer.QNGD):
             Whether to use imaginary-time evolution, default to True.
 
         :param solver:
-            The numerical solver for the matrix inverse, default to `~quantax.optimizer.auto_pinv_eig`.
+            The numerical solver for the matrix inverse, default to `qhuantax.sr_solvers.default_solver`
+            (``shift_eig``: quantax's shifted solve by eigendecomposition).
 
         :param symm:
             Symmetry used to construct the Hilbert space, default to be the symmetry
             of the variational state.
         """
-        super().__init__(state, EnergyGrad(hamiltonian), imag_time=imag_time, solver=solver)
+        super().__init__(state, EnergyGrad(hamiltonian), imag_time=imag_time,
+                         solver=default_solver() if solver is None else solver)
 
         self._hamiltonian = hamiltonian
         self._energy = None
@@ -147,7 +150,7 @@ class Supervised_KL_Sign(qtx.optimizer.StochasticQNGD):
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
         zero_penalty: float = 4.0,
     ):
-        super().__init__(state, OverlapGrad(target_state), solver=solver)
+        super().__init__(state, OverlapGrad(target_state), solver=default_solver() if solver is None else solver)
         self._target_state = target_state
         self._sign_weight = sign_weight
         self._zero_penalty = zero_penalty
@@ -248,7 +251,7 @@ class Supervised_LogSq_Sign(qtx.optimizer.StochasticQNGD):
         solver: Optional[Callable[[jax.Array, jax.Array], jax.Array]] = None,
         zero_penalty: float = 4.0,
     ):
-        super().__init__(state, OverlapGrad(target_state), solver=solver)
+        super().__init__(state, OverlapGrad(target_state), solver=default_solver() if solver is None else solver)
         self._target_state = target_state
         self._sign_weight = sign_weight
         self._zero_penalty = zero_penalty
@@ -320,7 +323,7 @@ class SupervisedExact_KL_Sign(qtx.optimizer.SupervisedExact):
     ):
         self._sign_weight = sign_weight
 
-        super().__init__(state, target_state, solver=solver, symm=symm)
+        super().__init__(state, target_state, solver=default_solver() if solver is None else solver, symm=symm)
         if restricted_to is None:
             restricted_to = jnp.arange(self._Ns)
         self._resctricted_to = restricted_to
@@ -713,7 +716,8 @@ class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
     ):
         grad = PenalizedEnergyGrad(hamiltonian, penalty, penalty_coeff, penalty_every, tail)
         updater = qtx.optimizer.Adam(mu, beta, norm_clip)
-        super().__init__(state, grad, imag_time, solver, updater, file)
+        # qhuantax's default solver (shift_eig: quantax's shifted solve by eigendecomposition) unless given
+        super().__init__(state, grad, imag_time, default_solver() if solver is None else solver, updater, file)
 
     @property
     def energy_H(self):

@@ -38,6 +38,7 @@ from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
 from qhuantax.quantumhall_utils import TableLog, adaptive_learning_rate_inv
 from qhuantax.rotated import load_member, member_spec, set_gap, untie
+from qhuantax.sr_solvers import add_solver_arguments, solver_from_args
 
 
 S1 = np.array([[1, 0], [0, 0]])
@@ -110,8 +111,7 @@ parser.add_argument("--lr", type=float, default=1e-2, help="starting value of th
 parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0), 0 for a constant lr; defaults to N")
 parser.add_argument("--norm-clip", type=float, default=0.0,
                     help="cap on the step norm before the learning rate; <= 0 disables")
-parser.add_argument("--rshift", type=float, default=None,
-                    help="relative diagonal shift of the SR solve; defaults to quantax's")
+add_solver_arguments(parser)        # --solver, --rshift, --pinv-rtol, --tol-snr
 parser.add_argument("--max-bad-steps", type=int, default=3,
                     help="a non-finite SR step is discarded with the Adam moments it fed and the sweep redone on fresh "
                          "samples; this many in a row stop the run, the last good member written (1 stops on the "
@@ -487,7 +487,7 @@ class ObarKeepingSR(PenalizedAdamSR):
         return self.last_Obar
 
 
-solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
+solver = solver_from_args(args)     # default shift_eig: quantax's shifted solve by eigendecomposition
 optimizer = ObarKeepingSR(state, tms_H, tms_LmLp, lam, lmlp_every, solver=solver, tail=args["tail"])
 
 energy_log = TableLog(f"{path}/data_energy_{run_id}.txt",
