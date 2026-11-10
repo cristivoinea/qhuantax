@@ -336,6 +336,18 @@ def _thin(W: jax.Array, key: jax.Array, tail: float) -> jax.Array:
     return jnp.where(keep[..., None], W / jnp.where(keep, p, 1.0)[..., None], 0)
 
 
+@jax.jit
+def _tail_g(W: jax.Array, tail: float) -> jax.Array:
+    r"""The added variance the tail sampling of `_thin` puts on each sample, without the amplitudes:
+    :math:`g_{cd}(s) = \sum_{s'} (1/p_{ss'} - 1)\, W^*_c W_d`, ``(nsamples, ncomp, ncomp)``, from the unthinned W.
+    Its average over :math:`s \sim |\psi|^2` is exactly :math:`E_s \mathrm{Cov}_\xi` of the sampled components
+    (the ratios cancel on relabelling, :math:`|O_{ss'}|` and p being symmetric), so a component combination
+    :math:`a` gains :math:`\langle a^\dagger g\, a\rangle` of variance."""
+    p = jnp.minimum(1.0, jnp.max(jnp.abs(W), axis=-1) / tail)
+    f = jnp.where(p > 0, 1 / jnp.where(p > 0, p, 1.0) - 1, 0.0)
+    return jnp.einsum("sg,sgc,sgd->scd", f, W.conj(), W, precision=jax.lax.Precision.HIGHEST)
+
+
 @partial(jax.jit, static_argnums=1)
 def _live_size(live: jax.Array, multiple: int | None) -> jax.Array:
     """The largest number of live connections on one device, rounded up to `multiple` (the state's forward chunk,
@@ -366,6 +378,15 @@ def _compact(spins: jax.Array, W: jax.Array, live: jax.Array, flips: jax.Array, 
         live.reshape(ndevices, -1, ngroups))
     segment += jnp.arange(ndevices)[:, None] * (nsamples // ndevices)
     return segment.flatten(), s_conn.reshape(-1, Nmodes), W.reshape(-1, ncomp)
+
+
+def _bit_codes(masks: np.ndarray) -> np.ndarray:
+    """One integer per row of a boolean (n, Nmodes) array: bit m set where it is True (row bytes beyond 64 modes)."""
+    masks = np.asarray(masks, bool)
+    if masks.shape[1] <= 64:
+        return (masks.astype(np.uint64) << np.arange(masks.shape[1], dtype=np.uint64)).sum(axis=1, dtype=np.uint64)
+    packed = np.packbits(masks, axis=1)
+    return np.array([row.tobytes() for row in packed], dtype=object)
 
 
 def _by_opstr(keys) -> dict:
@@ -462,8 +483,9 @@ class PooledOperator:
                              flips=jnp.asarray(flips, device=sharding))
         return self._jax
 
-    def _weights(self, spins: jax.Array, key=None) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """(W, live, ratio-one part) of a batch: the group weights, with the tail sampled when `key` is given."""
+    def _weights(self, spins: jax.Array, key=None, with_g: bool = False):
+        """(W, live, ratio-one part) of a batch: the group weights, with the tail sampled when `key` is given;
+        with `with_g` also the per-sample `_tail_g` of that sampling (zeros when nothing is sampled)."""
         a = self._arrays()
         if a["op_terms"]:
             W = _group_weights(_term_factors(spins, a["op_terms"]), a["group"], a["J"], self.ngroups)
@@ -473,15 +495,64 @@ class PooledOperator:
         if self._empty is not None:
             extra = W[:, self._empty]
             W = W.at[:, self._empty].set(0)
+        g = jnp.zeros((spins.shape[0], self.ncomp, self.ncomp), W.dtype) if with_g else None
         if key is not None and self.tail > 0 and W.shape[1]:
+            if with_g:
+                g = _tail_g(W, self.tail)
             W = _thin(W, key, self.tail)
         live = jnp.any(jnp.abs(W) > 1e-8, axis=-1)      # Quantax's isclose(H_conn, 0)
-        return W, live, extra
+        return (W, live, extra, g) if with_g else (W, live, extra)
 
     def _diagonal(self, spins: jax.Array, dtype) -> jax.Array:
         cols = [jnp.zeros(spins.shape[0], dtype) if d is None else d.apply_diag(spins).astype(dtype)
                 for d in self._diag]
         return jnp.stack(cols, axis=-1)
+
+    def _group_codes(self):
+        """The flip sets as sorted integer codes (bit m set where mode m flips) and the group of each."""
+        if getattr(self, "_codes", None) is None:
+            Nmodes = get_sites().Nmodes
+            masks = np.zeros((self.ngroups, Nmodes), bool)
+            for g, sites in enumerate(self._groups):
+                masks[g, list(sites)] = True
+            codes = _bit_codes(masks)
+            order = np.argsort(codes, kind="stable")
+            self._codes = (codes[order], order)
+        return self._codes
+
+    def tail_g_between(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        r"""
+        :math:`(1/p - 1)\, W^*_c W_d` of the connection :math:`a \to b` for each pair of configurations, zero
+        where b is not one move from a (or a = b) or nothing is sampled: ``(npairs, ncomp, ncomp)``, numpy.
+
+        `_tail_g` sums this over every connection of a. A trace over a tuple of NES slots does not see the
+        connections of slot i that land on another slot j, where its determinant ratio vanishes; the trace's added
+        variance is therefore :math:`\sum_i g(x_i) - \sum_{i\neq j} c(x_i, x_j)`. Only the pairs that are one move
+        apart are evaluated (no forward pass), so this is nearly free when such pairs are rare.
+        """
+        a, b = np.asarray(a), np.asarray(b)
+        nc = self.ncomp
+        out = np.zeros((a.shape[0], nc, nc))
+        if self.tail <= 0 or a.shape[0] == 0:
+            return out
+        codes, order = self._group_codes()
+        diff = a != b
+        pair = _bit_codes(diff)
+        pos = np.minimum(np.searchsorted(codes, pair), len(codes) - 1)
+        hit = np.flatnonzero((codes[pos] == pair) & diff.any(axis=1))
+        if hit.size == 0:
+            return out
+        groups = order[pos[hit]]
+        # padded to a power of 2, so the jitted enumeration sees few distinct shapes
+        size = 1 << int(np.ceil(np.log2(hit.size)))
+        rows = np.concatenate([hit, np.full(size - hit.size, hit[0])])
+        W = np.asarray(self._weights(jnp.asarray(a[rows]))[0])[np.arange(hit.size), groups]
+        p = np.minimum(1.0, np.max(np.abs(W), axis=-1) / self.tail)
+        f = np.where(p > 0, 1 / np.where(p > 0, p, 1.0) - 1, 0.0)
+        c = f[:, None, None] * np.einsum("kc,kd->kcd", W.conj(), W)
+        out = out.astype(np.result_type(out, c))
+        out[hit] = c
+        return out
 
     def connection_count(self, spins: jax.Array, sampled: bool = False) -> jax.Array:
         """Forward passes per sample: the distinct connected configurations s' != s; with `sampled`, those kept by
@@ -490,7 +561,7 @@ class PooledOperator:
         _, live, _ = self._weights(spins, get_subkeys() if sampled else None)
         return jnp.sum(live, axis=1)
 
-    def Oloc(self, states, samples, psi=None) -> jax.Array:
+    def Oloc(self, states, samples, psi=None, tail_variance: bool = False):
         r"""
         :math:`\sum_{s'} \langle s|O_c|s'\rangle \psi(s')/\psi(s)` of every component and state.
 
@@ -498,7 +569,11 @@ class PooledOperator:
         :param samples: `Samples` or configurations.
         :param psi: the amplitudes on the samples, one per state (a list for a sequence of states); computed where
             missing. For a single state it defaults to ``samples.psi``.
-        :return: ``(nsamples, ncomp)`` for a single state, ``(nsamples, nstates, ncomp)`` for a sequence.
+        :param tail_variance: also return the per-sample `_tail_g` of this call's tail sampling,
+            ``(nsamples, ncomp, ncomp)``: from the matrix elements already enumerated, no forward pass. The draw
+            is shared by the states, so every state's sampled values carry the same g. Zeros without a tail.
+        :return: ``(nsamples, ncomp)`` for a single state, ``(nsamples, nstates, ncomp)`` for a sequence; with
+            `tail_variance` the pair ``(that, g)``.
         """
         single = isinstance(states, State)
         states = [states] if single else list(states)
@@ -511,11 +586,14 @@ class PooledOperator:
             psi = [psi]
         psi = [state(spins) if p is None else p for state, p in zip(states, psi)]
 
+        nc, ns = self.ncomp, len(states)
         if any(state.use_ref for state in states):
-            # reference updates need Quantax's per-term update modes: no pooling, every operator on its own
+            # reference updates need Quantax's per-term update modes: no pooling, every operator on its own (and
+            # no tail sampling)
             out = jnp.stack([jnp.stack([op.Oloc(state, Samples(spins, p)) for op in self.operators], axis=-1)
                              for state, p in zip(states, psi)], axis=1)
-            return out[:, 0] if single else out
+            out = out[:, 0] if single else out
+            return (out, jnp.zeros((spins.shape[0], nc, nc), out.dtype)) if tail_variance else out
 
         forward_chunk = getattr(states[0], "forward_chunk", None)
         chunk = getattr(states[0], "ref_chunk", forward_chunk)
@@ -524,7 +602,8 @@ class PooledOperator:
         keys = iter(jax.random.split(get_subkeys(), nchunks)) if sampled else None
 
         def fn(spins, psi):
-            W, live, extra = self._weights(spins, next(keys) if sampled else None)
+            weights = self._weights(spins, next(keys) if sampled else None, with_g=tail_variance)
+            W, live, extra = weights[:3]
             size = int(_live_size(live, forward_chunk).item())
             if size > 0:
                 segment, s_conn, W_conn = _compact(spins, W, live, self._arrays()["flips"], size)
@@ -537,7 +616,16 @@ class PooledOperator:
                 out.append(jnp.stack([_get_Olocx(p, segment, psi_conn, W_conn[:, c]) for c in range(self.ncomp)],
                                      axis=-1))
             out = jnp.stack(out, axis=1)
-            return out + (self._diagonal(spins, out.dtype) + extra.astype(out.dtype))[:, None]
+            out = out + (self._diagonal(spins, out.dtype) + extra.astype(out.dtype))[:, None]
+            if tail_variance:       # one array per chunk, as `chunk_map` stacks it: g packed after the values
+                n = out.shape[0]
+                out = jnp.concatenate([out.reshape(n, -1), weights[3].reshape(n, -1).astype(out.dtype)], axis=1)
+            return out
 
         out = chunk_map(fn, chunk_size=chunk)(spins, psi)
-        return out[:, 0] if single else out
+        if tail_variance:
+            n = out.shape[0]
+            g = out[:, ns * nc:].reshape(n, nc, nc)
+            out = out[:, :ns * nc].reshape(n, ns, nc)
+        out = out[:, 0] if single else out
+        return (out, g) if tail_variance else out

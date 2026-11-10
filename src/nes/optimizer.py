@@ -5,6 +5,7 @@ from typing import BinaryIO, Callable, Optional, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import quantax as qtx
 from quantax.global_defs import get_default_dtype
 from quantax.sampler import Samples
@@ -141,8 +142,26 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
 
         with_penalty = self._with_penalty(resolve)
         pooled = self.pooled_operator(with_penalty)
-        local = pooled.Oloc(states.states, flat_spins, psi=psi_columns).astype(get_default_dtype())
-        columns = [[local[:, a, c] * jnp.asarray(psi) for a, psi in enumerate(psi_columns)]
+        if pooled.tail > 0:
+            local, g = pooled.Oloc(states.states, flat_spins, psi=psi_columns, tail_variance=True)
+            # the added variance of the tail draw on every slot, ``[t, i, c, d]``, and per tuple the connections
+            # between its slots, which the trace does not see (see `_record_tail`)
+            self.last_tail_g = g.reshape(nsamples, Nstates, pooled.ncomp, pooled.ncomp)
+            pairs = [(i, j) for i in range(Nstates) for j in range(Nstates) if i != j]
+            spins_np = np.asarray(tuple_spins)
+            between = pooled.tail_g_between(spins_np[:, [i for i, _ in pairs]].reshape(-1, Nmodes),
+                                            spins_np[:, [j for _, j in pairs]].reshape(-1, Nmodes))
+            self.last_tail_pairs = jnp.asarray(
+                between.reshape(nsamples, len(pairs), pooled.ncomp, pooled.ncomp).sum(axis=1))
+        else:
+            local = pooled.Oloc(states.states, flat_spins, psi=psi_columns)
+            self.last_tail_g = None
+        local = local.astype(get_default_dtype())
+        self.last_local_ncomp = pooled.ncomp
+        # each member's local energy of H on every slot, ``[t, i, a]``: with `last_psi_matrix` all that
+        # `~qhuantax.nes.subspace.sampled_subspace` needs for the Ritz energies and variances
+        self.last_local_H = local[:, :, 0].reshape(nsamples, Nstates, Nstates)
+        columns =[[local[:, a, c] * jnp.asarray(psi) for a, psi in enumerate(psi_columns)]
                    for c in range(pooled.ncomp)]
 
         Sinv = jnp.linalg.pinv(S_scaled)
@@ -185,7 +204,29 @@ class NaturalTraceEnergyGrad(PenaltySplitGrad, qtx.optimizer.EnergyGrad):
         else:
             reweight_factor = samples.reweight_factor
 
-        return self._record(Eloc, Eloc_H, Eloc_P, reweight_factor)
+        Ebar = self._record(Eloc, Eloc_H, Eloc_P, reweight_factor)
+        self._record_tail(Eloc, reweight_factor)
+        return Ebar
+
+    def _record_tail(self, Eloc, reweight_factor) -> None:
+        r"""
+        The variance the tail sampling adds to ``VarE``, ``VarE_H`` and ``VarPenalty`` of this step, exactly in
+        expectation and from the matrix elements alone (stored by `PenaltySplitGrad._record_tail_from`).
+
+        Slot :math:`i` of a tuple moves to :math:`s'` with the ratio :math:`r_i(s') = \det A_{i\to s'}/\det A`, so
+        the trace's tail is :math:`\sum_i\sum_{s'}(\xi/p - 1) H_{x_i s'} r_i(s')`: one draw per slot, shared by
+        the members. Its variance, averaged over :math:`|\det A|^2`, loses the ratios on relabelling
+        :math:`x_i \leftrightarrow s'` (as for one state). The ratio vanishes where :math:`s'` is another slot
+        :math:`x_j` (two equal rows), and those connections drop out, leaving
+        :math:`E[\sum_i a^\dagger g(x_i)\, a - \sum_{i\neq j} a^\dagger c(x_i, x_j)\, a]`
+        (`PooledOperator.tail_g_between`), with :math:`a = (1, \lambda)` for ``VarE``. Averaged with the same
+        reweight factors and discarded samples as `_record`, so ``VarE - tail_var`` estimates the variance
+        without the tail.
+        """
+        g = self.last_tail_g
+        # the slots' draws are independent, less the connections between slots
+        G = None if g is None else jnp.sum(g, axis=1) - self.last_tail_pairs.astype(g.dtype)
+        self._record_tail_from(G, Eloc, reweight_factor, self.last_local_ncomp)
 
 
 class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
@@ -382,6 +423,26 @@ class NaturalExcitedSR(qtx.optimizer.StochasticQNGD):
     def n_eff(self) -> Optional[jax.Array]:
         r"""Effective number of samples of the last batch, see the gradient source."""
         return getattr(self._grad, "n_eff", None)
+
+    @property
+    def tail_var(self) -> Optional[jax.Array]:
+        r"""The part of ``VarE`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var", None)
+
+    @property
+    def tail_var_H(self) -> Optional[jax.Array]:
+        r"""The part of ``VarE_H`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var_H", None)
+
+    @property
+    def tail_var_P(self) -> Optional[jax.Array]:
+        r"""The part of ``VarPenalty`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var_P", None)
+
+    @property
+    def last_tail_g(self) -> Optional[jax.Array]:
+        r"""Per-slot added variance of the last tail draw, ``[t, i, c, d]``; ``None`` without a tail."""
+        return getattr(self._grad, "last_tail_g", None)
 
     @property
     def penalty_coeff(self) -> float:

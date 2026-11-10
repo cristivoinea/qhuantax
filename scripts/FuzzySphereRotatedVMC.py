@@ -36,7 +36,7 @@ from qhuantax.quantumhall_optimizers import PenalizedAdamSR, PenalizedEnergyGrad
 from qhuantax.quantumhall_samplers import FermionDipoleConsFlavourFlip
 from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
-from qhuantax.quantumhall_utils import adaptive_learning_rate_inv
+from qhuantax.quantumhall_utils import TableLog, adaptive_learning_rate_inv
 from qhuantax.rotated import load_member, member_spec, set_gap, untie
 
 
@@ -103,6 +103,9 @@ parser.add_argument("--ed-k", type=int, default=10, help="lowest levels of the L
 parser.add_argument("--ed-dir", default=None, help="ED cache folder, searched first; defaults to --path")
 parser.add_argument("--nbr-sweeps", type=int, default=200, help="number of training iterations")
 parser.add_argument("--nbr-samples", type=int, default=512, help="number of samples per iteration")
+parser.add_argument("--save-every", type=int, default=10,
+                    help="write the checkpoint every this many sweeps, at the end and before a non-finite update stops "
+                         "the run; the data files are written row by row as the sweeps go")
 parser.add_argument("--lr", type=float, default=1e-2, help="starting value of the learning rate")
 parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep / lr_t0), 0 for a constant lr; defaults to N")
 parser.add_argument("--norm-clip", type=float, default=0.0,
@@ -147,6 +150,8 @@ k, L = member["k"], member.get("L", lz)          # older ansatz metas: every mem
 h = ansatz["h"] if args["h"] is None else args["h"]
 pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 nsamples, max_fs, do_ED, path = (args[key] for key in ("nbr_samples", "max_fs", "exact_diag", "path"))
+if args["save_every"] < 1:
+    parser.error("--save-every must be at least 1")
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
@@ -357,7 +362,7 @@ def ed_eigenvalue(V, U):
 
 def dense_readout():
     """<H>, fidelity with the ED target, the L of <L^2>, the leak <L^2> - L(L+1) out of the member's L (0 on an exact
-    eigenstate of it) and log10 of the largest amplitude. The state enters divided by that amplitude, taken in log
+    eigenstate of it), log10 of the largest amplitude, the normalised state and its energy variance <H^2> - <H>^2. The state enters divided by that amplitude, taken in log
     space: todense overflows float32 beyond e^88, and nothing here depends on its scale."""
     basis_ints = dense_symm.basis.states
     symm_norm = np.real(dense_symm.basis.get_amp(basis_ints))
@@ -371,11 +376,13 @@ def dense_readout():
         raise SystemExit(f"dense readout: non-finite amplitudes on {bad.sum()} of {len(p)} configurations; electrons "
                          f"per orbital of the first: {((s[:, :N] > 0).astype(int) + (s[:, N:] > 0).astype(int)).tolist()}")
     norm = np.real(np.vdot(p, p))
-    energy = np.real(np.vdot(p, H_sp @ p)) / norm
+    Hp = H_sp @ p
+    energy = np.real(np.vdot(p, Hp)) / norm
+    variance = np.real(np.vdot(Hp, Hp)) / norm - energy ** 2
     q = np.real(np.vdot(p, L2_sp @ p)) / norm
     fidelity = np.abs(np.vdot(V_ED, p))**2 / norm
     return (float(energy), float(fidelity), (-1 + np.sqrt(1 + 4*max(q, 0))) / 2, float(q - L*(L + 1)), top / np.log(10),
-            p / np.sqrt(norm))
+            p / np.sqrt(norm), float(variance))
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The target: the lowest level of the
@@ -418,7 +425,9 @@ def save_meta():
 
 
 save_meta()
-exact_rows = []
+# every data file is an append-only TableLog: one line per row as it comes, header first (np.loadtxt reads it as before)
+exact_log = TableLog(f"{path}/data_energy_exact_{run_id}.txt", ["sweep", "E", "fidelity", "L", "L2_leak", "dF", "VarE"],
+                     eager=False)
 last_dense = None
 
 
@@ -427,13 +436,13 @@ def record_exact(sweep):
     between this readout and the previous one: with --ed-every 1 the step's own, against the fs the trust region
     allowed it (fs_applied)."""
     global last_dense
-    energy, fidelity, L_q, leak, top, p = dense_readout()
+    energy, fidelity, L_q, leak, top, p, variance = dense_readout()
     dF = np.nan if last_dense is None else 1 - float(np.abs(np.vdot(last_dense, p))**2)
     last_dense = p
-    exact_rows.append((sweep, energy, fidelity, L_q, leak, dF))
-    np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows), header="sweep E fidelity L L2_leak dF")
+    exact_log.append((sweep, energy, fidelity, L_q, leak, dF, variance))
     # the member starts at norm 1, so a larger amplitude is a blow-up on configurations its fit never saw
-    return (f"dense E = {energy:.6f}, fidelity = {fidelity:.6f}, L {L_q:.2f}, L^2 leak = {leak:.2e}"
+    return (f"dense E = {energy:.6f}, VarE = {variance:.3e}, fidelity = {fidelity:.6f}, L {L_q:.2f}, "
+            f"L^2 leak = {leak:.2e}"
             + (f", dF = {dF:.2e}" if np.isfinite(dF) else "")
             + (f", log10 of the largest amplitude {top:.1f}" if sweep < 0 else ""))
 
@@ -475,7 +484,10 @@ class ObarKeepingSR(PenalizedAdamSR):
 solver = None if args["rshift"] is None else qtx.optimizer.auto_shift_eig(rshift=args["rshift"])
 optimizer = ObarKeepingSR(state, tms_H, tms_LmLp, lam, lmlp_every, solver=solver, tail=args["tail"])
 
-rows = []
+energy_log = TableLog(f"{path}/data_energy_{run_id}.txt",
+                      ["sweep", "E", "VarE", "E_H", "VarE_H", "LmLp", "VarLmLp", "step_norm", "g_norm", "fs",
+                       "fs_applied", "fs_same", "lambda", "fs_exact", "errE_H", "errLmLp", "n_eff", "tail_var",
+                       "tail_var_H", "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb"])
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
 # trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
 # sweeps of a fresh run to a smaller 1 - F
@@ -533,6 +545,7 @@ for i in range(args["nbr_sweeps"]):
 
     # checked before `update`, so the saved checkpoint remains the last good state
     if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
+        state.save(f"{path}/state0_{run_id}.eqx")
         raise RuntimeError(f"Non-finite update at sweep {i}: energy={optimizer.energy}, "
                            f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc")
 
@@ -566,15 +579,21 @@ for i in range(args["nbr_sweeps"]):
         prev_batch = keep_batch(samples)
 
     g_norm = optimizer._buffers["g_norm"]
-    rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
-                 optimizer.VarPenalty, step_norm, g_norm, fs, fs_applied, fs_same, lam, fs_exact))
-    np.savetxt(f"{path}/data_energy_{run_id}.txt",
-               np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
-               header="sweep E VarE E_H VarE_H LmLp VarLmLp step_norm g_norm fs fs_applied fs_same lambda fs_exact")
-    state.save(f"{path}/state0_{run_id}.eqx")
+    # the variances less what the tail sampling added: unbiased for the tail (0 subtracted without one)
+    tail = jax.device_get((optimizer.VarE, optimizer.tail_var, optimizer.VarE_H, optimizer.tail_var_H,
+                           optimizer.VarPenalty, optimizer.tail_var_P))
+    VarE_unb, VarE_H_unb, VarLmLp_unb = (float(v) - float(t) for v, t in zip(tail[::2], tail[1::2]))
+    energy_log.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H,
+                       optimizer.penalty_value, optimizer.VarPenalty, step_norm, g_norm, fs, fs_applied, fs_same, lam,
+                       fs_exact, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff, optimizer.tail_var,
+                       optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb))
+    if (i + 1) % args["save_every"] == 0:
+        state.save(f"{path}/state0_{run_id}.eqx")
 
     line = (f"  sweep {i:5d}  E = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
-            f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
+            + (f"(VarE_H {float(optimizer.VarE_H):.3e}, tail {float(optimizer.tail_var_H):.2e})  "
+               if args["tail"] > 0 else "")
+            + f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
             + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
             + ("  (step dropped)" if np.isinf(fs_exact) else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
@@ -582,6 +601,9 @@ for i in range(args["nbr_sweeps"]):
     if i < 5 or i % 10 == 0 or i == args["nbr_sweeps"] - 1:
         print(line, flush=True)
 
+state.save(f"{path}/state0_{run_id}.eqx")
+for log in (energy_log, exact_log):
+    log.close()
 print("VMC training completed in: ", datetime.now() - start_time)
 meta["time"] = str(datetime.now() - start_time)
 save_meta()

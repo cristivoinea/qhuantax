@@ -32,13 +32,13 @@ from quantax.nn import lecun_normal
 from quantax.utils import LogArray
 
 from qhuantax.nes import (NaturalExcitedSR, NaturalLzDetFlavourFlipSampler, NaturalLzDetPairHopSampler,
-                          NaturalLzDetSingleRowPairHopSampler, NaturalStateSet, sampled_overlap)
+                          NaturalLzDetSingleRowPairHopSampler, NaturalStateSet, sampled_subspace)
 from qhuantax.quantumhall_excitons import KSectors, rotated_vacuum_tuples
 from qhuantax.quantumhall_operators import GetL2Terms, GetLpTerms, GetSpinfulDenIntTerms, GetSpinfulPolTerms
 from qhuantax.quantumhall_symmetries import PHRyQH, RyQH, fuzzy_sphere_symmetry
 from qhuantax.quantumhall_transformer import grow_depth
 from qhuantax.quantumhall_userbasis import LzUserBasisSymmetry
-from qhuantax.quantumhall_utils import adaptive_learning_rate_inv
+from qhuantax.quantumhall_utils import TableLog, adaptive_learning_rate_inv
 from qhuantax.rotated import load_member, member_spec, set_gap, untie
 
 
@@ -436,6 +436,8 @@ def dense_readout():
     H_red = P.conj().T @ (H_sp @ P)
     ritz, C = sp.linalg.eigh((H_red + H_red.conj().T) / 2, S)
     q = np.real(np.einsum("ir,ij,jr->r", C.conj(), L2_red, C))
+    HP = H_sp @ P                                   # the energy variance of each Ritz state, <H^2> - E^2 (C^+ S C = 1)
+    ritz_var = np.real(np.einsum("ir,ij,jr->r", C.conj(), HP.conj().T @ HP, C)) - ritz ** 2
     Q = sp.linalg.orth(P)
     fidelity = np.linalg.norm(V_ED.conj().T @ Q)**2 / nstates
     # each member's L^2 outside the ED targets (exact L^2 eigenstates), per unit norm: blind to the members mixing among
@@ -444,7 +446,7 @@ def dense_readout():
     member_leak = np.real(np.diag(L2_red) - np.einsum("ta,t->a", np.abs(A)**2, L_ED * (L_ED + 1))) / np.real(np.diag(S))
     d = np.sqrt(np.real(np.diag(S)))
     return (float(np.sum(ritz)), float(fidelity), ritz, (-1 + np.sqrt(1 + 4*np.clip(q, 0, None))) / 2, float(leak),
-            member_leak, top / np.log(10), Q, overlap_summary(np.real(S) / np.outer(d, d)))
+            member_leak, top / np.log(10), Q, overlap_summary(np.real(S) / np.outer(d, d)), ritz_var)
 
 
 # ED in the Lz user basis, Z2-resolved with --z2-sect (~7e5 states at N=14, Lz=0). The targets: for every L among the
@@ -494,7 +496,11 @@ def save_meta():
 
 
 save_meta()
-exact_rows = []
+# every data file is an append-only TableLog: one line per row as it comes, header first (np.loadtxt reads it as before)
+exact_log = TableLog(f"{path}/data_energy_exact_{run_id}.txt",
+                     ["sweep", "trE", "fidelity", *(f"ritz{k}" for k in range(nstates)), "trL2",
+                      *(f"ritzL{k}" for k in range(nstates)), *(f"outL2_{k}" for k in range(nstates)), "dF",
+                      "overlap_cond", "overlap_max", *(f"ritzVar{k}" for k in range(nstates))], eager=False)
 last_span = None
 
 
@@ -503,17 +509,13 @@ def record_exact(sweep):
     of the span since the previous readout (the product of the cos^2 of the principal angles): with --ed-every 1 the
     step's own, against the trust region's fs_applied / fs_exact."""
     global last_span
-    trE, fidelity, ritz, ritz_L, leak, member_leak, top, Q, (cond, off) = dense_readout()
+    trE, fidelity, ritz, ritz_L, leak, member_leak, top, Q, (cond, off), ritz_var = dense_readout()
     dF = np.nan if last_span is None else 1 - float(np.prod(np.linalg.svd(last_span.conj().T @ Q, compute_uv=False)**2))
     last_span = Q
-    exact_rows.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, dF, cond, off))
-    np.savetxt(f"{path}/data_energy_exact_{run_id}.txt", np.array(exact_rows),
-               header="sweep trE fidelity " + " ".join(f"ritz{k}" for k in range(nstates)) + " trL2 "
-                      + " ".join(f"ritzL{k}" for k in range(nstates)) + " "
-                      + " ".join(f"outL2_{k}" for k in range(nstates)) + " dF overlap_cond overlap_max")
+    exact_log.append((sweep, trE, fidelity, *ritz, leak, *ritz_L, *member_leak, dF, cond, off, *ritz_var))
     # the members start at norm 1, so a larger amplitude is a blow-up on configurations their fits never saw
     return (f"dense trE = {trE:.6f}, fidelity = {fidelity:.6f}, Ritz = {np.round(ritz, 4)} "
-            f"(L {np.round(ritz_L, 2)}), L^2 leak = {leak:.2e}, overlap cond {cond:.1f}"
+            f"(L {np.round(ritz_L, 2)}, VarE {np.array2string(ritz_var, precision=2)}), L^2 leak = {leak:.2e}, overlap cond {cond:.1f}"
             + (f", dF = {dF:.2e}" if np.isfinite(dF) else "")
             + (f", log10 of each member's largest amplitude {np.round(top, 1)}" if sweep < 0 else ""))
 
@@ -590,12 +592,25 @@ def span_infidelity(dtheta, samples, current):
 
 
 DIAGNOSTICS_COLUMNS = ("sigma_max", "sigma_min", "rank_eff", "obar_fro2")
-rows, member_rows = [], []
+energy_log = TableLog(f"{path}/data_energy_{run_id}.txt",
+                      ["sweep", "trE", "VarE", "trE_H", "VarE_H", "trLmLp", "VarLmLp", "step_norm", "g_norm",
+                       *DIAGNOSTICS_COLUMNS, "fs", "fs_applied", "fs_same", "lambda", "moved", "valid", "fs_exact",
+                       "overlap_cond", "overlap_max", "errE_H", "errLmLp", "n_eff", "tail_var", "tail_var_H",
+                       "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb"])
+# the Ritz states of the span (not the members, whose step diagnostics are data_members): energy, variance, the
+# variance less its tail part, the tail part, effective number of slots
+states_log = TableLog(f"{path}/data_states_{run_id}.txt",
+                      ["sweep", *(f"{q}{k}" for q in ("E", "VarE", "VarE_unb", "tail_var", "n_eff")
+                                  for k in range(nstates))])
+members_log = TableLog(f"{path}/data_members_{run_id}.txt",
+                       ["sweep", *(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates))], eager=False)
 
 # --profile: wall time of each part of a sweep. Every timed call is waited on (JAX dispatches asynchronously), so the
 # parts add up to the sweep; the first sweeps also contain compilation
 PROFILE_COLUMNS = ("sample", "eloc", "ebar_rest", "obar", "solve", "update", "readout", "output", "fs_exact")
-timings, profile_rows = {}, []
+timings, profile_rows = {}, []          # the rows also kept for profile_summary
+profile_log = TableLog(f"{path}/data_profile_{run_id}.txt", ["sweep", "total", *PROFILE_COLUMNS, "rest"],
+                       eager=False, prefix="seconds:")
 
 
 def timed(key, fn):
@@ -617,20 +632,8 @@ def profile_summary(first=2):
 
 
 def write_outputs():
-    """The data files from the rows so far and the members as they stand: every --save-every sweeps, at the end and
-    before an abort. data_energy_exact is written at its own readouts."""
-    np.savetxt(f"{path}/data_energy_{run_id}.txt",
-               np.array([[np.nan if v is None else float(np.real(v)) for v in row] for row in rows]),
-               header="sweep trE VarE trE_H VarE_H trLmLp VarLmLp step_norm g_norm "
-                      + " ".join(DIAGNOSTICS_COLUMNS)
-                      + " fs fs_applied fs_same lambda moved valid fs_exact overlap_cond overlap_max errE_H errLmLp "
-                        "n_eff")
-    if member_rows:
-        np.savetxt(f"{path}/data_members_{run_id}.txt", np.array(member_rows),
-                   header="sweep " + " ".join(f"{q}{k}" for q in ("fs", "fs_same", "norm") for k in range(nstates)))
-    if profile_rows:
-        np.savetxt(f"{path}/data_profile_{run_id}.txt", np.array(profile_rows),
-                   header="seconds: sweep total " + " ".join(PROFILE_COLUMNS) + " rest")
+    """The members as they stand: every --save-every sweeps, at the end and before an abort. The data files are
+    written row by row as the sweeps go (TableLog)."""
     for index, state in enumerate(state_set.states):
         state.save(f"{path}/state{index}_{run_id}.eqx")
 
@@ -657,8 +660,17 @@ for i in range(args["nbr_sweeps"]):
     samples = sampler.sweep()
     step = optimizer.get_step(samples)
     # the members' overlaps from this sweep's tuple matrices, which the local energies just evaluated
-    overlap_cond, overlap_max = overlap_summary(sampled_overlap(optimizer._grad.last_psi_matrix,
-                                                                samples.reweight_factor))
+    # the members' overlaps, and the Ritz states' energies and variances (H alone), from this sweep's tuple matrices
+    # and the local energies just evaluated: no further evaluation
+    tail_g = optimizer.last_tail_g          # per slot, [t, i, c, d]; None without --tail
+    subspace = sampled_subspace(optimizer._grad.last_psi_matrix, optimizer._grad.last_local_H,
+                                samples.reweight_factor, tail_g=None if tail_g is None else tail_g[..., 0, 0])
+    # the variances less what the tail sampling added: unbiased for the tail (0 subtracted without one)
+    VarE_unb = float(optimizer.VarE) - float(optimizer.tail_var)
+    VarE_H_unb = float(optimizer.VarE_H) - float(optimizer.tail_var_H)
+    VarLmLp_unb = float(optimizer.VarPenalty) - float(optimizer.tail_var_P)
+    VarE_ritz_unb = subspace.variances - subspace.tail_var
+    overlap_cond, overlap_max = overlap_summary(subspace.overlap)
 
     # checked before `update`, so the checkpoints written here are the last good state
     if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
@@ -699,7 +711,7 @@ for i in range(args["nbr_sweeps"]):
         # above 1 is noise the step's batch fitted); its norm; cross terms between members are left out
         edges = np.cumsum([0, *state_set.nparams_per_state])
         blocks = list(zip(edges[:-1], edges[1:]))
-        member_rows.append((i, *(float(jnp.sum(jnp.abs(O[:, a:b] @ dtheta[a:b])**2))
+        members_log.append((i, *(float(jnp.sum(jnp.abs(O[:, a:b] @ dtheta[a:b])**2))
                                  for O in (prev_Obar, optimizer.last_Obar) for a, b in blocks),
                             *(float(jnp.linalg.norm(dtheta[a:b])) for a, b in blocks)))
     state_set.update(state_set.split_step(dtheta))
@@ -712,17 +724,23 @@ for i in range(args["nbr_sweeps"]):
     g_norm = optimizer._buffers["g_norm"]
     diag = optimizer.diagnostics if args["diagnostics"] else {}
     acceptance = sampler.acceptance if args["diagnostics"] else {}
-    rows.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
+    energy_log.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H, optimizer.penalty_value,
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
-                 fs_exact, overlap_cond, overlap_max, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff))
+                 fs_exact, overlap_cond, overlap_max, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff,
+                 optimizer.tail_var, optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb))
+    states_log.append((i, *subspace.energies, *subspace.variances, *VarE_ritz_unb, *subspace.tail_var,
+                       *subspace.n_eff))
     if (i + 1) % args["save_every"] == 0:
         write_outputs()         # the profile file one sweep behind: this sweep's row includes this write
     timings["output"] = perf_counter() - t
 
     line = (f"  sweep {i:5d}  trE = {float(optimizer.energy):.6f}  VarE = {float(optimizer.VarE):.3e}  "
             f"err E_H = {float(optimizer.ErrE_H):.1e}  n_eff/n = {float(optimizer.n_eff) / nsamples:.2f}  "
-            f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}  overlap cond = {overlap_cond:.1f}"
+            f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}  overlap cond = {overlap_cond:.1f}  "
+            f"Ritz E = {np.round(subspace.energies, 4)}  VarE = {np.array2string(subspace.variances, precision=2)}"
+            + (f" (tail {np.array2string(subspace.tail_var, precision=2)}; VarE_H {float(optimizer.VarE_H):.3e}, "
+               f"tail {float(optimizer.tail_var_H):.2e})" if tail_g is not None else "")
             + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
             + ("  (step dropped)" if np.isinf(fs_exact) else "")
             + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
@@ -738,10 +756,13 @@ for i in range(args["nbr_sweeps"]):
         timings["ebar_rest"] = timings.get("ebar", 0.0) - timings.get("eloc", 0.0)
         parts = [timings.get(c, 0.0) for c in PROFILE_COLUMNS]
         profile_rows.append([i, total, *parts, total - sum(parts)])
+        profile_log.append(profile_rows[-1])
         if i in (10, 50) or i == args["nbr_sweeps"] - 1:
             print("  profile: " + profile_summary(), flush=True)
 
 write_outputs()
+for log in (energy_log, states_log, members_log, profile_log, exact_log):
+    log.close()
 print("NES training completed in: ", datetime.now() - start_time)
 meta["time"] = str(datetime.now() - start_time)
 save_meta()

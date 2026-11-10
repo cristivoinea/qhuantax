@@ -612,6 +612,50 @@ class PenaltySplitGrad:
         Eloc = Eloc - jnp.sum(Eloc) / nfinite
         return Eloc * jnp.sqrt(reweight_factor / nsamples)
 
+    _tail_var = _tail_var_H = _tail_var_P = 0.0
+
+    def _record_tail_from(self, G, Eloc, reweight_factor, ncomp: int) -> None:
+        r"""
+        Store the variance the tail sampling added to ``VarE``, ``VarE_H`` and ``VarPenalty`` this step.
+
+        ``G[t]`` is the added variance matrix of sample t over the components, ``(nsamples, ncomp, ncomp)``,
+        whose average over the sampled distribution is exactly the added (co)variance (`PooledOperator`'s
+        ``tail_variance``; a single state takes its g as it is, NES a tuple's sum over slots). It is averaged
+        with the reweight factors and discarded samples of `_record`, so ``VarE - tail_var`` estimates the
+        variance without the tail; ``G = None`` (no tail) gives 0. The combination for ``VarE`` is
+        :math:`(1, \lambda)`: the components share the draw.
+        """
+        if G is None:
+            self._tail_var = self._tail_var_H = 0.0
+            self._tail_var_P = 0.0 if ncomp == 2 else jnp.nan
+            return
+        finite = jnp.isfinite(Eloc)
+        w = jnp.where(finite, reweight_factor, 0.0)
+        G = jnp.where(finite[:, None, None], G, 0.0)
+        mean = jnp.real(jnp.mean(G * w[:, None, None], axis=0))
+        self._tail_var_H = mean[0, 0]
+        if mean.shape[0] == 2:
+            lam = self._penalty_coeff
+            self._tail_var_P = mean[1, 1]
+            self._tail_var = mean[0, 0] + 2 * lam * mean[0, 1] + lam ** 2 * mean[1, 1]
+        else:
+            self._tail_var_P, self._tail_var = jnp.nan, mean[0, 0]
+
+    @property
+    def tail_var(self):
+        """The part of ``VarE`` the tail sampling added this step; 0 without a tail."""
+        return self._tail_var
+
+    @property
+    def tail_var_H(self):
+        """The part of ``VarE_H`` the tail sampling added this step; 0 without a tail."""
+        return self._tail_var_H
+
+    @property
+    def tail_var_P(self):
+        """The part of ``VarPenalty`` the tail sampling added this step (``nan`` on steps without P)."""
+        return self._tail_var_P
+
 
 class PenalizedEnergyGrad(PenaltySplitGrad, EnergyGrad):
     r"""Single-state energy gradient against :math:`H + \lambda P`, see `PenaltySplitGrad`."""
@@ -629,8 +673,18 @@ class PenalizedEnergyGrad(PenaltySplitGrad, EnergyGrad):
             reweight_factor = samples.reweight_factor
 
         with_penalty = self._resolve()
-        values = self.pooled_operator(with_penalty).Oloc(state, samples).astype(get_default_dtype())
-        return self._record(*self._combine(list(values.T), with_penalty), reweight_factor)
+        pooled = self.pooled_operator(with_penalty)
+        G = None
+        if pooled.tail > 0:
+            # one state: the added variance of a sample is its own g (no other slots to subtract)
+            values, G = pooled.Oloc(state, samples, tail_variance=True)
+        else:
+            values = pooled.Oloc(state, samples)
+        values = values.astype(get_default_dtype())
+        Ebar = self._record(*self._combine(list(values.T), with_penalty), reweight_factor)
+        Eloc = values[:, 0] if pooled.ncomp == 1 else values[:, 0] + self._penalty_coeff * values[:, 1]
+        self._record_tail_from(G, Eloc, reweight_factor, pooled.ncomp)
+        return Ebar
 
 
 class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
@@ -690,3 +744,33 @@ class PenalizedAdamSR(qtx.optimizer.StochasticQNGD):
     def nonfinite(self):
         r"""Samples dropped for a non-finite local energy, see the gradient source."""
         return getattr(self._grad, "nonfinite", None)
+
+    @property
+    def ErrE_H(self):
+        r"""Statistical error of ``energy_H`` over the last batch, see the gradient source."""
+        return getattr(self._grad, "ErrE_H", None)
+
+    @property
+    def ErrPenalty(self):
+        r"""Statistical error of ``penalty_value`` over the last batch, see the gradient source."""
+        return getattr(self._grad, "ErrPenalty", None)
+
+    @property
+    def n_eff(self):
+        r"""Effective number of samples of the last batch, see the gradient source."""
+        return getattr(self._grad, "n_eff", None)
+
+    @property
+    def tail_var(self):
+        r"""The part of ``VarE`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var", None)
+
+    @property
+    def tail_var_H(self):
+        r"""The part of ``VarE_H`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var_H", None)
+
+    @property
+    def tail_var_P(self):
+        r"""The part of ``VarPenalty`` added by the tail sampling, see the gradient source."""
+        return getattr(self._grad, "tail_var_P", None)

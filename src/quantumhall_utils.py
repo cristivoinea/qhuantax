@@ -306,3 +306,40 @@ def build_root_U_perturbed(N: int, L: int, eps: float = 1e-3, dtype=jnp.float64)
     U = U + eps * rng.standard_normal(U.shape)
     q, _ = np.linalg.qr(U)
     return jnp.asarray(q[:, :N], dtype=dtype)
+
+class TableLog:
+    r"""
+    An append-only table of numbers in ``np.savetxt``'s format (``#`` header, ``%.18e`` columns), so ``np.loadtxt``
+    and the column-by-name readers see the same file as before.
+
+    The header is written when the file is created, and every row is written as one line on `append` (line
+    buffered): the file is always current, a row costs the same at sweep 10 as at sweep 10000, and a killed run
+    keeps every row written so far. A row is converted once, with one ``jax.device_get`` for all its entries
+    (``None`` reads as ``nan``), not on every save. The file is created on the first row unless `eager`;
+    `prefix` goes in the header line before the column names (e.g. a unit).
+    """
+
+    def __init__(self, filename, columns, eager: bool = True, prefix: str = ""):
+        self.filename = str(filename)
+        self.columns = list(columns)
+        self.prefix = prefix
+        self._file = None
+        if eager:
+            self._open()
+
+    def _open(self):
+        self._file = open(self.filename, "w", buffering=1)
+        self._file.write("# " + (self.prefix + " " if self.prefix else "") + " ".join(self.columns) + "\n")
+
+    def append(self, values) -> None:
+        values = jax.device_get(list(values))
+        row = [np.nan if v is None else float(np.real(v)) for v in values]
+        if len(row) != len(self.columns):
+            raise ValueError(f"{self.filename}: {len(row)} values for {len(self.columns)} columns")
+        if self._file is None:
+            self._open()
+        self._file.write(" ".join(f"{v:.18e}" for v in row) + "\n")
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()

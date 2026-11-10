@@ -13,6 +13,8 @@ from .state_set import NaturalStateSet
 from .subspace import (
     dense_reduced_matrices,
     sampled_overlap,
+    sampled_subspace,
+    SubspaceEstimate,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "NaturalExcitedSR",
     "dense_reduced_matrices",
     "sampled_overlap",
+    "sampled_subspace",
+    "SubspaceEstimate",
 ]
