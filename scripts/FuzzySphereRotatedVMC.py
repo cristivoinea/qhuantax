@@ -112,6 +112,10 @@ parser.add_argument("--norm-clip", type=float, default=0.0,
                     help="cap on the step norm before the learning rate; <= 0 disables")
 parser.add_argument("--rshift", type=float, default=None,
                     help="relative diagonal shift of the SR solve; defaults to quantax's")
+parser.add_argument("--max-bad-steps", type=int, default=3,
+                    help="a non-finite SR step is discarded with the Adam moments it fed and the sweep redone on fresh "
+                         "samples; this many in a row stop the run, the last good member written (1 stops on the "
+                         "first, as before)")
 parser.add_argument("--max-fs", type=float, default=0.0,
                     help="trust region: cap on 1 - F per sweep, F the fidelity of the state before and after the "
                          "update, to second order dtheta^T S dtheta with S from the previous sweep; 0 disables")
@@ -152,6 +156,8 @@ pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 nsamples, max_fs, do_ED, path = (args[key] for key in ("nbr_samples", "max_fs", "exact_diag", "path"))
 if args["save_every"] < 1:
     parser.error("--save-every must be at least 1")
+if args["max_bad_steps"] < 1:
+    parser.error("--max-bad-steps must be at least 1")
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
@@ -487,7 +493,7 @@ optimizer = ObarKeepingSR(state, tms_H, tms_LmLp, lam, lmlp_every, solver=solver
 energy_log = TableLog(f"{path}/data_energy_{run_id}.txt",
                       ["sweep", "E", "VarE", "E_H", "VarE_H", "LmLp", "VarLmLp", "step_norm", "g_norm", "fs",
                        "fs_applied", "fs_same", "lambda", "fs_exact", "errE_H", "errLmLp", "n_eff", "tail_var",
-                       "tail_var_H", "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb"])
+                       "tail_var_H", "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb", "bad_steps"])
 # The size of a step is measured on an independent batch, the previous sweep's (an extra one before sweep 0 with a
 # trust region): on the batch the step was solved from, |Obar dtheta|^2 is biased low. --warmup-fs holds the first
 # sweeps of a fresh run to a smaller 1 - F
@@ -538,16 +544,42 @@ def step_infidelity(dtheta, batch, current):
     return float(1 - np.sum(w * r)**2 / (np.sum(w) * np.sum(w * r**2)))
 
 
+def bad_step_cause():
+    """What a non-finite step came from, for the log: Adam's first solve (the plain SR g) or its second (on Obar / V)
+    and its arithmetic, and how large the inputs were."""
+    g_norm = float(optimizer._buffers["g_norm"])
+    where = "second solve or Adam" if np.isfinite(g_norm) else "first solve"
+    return (f"energy {float(optimizer.energy):.6f}, |g| {g_norm:.3e} ({where}), "
+            f"max |Obar| {float(jnp.max(jnp.abs(optimizer.last_Obar))):.3e}, "
+            f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc")
+
+
+def sample_and_solve(i):
+    """This sweep's samples and SR step, and how many non-finite steps were discarded on the way. A non-finite step
+    from finite inputs is a one-off (NES at N=24, id07, died on one at sweep 3242 of 3600, 25 h in, with no sample
+    dropped and nothing drifting before it; most likely the GPU eigensolver failing on one Gram matrix): it is
+    discarded with the Adam moments it fed, which a NaN g would otherwise leave NaN for good, and the sweep redone on
+    the chains' next samples. --max-bad-steps in a row stop the run with the member written: the last good state,
+    nothing having been applied. `solve` donates the buffers it is given, so the kept ones are copies."""
+    for bad in range(args["max_bad_steps"]):
+        buffers = jax.tree_util.tree_map(jnp.copy, optimizer._buffers)
+        samples = sampler.sweep()
+        step = optimizer.get_step(samples)
+        if jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy):
+            return samples, step, bad
+        cause = bad_step_cause()
+        optimizer._buffers = buffers
+        print(f"  sweep {i:5d}  non-finite step discarded ({bad + 1} in a row, --max-bad-steps "
+              f"{args['max_bad_steps']}): {cause}", flush=True)
+    state.save(f"{path}/state0_{run_id}.eqx")
+    raise RuntimeError(f"Non-finite update at sweep {i}, {args['max_bad_steps']} in a row: {cause}")
+
+
 start_time = datetime.now()
 for i in range(args["nbr_sweeps"]):
-    samples = sampler.sweep()
-    step = optimizer.get_step(samples)
-
-    # checked before `update`, so the saved checkpoint remains the last good state
-    if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
-        state.save(f"{path}/state0_{run_id}.eqx")
-        raise RuntimeError(f"Non-finite update at sweep {i}: energy={optimizer.energy}, "
-                           f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc")
+    # checked before `update`: a non-finite step is redone on fresh samples, and the run stopped with the last good
+    # member after --max-bad-steps in a row
+    samples, step, bad_steps = sample_and_solve(i)
 
     # cap the step norm, then (--max-fs) the step's 1 - F: `fs` on the previous sweep's batch, `fs_same` on this one
     step_norm = float(jnp.linalg.norm(step))
@@ -586,7 +618,7 @@ for i in range(args["nbr_sweeps"]):
     energy_log.append((i, optimizer.energy, optimizer.VarE, optimizer.energy_H, optimizer.VarE_H,
                        optimizer.penalty_value, optimizer.VarPenalty, step_norm, g_norm, fs, fs_applied, fs_same, lam,
                        fs_exact, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff, optimizer.tail_var,
-                       optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb))
+                       optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb, bad_steps))
     if (i + 1) % args["save_every"] == 0:
         state.save(f"{path}/state0_{run_id}.eqx")
 
@@ -595,7 +627,8 @@ for i in range(args["nbr_sweeps"]):
                if args["tail"] > 0 else "")
             + f"|step| = {step_norm:.3e}  |g| = {float(g_norm):.3e}  fs = {fs:.2e}"
             + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
-            + ("  (step dropped)" if np.isinf(fs_exact) else ""))
+            + ("  (step dropped)" if np.isinf(fs_exact) else "")
+            + (f"  ({bad_steps} non-finite step{'s' if bad_steps > 1 else ''} redone)" if bad_steps else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         line += "  | " + record_exact(i)
     if i < 5 or i % 10 == 0 or i == args["nbr_sweeps"] - 1:

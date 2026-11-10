@@ -103,6 +103,10 @@ parser.add_argument("--norm-clip", type=float, default=0.0,
                     help="cap on the step norm before the learning rate; <= 0 disables")
 parser.add_argument("--rshift", type=float, default=None,
                     help="relative diagonal shift of the SR solve; defaults to quantax's")
+parser.add_argument("--max-bad-steps", type=int, default=3,
+                    help="a non-finite SR step is discarded with the Adam moments it fed and the sweep redone on fresh "
+                         "samples; this many in a row stop the run, the last good members written (1 stops on the "
+                         "first, as before)")
 parser.add_argument("--max-fs", type=float, default=0.0,
                     help="trust region: cap on 1 - F per sweep, F the fidelity of the spans before and after the "
                          "update, to second order dtheta^T S dtheta with S from the previous sweep; 0 disables")
@@ -166,6 +170,8 @@ pspot_inter = np.array([float(v) for v in ansatz["args"]["ps_pot"].split(",")])
 nsamples, max_fs, do_ED, path = (args[k] for k in ("nbr_samples", "max_fs", "exact_diag", "path"))
 if args["save_every"] < 1:
     parser.error("--save-every must be at least 1")
+if args["max_bad_steps"] < 1:
+    parser.error("--max-bad-steps must be at least 1")
 t0 = N if args["lr_t0"] is None else args["lr_t0"]
 
 
@@ -596,7 +602,7 @@ energy_log = TableLog(f"{path}/data_energy_{run_id}.txt",
                       ["sweep", "trE", "VarE", "trE_H", "VarE_H", "trLmLp", "VarLmLp", "step_norm", "g_norm",
                        *DIAGNOSTICS_COLUMNS, "fs", "fs_applied", "fs_same", "lambda", "moved", "valid", "fs_exact",
                        "overlap_cond", "overlap_max", "errE_H", "errLmLp", "n_eff", "tail_var", "tail_var_H",
-                       "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb"])
+                       "tail_var_LmLp", "VarE_unb", "VarE_H_unb", "VarLmLp_unb", "bad_steps"])
 # the Ritz states of the span (not the members, whose step diagnostics are data_members): energy, variance, the
 # variance less its tail part, the tail part, effective number of slots
 states_log = TableLog(f"{path}/data_states_{run_id}.txt",
@@ -638,6 +644,38 @@ def write_outputs():
         state.save(f"{path}/state{index}_{run_id}.eqx")
 
 
+def bad_step_cause():
+    """What a non-finite step came from, for the log: Adam's first solve (the plain SR g) or its second (on Obar / V)
+    and its arithmetic, and how large the inputs were."""
+    g_norm = float(optimizer._buffers["g_norm"])
+    where = "second solve or Adam" if np.isfinite(g_norm) else "first solve"
+    return (f"energy {float(optimizer.energy):.6f}, |g| {g_norm:.3e} ({where}), "
+            f"max |Obar| {float(jnp.max(jnp.abs(optimizer.last_Obar))):.3e}, "
+            f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc, "
+            f"{optimizer.nonfinite_grad} for the log-derivative")
+
+
+def sample_and_solve(i):
+    """This sweep's samples and SR step, and how many non-finite steps were discarded on the way. A non-finite step
+    from finite inputs is a one-off (N=24 id07 died on one at sweep 3242 of 3600, 25 h in, with no sample dropped and
+    nothing drifting before it; most likely the GPU eigensolver failing on one Gram matrix): it is discarded with the
+    Adam moments it fed, which a NaN g would otherwise leave NaN for good, and the sweep redone on the chains' next
+    samples. --max-bad-steps in a row stop the run with the members written: the last good state, nothing having
+    been applied. `solve` donates the buffers it is given, so the kept ones are copies."""
+    for bad in range(args["max_bad_steps"]):
+        buffers = jax.tree_util.tree_map(jnp.copy, optimizer._buffers)
+        samples = sampler.sweep()
+        step = optimizer.get_step(samples)
+        if jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy):
+            return samples, step, bad
+        cause = bad_step_cause()
+        optimizer._buffers = buffers
+        print(f"  sweep {i:5d}  non-finite step discarded ({bad + 1} in a row, --max-bad-steps "
+              f"{args['max_bad_steps']}): {cause}", flush=True)
+    write_outputs()
+    raise RuntimeError(f"Non-finite update at sweep {i}, {args['max_bad_steps']} in a row: {cause}")
+
+
 if args["profile"]:
     sampler.sweep = timed("sample", sampler.sweep)
     for pooled in optimizer._grad.pooled_operators:        # H alone, and H with L^- L^+: one pooled evaluation each
@@ -657,9 +695,9 @@ start_time = datetime.now()
 for i in range(args["nbr_sweeps"]):
     timings.clear()
     t_sweep = perf_counter()
-    samples = sampler.sweep()
-    step = optimizer.get_step(samples)
-    # the members' overlaps from this sweep's tuple matrices, which the local energies just evaluated
+    # checked before `update`: a non-finite step is redone on fresh samples, and the run stopped with the last good
+    # members after --max-bad-steps in a row
+    samples, step, bad_steps = sample_and_solve(i)
     # the members' overlaps, and the Ritz states' energies and variances (H alone), from this sweep's tuple matrices
     # and the local energies just evaluated: no further evaluation
     tail_g = optimizer.last_tail_g          # per slot, [t, i, c, d]; None without --tail
@@ -671,13 +709,6 @@ for i in range(args["nbr_sweeps"]):
     VarLmLp_unb = float(optimizer.VarPenalty) - float(optimizer.tail_var_P)
     VarE_ritz_unb = subspace.variances - subspace.tail_var
     overlap_cond, overlap_max = overlap_summary(subspace.overlap)
-
-    # checked before `update`, so the checkpoints written here are the last good state
-    if not (jnp.all(jnp.isfinite(step)) and np.isfinite(optimizer.energy)):
-        write_outputs()
-        raise RuntimeError(f"Non-finite update at sweep {i}: energy={optimizer.energy}, "
-                           f"{optimizer.nonfinite} of {nsamples} samples dropped for Eloc, "
-                           f"{optimizer.nonfinite_grad} for the log-derivative")
 
     # cap the step norm, then (--max-fs) the step's 1 - F: `fs` on the previous sweep's batch, `fs_same` on this one
     t = perf_counter()
@@ -728,7 +759,8 @@ for i in range(args["nbr_sweeps"]):
                  optimizer.VarPenalty, step_norm, g_norm, *(diag.get(key) for key in DIAGNOSTICS_COLUMNS),
                  fs, fs_applied, fs_same, optimizer.penalty_coeff, acceptance.get("moved"), acceptance.get("valid"),
                  fs_exact, overlap_cond, overlap_max, optimizer.ErrE_H, optimizer.ErrPenalty, optimizer.n_eff,
-                 optimizer.tail_var, optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb))
+                 optimizer.tail_var, optimizer.tail_var_H, optimizer.tail_var_P, VarE_unb, VarE_H_unb, VarLmLp_unb,
+                 bad_steps))
     states_log.append((i, *subspace.energies, *subspace.variances, *VarE_ritz_unb, *subspace.tail_var,
                        *subspace.n_eff))
     if (i + 1) % args["save_every"] == 0:
@@ -743,6 +775,7 @@ for i in range(args["nbr_sweeps"]):
                f"tail {float(optimizer.tail_var_H):.2e})" if tail_g is not None else "")
             + (f"  fs_exact = {fs_exact:.2e}" if not np.isnan(fs_exact) else "")
             + ("  (step dropped)" if np.isinf(fs_exact) else "")
+            + (f"  ({bad_steps} non-finite step{'s' if bad_steps > 1 else ''} redone)" if bad_steps else "")
             + (f"  acceptance = {acceptance['moved'] / max(acceptance['valid'], 1e-12):.3f}" if acceptance else ""))
     if do_ED and (i % args["ed_every"] == 0 or i == args["nbr_sweeps"] - 1):
         t = perf_counter()
