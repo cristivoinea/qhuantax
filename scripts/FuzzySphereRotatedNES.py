@@ -103,6 +103,11 @@ parser.add_argument("--lr-t0", type=float, default=None, help="lr / (1 + sweep /
 parser.add_argument("--norm-clip", type=float, default=0.0,
                     help="cap on the step norm before the learning rate; <= 0 disables")
 add_solver_arguments(parser)        # --solver, --rshift, --pinv-rtol, --tol-snr
+parser.add_argument("--updater", choices=("adam", "plain"), default="adam",
+                    help="adam: AdamSR (quantax Adam, mu 0.95, beta 0.995: momentum plus a fit preconditioned by "
+                         "v^(1/4)); plain: the SR solve itself, no memory between sweeps. On the step's own batch "
+                         "both give the same change, Obar dtheta = lr Ebar; they differ in the directions the batch "
+                         "does not see")
 parser.add_argument("--max-bad-steps", type=int, default=3,
                     help="a non-finite SR step is discarded with the Adam moments it fed and the sweep redone on fresh "
                          "samples; this many in a row stop the run, the last good members written (1 stops on the "
@@ -548,6 +553,18 @@ class LoggedAdam(qtx.optimizer.Adam):
         return step, buffers
 
 
+class LoggedPlain(qtx.optimizer.PlainUpdater):
+    """Plain SR (--updater plain): the step is the solve g, whose norm goes in the buffers as for LoggedAdam."""
+
+    def init(self, nparams):
+        return {**super().init(nparams), "g_norm": jnp.zeros(())}
+
+    def update(self, core_solve, Obar, Ebar, buffers):
+        step, buffers = super().update(core_solve, Obar, Ebar, buffers)
+        buffers["g_norm"] = jnp.linalg.norm(step)
+        return step, buffers
+
+
 class ObarKeepingSR(NaturalExcitedSR):
     """Keeps the last Obar. (The retired L-aware metric, --lmetric, also hooked in here: qhuantax/archive/
     nes_lmetric.py.)"""
@@ -558,7 +575,8 @@ class ObarKeepingSR(NaturalExcitedSR):
 
 
 solver = solver_from_args(args)     # default shift_eig: quantax's shifted solve by eigendecomposition
-optimizer = ObarKeepingSR(state_set, tms_H, updater=LoggedAdam(), solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
+updater = LoggedAdam() if args["updater"] == "adam" else LoggedPlain()
+optimizer = ObarKeepingSR(state_set, tms_H, updater=updater, solver=solver, penalty=tms_LmLp, penalty_coeff=lam,
                           penalty_every=lmlp_every, diagnostics=args["diagnostics"], tail=args["tail"])
 
 
