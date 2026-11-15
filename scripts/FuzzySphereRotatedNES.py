@@ -1,6 +1,6 @@
 # NES at transverse field h from the rotated exciton members of FuzzySphereRotatedAnsatz.py, in its Lz sector (--lz),
 # each member with its own L >= Lz (--L-sect there). The members are released before training: untied (the features may
-# then see the flavour; no amplitude changes), the k=2 up-feature suppression lowered to exp(-gap), and the k=0,1
+# then see the flavour; no amplitude changes), the k>=2 up-feature suppression lowered to exp(-gap), and the k=0,1
 # determinants (W = 0, where the network has no gradient) given a small random backflow; the angle trains. The
 # L^- L^+ penalty vanishes on L = Lz and lifts a level of L > Lz by lambda [L(L+1) - Lz(Lz+1)], so it suits members that
 # all have L = Lz; with members of higher L (e.g. K=6 at Lz=0: four L=0 and the two L=2 levels below them) leave it off
@@ -70,16 +70,16 @@ parser.add_argument("--no-untie", action="store_true", help="keep the features c
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 members: W = this x the default random init; 0 keeps W = 0")
 parser.add_argument("--gap", type=float, default=8.0,
-                    help="k=2 members, and k=1 ones with a live backflow: up features suppressed by exp(-gap); the "
+                    help="k>=2 members, and k=1 ones with a live backflow: up features suppressed by exp(-gap); the "
                          "live k=0 one: down features; <= 0 keeps the ansatz's")
 parser.add_argument("--lmlp-coeff", default="0",
                     help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
                          "lowest level of every L > Lz --lmlp-margin above the K-th L = Lz one, and at least the "
-                         "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-14, other "
-                         "N extrapolated). With members of L > Lz, the floor alone")
+                         "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-18, other "
+                         "N extrapolated quadratically in 1/sqrt(N)). With members of L > Lz, the floor alone")
 parser.add_argument("--lmlp-margin", type=float, default=1.0,
-                    help="auto: energy by which the L > Lz levels must clear the K targets; the a + b/sqrt(N) "
-                         "extrapolation of the ED gaps misses by ~0.1-0.5 already from N = 9-12 to 14")
+                    help="auto: energy by which the L > Lz levels must clear the K targets; the extrapolated ED gaps "
+                         "miss the N = 24 DMRG levels by 0.11 on average, 0.65 at most")
 parser.add_argument("--lmlp-floor-gap", type=float, default=20.0,
                     help="auto: floor on lambda, kept when the levels need less, as the energy by which it lifts a "
                          "random state of the Lz sector, taken for the L > Lz admixture the members pick up in "
@@ -322,7 +322,7 @@ def release(member):
 if cont_run_id is None:
     models = [release(member) for member in ansatz["members"]]
     start = (f"theta {np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}, "
-             f"k=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
+             f"k>=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
 else:
     models = [load_member(m["spec"], N, f"{path}/{m['file']}") for m in cont_meta["members"]]
     cont_lam = cont_meta.get("lam_bump", {}).get("lam_to", cont_meta["lam"])     # older runs could double lambda

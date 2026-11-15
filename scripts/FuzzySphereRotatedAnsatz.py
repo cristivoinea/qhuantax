@@ -6,14 +6,17 @@
 #   k=1  the exciton B_{L,Lz}|Up>, one block determinant as k=2's (holes t^{L,Lz}_{j+Lz,j}, particles all ones; exact
 #        at W = 0 at every Lz) with W fitted (live); zero: the plain determinant with W = 0, at Lz = 0 and L >= 1 that
 #        determinant minus the vacuum
-#   k=2  --nbr-dets charge-only block determinants on one shared network, fitted once to the exact
-#        two-exciton state; 1-F is reported (a stuck fit plateaus at 1e-3 - 1e-2: more dets or another seed)
+#   k>=2 --nbr-dets charge-only block determinants on one shared network (N-k core columns for the up electrons, k
+#        excitation columns for the flipped ones), fitted once to the exact k-exciton state; 1-F is reported (a stuck
+#        fit plateaus at 1e-3 - 1e-2: more dets or another seed). The fit is an exact sum over sector k, which grows
+#        as ~N^(2k-1): at N=24, Lz=3, 2112 configurations for k=2 and 96762 for k=3
 # With charge-only features R(theta) only rotates the orbital rows, so setting theta is the rotation.
 #
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 0,1,2,2 --nbr-dets 4 --check --path runs/rot
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 2 --k-root 1 --run-id 2 --path runs/rot
 #   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --k-sect 0,1,2,2,2,1 --L-sect 0,0,0,0,2,2 --path runs/rot
-# --parallel fits the k=2 members at the same time: the parent computes the targets once and starts one child
+#   python FuzzySphereRotatedAnsatz.py -n 8 --h 3.16 --lz 3 --z2-sect -1 --k-sect 3 --L-sect 3 --check --path runs/rot
+# --parallel fits the k>=2 members at the same time: the parent computes the targets once and starts one child
 # process per member (this script with --fit-member), each pinned to an equal share of the job's CPUs and splitting
 # its fit over half as many JAX devices; it then collects them into the one meta file.
 import argparse
@@ -50,14 +53,14 @@ parser.add_argument("-n", type=int, required=True, help="number of particles = n
 parser.add_argument("--lz", type=int, default=0, help="Lz sector (>= 0)")
 parser.add_argument("--z2-sect", type=int, default=1, choices=(1, -1), help="Z2 symmetry sector")
 parser.add_argument("--h", type=float, required=True, help="transverse field")
-parser.add_argument("--k-sect", required=True, help="exciton number k <= 2 of each member, e.g. 0,1,2,2")
+parser.add_argument("--k-sect", required=True, help="exciton number k of each member, e.g. 0,1,2,2 or 3")
 parser.add_argument("--L-sect", default=None,
                     help="angular momentum L >= Lz of each member, e.g. 0,0,0,0,2,2; defaults to L = Lz for all")
 parser.add_argument("--k-root", default=None,
                     help="root of each member among the states of its (k, L), 0 the lowest, e.g. 0,0,0,1; defaults "
                          "to the next root for a repeated (k, L)")
 parser.add_argument("--ry-ph-sect", type=int, default=None, choices=(1, -1),
-                    help="put every member in this sector of particle-hole x Ry (eigenvalue P (-1)^L): the k=2 roots "
+                    help="put every member in this sector of particle-hole x Ry (eigenvalue P (-1)^L): the k>=2 roots "
                          "are counted within it (--k-root) and fitted as projected models, k=0 and k=1 must have it; "
                          "not imposed if omitted. Pass the same value to FuzzySphereRotatedNES.py")
 parser.add_argument("--theta", type=float, default=None,
@@ -67,7 +70,7 @@ parser.add_argument("--ps-pot", default="4.75,1", help="inter-flavour pseudopote
 parser.add_argument("--attn-dim", type=int, default=16, help="attention dimension of the transformer")
 parser.add_argument("--nbr-blocks", type=int, default=4, help="number of layers in the transformer")
 parser.add_argument("--nbr-heads", type=int, default=4, help="number of attention heads in the transformer")
-parser.add_argument("--nbr-dets", type=int, default=6, help="k=2: number of block determinants")
+parser.add_argument("--nbr-dets", type=int, default=6, help="k>=2: number of block determinants")
 parser.add_argument("--gap", type=float, default=20.0,
                     help="k>=1: up features suppressed by exp(-gap); k=0 with --k01-backflow live: down features")
 parser.add_argument("--k01-backflow", default="live", choices=("live", "zero"),
@@ -76,13 +79,13 @@ parser.add_argument("--k01-backflow", default="live", choices=("live", "zero"),
                          "their networks have gradients from the start and --max-fs sees their steps; zero: the exact "
                          "determinants with W = 0 of the older ansatz runs (NES/VMC then release them with a small "
                          "random W)")
-parser.add_argument("--pretrain-steps", type=int, default=4000, help="k=2: number of fit steps")
-parser.add_argument("--pretrain-lr", type=float, default=1e-2, help="k=2: fit learning rate")
+parser.add_argument("--pretrain-steps", type=int, default=4000, help="k>=1: number of fit steps")
+parser.add_argument("--pretrain-lr", type=float, default=1e-2, help="k>=1: fit learning rate")
 parser.add_argument("--pretrain-lr-t0", type=float, default=None,
-                    help="k=2: learning rate decay, lr / (1 + step / t0); defaults to a quarter of --pretrain-steps")
-parser.add_argument("--pretrain-log-every", type=int, default=500, help="k=2: record 1-F every this many steps")
+                    help="k>=1: learning rate decay, lr / (1 + step / t0); defaults to a quarter of --pretrain-steps")
+parser.add_argument("--pretrain-log-every", type=int, default=500, help="k>=1: record 1-F every this many steps")
 parser.add_argument("--parallel", action="store_true",
-                    help="fit the k=2 members at the same time, one process each on an equal share of the job's CPUs "
+                    help="fit the k>=2 members at the same time, one process each on an equal share of the job's CPUs "
                          "(Linux)")
 parser.add_argument("--fit-member", type=int, default=None, help=argparse.SUPPRESS)    # a child of --parallel
 parser.add_argument("--check", action="store_true", help="compare the members with ED at h (N <= 12)")
@@ -106,15 +109,16 @@ members = int_list(args["k_sect"])
 Ls = [lz] * len(members) if args["L_sect"] is None else int_list(args["L_sect"])
 kL = list(zip(members, Ls))
 roots = [kL[:i].count(s) for i, s in enumerate(kL)] if args["k_root"] is None else int_list(args["k_root"])
-k2 = [i for i, k in enumerate(members) if k == 2]
+fitted = [i for i, k in enumerate(members) if k >= 2]          # the multi-det block fits
+fitted_ks = sorted({members[i] for i in fitted})
 pspot_inter = np.array([float(v) for v in args["ps_pot"].split(",")])
 d, nb, nh = args["attn_dim"], args["nbr_blocks"], args["nbr_heads"]
 ndets = args["nbr_dets"]
 path = args["path"]
 run_id = f"n_{N}_2s_{N-1}_lz_{lz}_z2_{z2}_ryph_{ry_ph or 0}_h_{h:g}_id0{args['run_id']}"     # ryph 0: not imposed
 
-if any(k not in (0, 1, 2) for k in members):
-    parser.error("--k-sect: only k = 0, 1, 2 are implemented")
+if any(not 0 <= k <= N for k in members):
+    parser.error(f"--k-sect: 0 <= k <= N = {N}")
 if len(roots) != len(members) or len(Ls) != len(members):
     parser.error(f"--k-root/--L-sect give {len(roots)}/{len(Ls)} values for {len(members)} members")
 if lz < 0 or any(L < lz for L in Ls):
@@ -138,7 +142,7 @@ qtx.set_default_dtype(jnp.float64)
 lattice = qtx.sites.Chain(L=N, boundary=0, particle_type="spinful_fermion", Nparticles=N)
 symm = fuzzy_sphere_symmetry(z2=z2, phry=ry_ph)
 ksectors = KSectors(N, lz)
-work = f"{path}/work_{run_id}"         # --parallel: the k=2 targets from the parent, the members from the children
+work = f"{path}/work_{run_id}"         # --parallel: the k>=2 targets from the parent, the members from the children
 U_phry = PHRyQH(1)
 
 
@@ -193,32 +197,33 @@ def save_member(i, k, root, model, start_time, **fit):
     return info, model
 
 
-def fit_k2(i, root, spins2, target, E_exact, H2):
-    """Member i: --nbr-dets block determinants fitted to root `root` of its L in the k=2 sector at h = 0; with
-    --ry-ph-sect the projected model is fitted (what NES uses), at no extra cost since the images are k=2
+def fit_block(i, root, spins, target, E_exact, Hk):
+    """Member i: --nbr-dets block determinants fitted to root `root` of its L in its sector k >= 2 at h = 0; with
+    --ry-ph-sect the projected model is fitted (what NES uses), at no extra cost since the images are sector-k
     configurations too."""
     start_time = time.time()
-    label = f"member {i} (k=2 L={Ls[i]} root {root}):"
-    images = None if ry_ph is None else image_map(spins2)
-    model, masks = multidet_block_reference(new_net(), d, N, 2, ndets, gap=args["gap"], seed=args["seed"] + i)
-    model, hist, _ = pretrain_exact(model, spins2, target, masks, steps=args["pretrain_steps"], lr=args["pretrain_lr"],
+    k = members[i]
+    label = f"member {i} (k={k} L={Ls[i]} root {root}):"
+    images = None if ry_ph is None else image_map(spins)
+    model, masks = multidet_block_reference(new_net(), d, N, k, ndets, gap=args["gap"], seed=args["seed"] + i)
+    model, hist, _ = pretrain_exact(model, spins, target, masks, steps=args["pretrain_steps"], lr=args["pretrain_lr"],
                                     lr_t0=args["pretrain_lr_t0"], abort_at=None, log_every=args["pretrain_log_every"],
                                     log_prefix=label, projection=None if images is None else (*images, ry_ph))
-    a = amplitudes(model, spins2)
+    a = amplitudes(model, spins)
     if images is not None:
         a = 0.5 * (a + ry_ph * images[1] * a[images[0]])
     infidelity = 1 - (a @ target)**2 / (a @ a) / (target @ target)
-    E = float(a @ (H2 @ a) / (a @ a))
+    E = float(a @ (Hk @ a) / (a @ a))
     print(f"{label} h=0 1-F {infidelity:.3e}, <H> {E:.6f} (exact {E_exact:.6f}), {ndets} dets "
           f"[{time.time() - start_time:.0f}s]", flush=True)
-    return save_member(i, 2, root, model, start_time, E_h0=float(E_exact), infidelity_h0=float(infidelity),
+    return save_member(i, k, root, model, start_time, E_h0=float(E_exact), infidelity_h0=float(infidelity),
                        E_model_h0=E, history=[(int(s), float(v)) for s, v in hist[:-1]])
 
 
 def live_k01(i, k, L):
     """Member i, k = 0 or 1 with --k01-backflow live: the vacuum with a random W and the down features suppressed
     (exact for any W, nothing to fit), or the k=1 block determinant with W fitted to the sector's L state at h = 0 as
-    the k=2 members are (projected with --ry-ph-sect). Also reports the weight it puts in the neighbouring sectors,
+    the k>=2 members are (projected with --ry-ph-sect). Also reports the weight it puts in the neighbouring sectors,
     O(e^-2gap)."""
     start_time = time.time()
     label = f"member {i} (k={k} L={L}):"
@@ -250,15 +255,15 @@ def live_k01(i, k, L):
                        leak_h0=leak, backflow="live", history=[(int(s), float(v)) for s, v in hist[:-1]])
 
 
-# --parallel child: one k=2 member from the parent's targets; its meta entry goes back through a file
+# --parallel child: one k>=2 member from the parent's targets; its meta entry goes back through a file
 if args["fit_member"] is not None:
     i = args["fit_member"]
+    k = members[i]
     qtx.set_random_seed(args["seed"] + i)          # otherwise every child starts from the same network
     with np.load(f"{work}.npz") as w:
         theta = float(w["theta"])
-        col = k2.index(i)
-        info, _ = fit_k2(i, roots[i], w["spins2"], w["V2"][:, col], float(w["E2"][col]),
-                         sp.sparse.load_npz(f"{work}_H2.npz"))
+        info, _ = fit_block(i, roots[i], w[f"spins{k}"], w[f"V{i}"], float(w[f"E{i}"]),
+                            sp.sparse.load_npz(f"{work}_H{k}.npz"))
     with open(f"{work}_member{i}.json", "w") as f:
         json.dump(info, f, default=float)
     raise SystemExit
@@ -295,61 +300,66 @@ print(f"every member is rotated by {np.degrees(theta):.4f} deg (rotated vacuum i
       f"{meta['E_vacuum']:.6f})", flush=True)
 
 
-def k2_roots(L, need):
-    """The lowest `need` L states of the two-exciton sector at h = 0; with --ry-ph-sect those of that PH x Ry
+def sector_roots(k, L, need):
+    """The lowest `need` L states of the k-exciton sector at h = 0; with --ry-ph-sect those of that PH x Ry
     eigenvalue (the sector is closed under it), more roots being computed until there are enough."""
     if ry_ph is None:
-        return ksectors.eigenstates(tms_H0, 2, nstates=need, L2=tms_L2, L=L)
-    images2 = image_map(spins2)
+        return ksectors.eigenstates(tms_H0, k, nstates=need, L2=tms_L2, L=L)
+    images = image_map(ksectors.configs(k))
     nst = need
-    E, V = ksectors.eigenstates(tms_H0, 2, nstates=nst, L2=tms_L2, L=L)
+    E, V = ksectors.eigenstates(tms_H0, k, nstates=nst, L2=tms_L2, L=L)
     while True:
-        ev = np.array([eigenvalue(V[:, j], images2) for j in range(V.shape[1])])
+        ev = np.array([eigenvalue(V[:, j], images) for j in range(V.shape[1])])
         keep = np.flatnonzero(ev * ry_ph > 0.5)
         if len(keep) >= need:
             break
         nst *= 2
         try:
-            E, V = ksectors.eigenstates(tms_H0, 2, nstates=nst, L2=tms_L2, L=L)
+            E, V = ksectors.eigenstates(tms_H0, k, nstates=nst, L2=tms_L2, L=L)
         except ValueError:                                   # fewer L levels in the whole sector
             break
-    print(f"k=2 L={L} roots {np.round(E, 6)}: PH x Ry {np.round(ev, 4)}", flush=True)
+    print(f"k={k} L={L} roots {np.round(E, 6)}: PH x Ry {np.round(ev, 4)}", flush=True)
     if len(keep) < need:
-        raise SystemExit(f"--ry-ph-sect {ry_ph:+d}: only {len(keep)} k=2 L={L} roots in that sector, {need} needed")
+        raise SystemExit(f"--ry-ph-sect {ry_ph:+d}: only {len(keep)} k={k} L={L} roots in that sector, {need} needed")
     return E[keep[:need]], V[:, keep[:need]]
 
 
-# The k=2 targets, one column per k=2 member (in member order)
-if k2:
-    spins2 = ksectors.configs(2)
-    roots_by_L = {L: k2_roots(L, 1 + max(roots[i] for i in k2 if Ls[i] == L)) for L in sorted({Ls[i] for i in k2})}
-    E2 = np.array([roots_by_L[Ls[i]][0][roots[i]] for i in k2])
-    V2 = np.stack([roots_by_L[Ls[i]][1][:, roots[i]] for i in k2], 1)
-    H2 = ksectors.block(tms_H0, 2, 2)
-    print(f"k=2 sector: {len(spins2)} configurations; targets (L, root) {[(Ls[i], roots[i]) for i in k2]}"
-          f"{'' if ry_ph is None else f' in PH x Ry {ry_ph:+d}'}, exact energies {np.round(E2, 6)}", flush=True)
+# The targets of the k>=2 members, (exact energy, vector on ksectors.configs(k)) by member index
+targets = {}
+for k in fitted_ks:
+    mine = [i for i in fitted if members[i] == k]
+    roots_by_L = {L: sector_roots(k, L, 1 + max(roots[i] for i in mine if Ls[i] == L))
+                  for L in sorted({Ls[i] for i in mine})}
+    for i in mine:
+        E, V = roots_by_L[Ls[i]]
+        targets[i] = (float(E[roots[i]]), V[:, roots[i]])
+    print(f"k={k} sector: {ksectors.dim(k)} configurations; targets (L, root) {[(Ls[i], roots[i]) for i in mine]}"
+          f"{'' if ry_ph is None else f' in PH x Ry {ry_ph:+d}'}, exact energies "
+          f"{np.round([targets[i][0] for i in mine], 6)}", flush=True)
 
 
-# --parallel: the k=2 fits in child processes. Each is pinned to its share of the CPUs by setting it on this thread
+# --parallel: the k>=2 fits in child processes. Each is pinned to its share of the CPUs by setting it on this thread
 # while the child starts (a child inherits it), and splits its fit over half as many JAX devices: with as many devices
 # as CPUs the children hung at 0% CPU on the cluster (2026-10-15), probably waiting in the cross-device sum
 children = {}
-if args["parallel"] and len(k2) > 1:
-    np.savez(f"{work}.npz", spins2=spins2, V2=V2, E2=E2, theta=theta)
-    sp.sparse.save_npz(f"{work}_H2.npz", H2)
+if args["parallel"] and len(fitted) > 1:
+    np.savez(f"{work}.npz", theta=theta, **{f"spins{k}": ksectors.configs(k) for k in fitted_ks},
+             **{f"V{i}": targets[i][1] for i in fitted}, **{f"E{i}": targets[i][0] for i in fitted})
+    for k in fitted_ks:
+        sp.sparse.save_npz(f"{work}_H{k}.npz", ksectors.block(tms_H0, k, k))
     all_cpus = sorted(os.sched_getaffinity(0))
-    if len(all_cpus) < len(k2):
-        raise SystemExit(f"--parallel: {len(all_cpus)} CPUs for {len(k2)} k=2 members")
-    shares = [set(map(int, c)) for c in np.array_split(all_cpus, len(k2))]
-    for i, cpus in zip(k2, shares):
+    if len(all_cpus) < len(fitted):
+        raise SystemExit(f"--parallel: {len(all_cpus)} CPUs for {len(fitted)} k>=2 members")
+    shares = [set(map(int, c)) for c in np.array_split(all_cpus, len(fitted))]
+    for i, cpus in zip(fitted, shares):
         os.sched_setaffinity(0, cpus)
         children[i] = subprocess.Popen([sys.executable, __file__, *sys.argv[1:], "--fit-member", str(i)],
                                        env={**os.environ, "JAX_NUM_CPU_DEVICES": str(max(1, len(cpus) // 2))})
     os.sched_setaffinity(0, all_cpus)
-    print(f"k=2 members {k2} fitting in parallel, CPUs {[sorted(c) for c in shares]}", flush=True)
+    print(f"k>=2 members {fitted} fitting in parallel, CPUs {[sorted(c) for c in shares]}", flush=True)
 
 
-# The members, built at h = 0 and rotated by setting theta; with --parallel the k=2 ones come from the children
+# The members, built at h = 0 and rotated by setting theta; with --parallel the k>=2 ones come from the children
 models = []
 for i, (k, L, root) in enumerate(zip(members, Ls, roots)):
     if k < 2 and args["k01_backflow"] == "live":
@@ -382,18 +392,18 @@ for i, (k, L, root) in enumerate(zip(members, Ls, roots)):
             info = json.load(f)
         model = load_member(info["spec"], N, f"{path}/{info['file']}")
     else:
-        col = k2.index(i)
-        info, model = fit_k2(i, root, spins2, V2[:, col], float(E2[col]), H2)
+        info, model = fit_block(i, root, ksectors.configs(k), targets[i][1], targets[i][0],
+                                ksectors.block(tms_H0, k, k))
     models.append(model)
     meta["members"].append(info)
     save_meta()
     print(f"member {i} (k={k} L={L}) written: {info['file']}", flush=True)
-for f in [f"{work}.npz", f"{work}_H2.npz", *(f"{work}_member{i}.json" for i in children)]:
+for f in [f"{work}.npz", *(f"{work}_H{k}.npz" for k in fitted_ks), *(f"{work}_member{i}.json" for i in children)]:
     Path(f).unlink(missing_ok=True)
 
 
 # Conditioning as NES members. The overlap matrix of the unprojected members is that of the h = 0 ones (R(theta) is
-# unitary), block diagonal in k: only the fits of the same k (the k=2 roots) can make it ill-conditioned, and that
+# unitary), block diagonal in k: only the fits of the same k (the roots of one k >= 2) can make it ill-conditioned, and that
 # part is exact here. The Z2 projection adds cross terms <psi_i|F R(2 theta)|psi_j>: sin(theta)^N for the vacuum
 # (0.34 at N=8, 0.12 at N=24), larger between different k by combinatorial factors; --check gives the full overlap
 # matrix at N <= 12 (condition number 4.4 at N=8)

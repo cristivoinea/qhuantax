@@ -1,6 +1,6 @@
 # Single-state counterpart of FuzzySphereRotatedNES.py: SR on one rotated exciton member of FuzzySphereRotatedAnsatz.py
 # (--member, its index in the ansatz), at transverse field h in the ansatz's Lz sector, where NES needs K >= 2. The member
-# is released as there (untied, the k=2 up-feature suppression lowered to exp(-gap), the k=0,1 determinants given a
+# is released as there (untied, the k>=2 up-feature suppression lowered to exp(-gap), the k=0,1 determinants given a
 # small random backflow) and trained by energy minimisation against H + lambda L^- L^+, sampled from |psi|^reweight with
 # pair hops mixed with single-electron flavour flips. Minimisation finds the lowest level of the imposed sectors, so
 # the target is the member's only if it is that level: a k=2 root above the vacuum, or a member of L > Lz without a
@@ -70,7 +70,7 @@ parser.add_argument("--no-untie", action="store_true", help="keep the features c
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 member: W = this x the default random init; 0 keeps W = 0")
 parser.add_argument("--gap", type=float, default=8.0,
-                    help="k=2 member, and a k=1 one with a live backflow: up features suppressed by exp(-gap); the "
+                    help="k>=2 member, and a k=1 one with a live backflow: up features suppressed by exp(-gap); the "
                          "live k=0 one: down features; <= 0 keeps the ansatz's")
 parser.add_argument("--fs-exact-sweeps", type=int, default=10,
                     help="in this run's first this many sweeps (continuations too: Adam restarts) --max-fs and "
@@ -86,8 +86,8 @@ parser.add_argument("--open-fill", type=float, default=0.0,
 parser.add_argument("--lmlp-coeff", default="0",
                     help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
                          "lowest level of every L > Lz --lmlp-margin above the lowest L = Lz one, and at least the "
-                         "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-14, other "
-                         "N extrapolated). The member must have L = Lz")
+                         "--lmlp-floor-gap floor; from the ED levels at h = 3.16 of misc/iqh_gaps.py (N = 7-18, other "
+                         "N extrapolated quadratically in 1/sqrt(N)). The member must have L = Lz")
 parser.add_argument("--lmlp-margin", type=float, default=1.0,
                     help="auto: energy by which the L > Lz levels must clear the target")
 parser.add_argument("--lmlp-floor-gap", type=float, default=20.0,
@@ -304,7 +304,7 @@ def release(member):
 if cont_run_id is None:
     model = release(member)
     start = (f"theta {np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}, "
-             f"k=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
+             f"k>=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
 else:
     model = load_member(cont_meta["members"][0]["spec"], N, f"{path}/{cont_meta['members'][0]['file']}")
     start = f"continued from {cont_run_id} (lambda {cont_meta['lam']:g} at its end)"
