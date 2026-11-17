@@ -3,8 +3,11 @@ smallest :math:`L^- L^+` penalty that makes a given set of them the lowest state
 
 ``ED_benchmark/3d_ising_spectrum_ne_{N}.txt`` holds one level per row, lowest first, columns ``E L Z P``: Z the flavour
 flip (``--z2-sect``) and P the FuzzifiED particle hole ``GetParityQNOffd(nm, 2, [2, 1], [-1, 1])``, so ``--ry-ph-sect``
-is P (-1)^L. The ED kept the 20 lowest states of each (P, Z, Ry) sector at Lz = 0 and of these the ``N_EIG`` lowest of
-each (L, Z, P) with L <= ``L_MAX``; whatever is missing lies above them.
+is P (-1)^L. N = 7-16 come from FuzzifiED's SO3lver (FuzzySphere/ising_spectrum_so3.jl), which kept the 20 lowest states
+of each (P, Z, Ry) sector at Lz = 0 and of these the ``N_EIG`` lowest of each (L, Z, P) with L <= ``L_MAX``, whatever is
+missing lying above them. N = 17-18 come from FuzzySphereLDiag's coupled basis adapted to P
+(FuzzySphere/ising_spectrum_ldiag.jl), the ``N_EIG`` lowest of each (L, Z, P) directly; the two agree to 2e-9 at
+N = 7-16.
 """
 
 from pathlib import Path
@@ -16,6 +19,7 @@ H_FIELD = 3.16
 PS_POT = (4.75, 1.0)
 N_EIG = 4
 L_MAX = 4
+FIT_DEG = 2  # gap extrapolations are polynomials of this degree in 1/sqrt(N); the L = 3, 4 gaps curve
 
 
 def sizes() -> list[int]:
@@ -38,11 +42,11 @@ def levels(N: int, L: int, Z=None, P=None) -> np.ndarray:
     return s[keep, 0]
 
 
-def gap_fit(L: int, Z, k: int, P=None):
+def gap_fit(L: int, Z, k: int, P=None, deg: int = FIT_DEG):
     """Port of ``get_fit``: the gap of the k-th (L, Z, P) level above the ground state at every size, NaN where it is
-    absent, and its least-squares fit ``a + b / sqrt(N)``.
+    absent, and its least-squares fit by a polynomial of degree ``deg`` in 1 / sqrt(N) (``get_fit`` is deg = 1).
 
-    :return: ``(Ns, gaps, (a, b))``, ``(a, b)`` NaN when fewer than two sizes have the level.
+    :return: ``(Ns, gaps, coef)``, ``coef`` lowest order first, NaN when at most ``deg`` sizes have the level.
     """
     Ns = np.array(sizes())
     gaps = np.full(len(Ns), np.nan)
@@ -51,10 +55,15 @@ def gap_fit(L: int, Z, k: int, P=None):
         if k <= len(lv):
             gaps[i] = lv[k - 1] - load_spectrum(N)[0, 0]
     ok = ~np.isnan(gaps)
-    if ok.sum() < 2:
-        return Ns, gaps, (np.nan, np.nan)
-    A = np.stack([np.ones(ok.sum()), 1 / np.sqrt(Ns[ok])], axis=1)
-    return Ns, gaps, tuple(np.linalg.lstsq(A, gaps[ok], rcond=None)[0])
+    if ok.sum() <= deg:
+        return Ns, gaps, np.full(deg + 1, np.nan)
+    A = np.vander(1 / np.sqrt(Ns[ok]), deg + 1, increasing=True)
+    return Ns, gaps, np.linalg.lstsq(A, gaps[ok], rcond=None)[0]
+
+
+def fitted_gap(N: int, L: int, Z, k: int, P=None, deg: int = FIT_DEG) -> float:
+    """The ``gap_fit`` of the k-th (L, Z, P) level evaluated at size N; NaN without a fit."""
+    return float(np.polynomial.polynomial.polyval(N ** -0.5, gap_fit(L, Z, k, P, deg)[2]))
 
 
 def min_lambda(N: int, L: int, n_states: int, Z=None, ry_ph=None, ry=None, margin: float = 0.0,
@@ -66,7 +75,7 @@ def min_lambda(N: int, L: int, n_states: int, Z=None, ry_ph=None, ry=None, margi
     P = ry_ph (-1)^L and only the L' levels with P = ry_ph (-1)^L' compete; ``ry`` (Lz = 0 only, eigenvalue (-1)^L)
     leaves the even L'; Z = None leaves the Z2 sector unresolved.
 
-    At a size in the data the ED gaps are used, at any other N the ``gap_fit`` extrapolations.
+    At a size in the data the ED gaps are used, at any other N the ``fitted_gap`` extrapolations.
     """
     if n_states > N_EIG:
         # with Z or P unresolved more levels are on file, but beyond N_EIG some may be missing
@@ -82,14 +91,13 @@ def min_lambda(N: int, L: int, n_states: int, Z=None, ry_ph=None, ry=None, margi
 
     exact = N in sizes()
     if verbose and not exact:
-        print(f"N={N} not in the ED sizes {sizes()}: gaps from the a + b/sqrt(N) fits")
+        print(f"N={N} not in the ED sizes {sizes()}: gaps from the degree-{FIT_DEG} fits in 1/sqrt(N)")
 
     def gap(l, k):
         if exact:
             lv = levels(N, l, Z, P(l))
             return lv[k - 1] - load_spectrum(N)[0, 0] if k <= len(lv) else np.nan
-        a, b = gap_fit(l, Z, k, P(l))[2]
-        return a + b / np.sqrt(N)
+        return fitted_gap(N, l, Z, k, P(l))
 
     gap_target = gap(L, n_states)
     if np.isnan(gap_target):
