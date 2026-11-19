@@ -16,11 +16,12 @@ vacuum :math:`|\Uparrow\rangle`. With :math:`b_{mn}=c^\dagger_{\downarrow m}c_{\
   :math:`k\ge3`, so its support is the handful of :math:`k\le2` configurations returned by
   ``support`` and the fidelity is an exact finite sum -- no sampling.
 * Preferred for :math:`k\ge2`: the **block reference** (``block_orbitals``, ``block_backflow``,
-  ``pretrain_masked``, ``k2_sector_checks``; ``docs/exciton_h0.pdf``, section 2). Its support is
-  exactly sector :math:`k` by construction, so the exact sum needs no :math:`k+1` guard shell and
-  no :math:`\delta` block, it trains at production width, and overlap and energy are checked
-  exactly without ED at any :math:`N`. ``FuzzySphereExcitonCheck.py`` runs it (default ansatz),
-  ``FuzzySphereExcitonLRSweep.py`` sweeps its learning rate.
+  ``pretrain_masked``, ``k2_sector_checks``; ``docs/exciton_h0.pdf``, section 2). Nothing reaches
+  above sector :math:`k` by construction, so the exact sum runs over :math:`k'\le k`
+  (``KSectors.space``) and needs no :math:`k+1` guard shell and no :math:`\delta` block, it
+  trains at production width, and overlap and energy are checked exactly without ED at any
+  :math:`N`. ``FuzzySphereExcitonCheck.py`` runs it (default ansatz, with the older up-feature
+  gap and sector :math:`k` alone), ``FuzzySphereExcitonLRSweep.py`` sweeps its learning rate.
 
 * Any :math:`k`, and the response to a transverse field: ``KSectors`` works on the explicit
   configuration lists of each :math:`k` sector with quantax's own matrix elements, and solves
@@ -391,6 +392,24 @@ class KSectors:
     def dim(self, k: int) -> int:
         return len(self.configs(k))
 
+    def space(self, kmax: int) -> np.ndarray:
+        r"""The configurations with at most ``kmax`` flips: ``configs(0)``, ..., ``configs(kmax)``
+        concatenated in that order, so the space of a smaller ``kmax`` is a prefix of this one and a
+        vector on it extends to a larger space by appending zeros. The space a block member of
+        sector ``kmax`` lives on (exactly zero above ``kmax``) and is fitted on."""
+        return np.concatenate([self.configs(k) for k in range(kmax + 1)])
+
+    def sector_of(self, kmax: int) -> np.ndarray:
+        """The sector k of every configuration of ``space(kmax)``."""
+        return np.concatenate([np.full(self.dim(k), k) for k in range(kmax + 1)])
+
+    def block_diag(self, op, kmax: int):
+        r"""An operator that conserves :math:`k` (:math:`H_\text{int}`, :math:`L^2`) on
+        ``space(kmax)``: its diagonal blocks, as one scipy CSR matrix."""
+        from scipy.sparse import block_diag
+
+        return block_diag([self.block(op, k, k) for k in range(kmax + 1)], format="csr")
+
     def block(self, op, k_out: int, k_in: int, chunk: int | None = None):
         r""":math:`\langle s'|O|s\rangle` for ``s'`` in sector ``k_out`` and ``s`` in ``k_in``, as a
         scipy CSR matrix. Connected configurations outside ``k_out`` are dropped.
@@ -411,6 +430,9 @@ class KSectors:
         s_in = self.configs(k_in)
         keys_out = spins_key(self.configs(k_out))
         n_out, n_in = len(keys_out), len(s_in)
+        if n_out == 0 or n_in == 0:             # an empty sector (e.g. k = 0 at Lz != 0)
+            self._blocks[cache_key] = csr_matrix((n_out, n_in))
+            return self._blocks[cache_key]
 
         rows, cols, vals = [], [], []
         for start in range(0, n_in, chunk):
@@ -521,13 +543,15 @@ class KSectors:
         return psi1, E2
 
     def target(self, pieces: dict, kmax: int):
-        r"""Stack sector vectors ``{k: vector}`` into ``(spins, amplitudes)`` over every
-        :math:`k\le k_{\max}` (zeros where ``pieces`` has none), the input of
-        ``pretrain_fidelity``."""
-        spins = [self.configs(k) for k in range(kmax + 1)]
-        amps = [np.asarray(pieces[k], float) if k in pieces else np.zeros(len(s))
-                for k, s in zip(range(kmax + 1), spins)]
-        return np.concatenate(spins), np.concatenate(amps)
+        r"""Stack sector vectors ``{k: vector on configs(k)}`` into ``(spins, amplitudes)`` on
+        ``space(kmax)`` (zeros where ``pieces`` has none): one sector's state, or a superposition
+        of several :math:`k\le k_{\max}`. The input of ``pretrain_fidelity`` and
+        ``rotated.pretrain_exact``."""
+        if any(not 0 <= k <= kmax for k in pieces):
+            raise ValueError(f"pieces in sectors {sorted(pieces)}, outside 0..{kmax}")
+        amps = [np.asarray(pieces[k], float) if k in pieces else np.zeros(self.dim(k))
+                for k in range(kmax + 1)]
+        return self.space(kmax), np.concatenate(amps)
 
 
 # ---------------------------------------------------------------------- block reference for k >= 2
@@ -535,8 +559,9 @@ class KSectors:
 # docs/exciton_h0.pdf, section 2. On the vacuum, a rank-2 correction gives psi_{k=2} = det X_down *
 # det W_holes exactly, but psi_{k<=1} = 0 needs the fine-tuning G(s) = -1 on every k<=1
 # configuration, which is what forced the k=3 guard shell and the delta block of
-# ``pretrain_fidelity``. The block reference removes both: the support is exactly sector k by
-# construction, so the exact sum runs over sector k alone.
+# ``pretrain_fidelity``. The block reference removes both: nothing reaches above sector k by
+# construction, and below it the amplitudes are powers of the up features, so the exact sum runs
+# over KSectors.space(k) (or, with the older up-feature gap, over sector k alone).
 
 
 def hole_frame(nm: int, k: int) -> np.ndarray:
@@ -586,20 +611,25 @@ def block_orbitals(nm: int, k: int, holes: np.ndarray | None = None,
     return U0, mask
 
 
-def block_backflow(model, k: int, gap: float = 20.0):
-    r"""Restrict a ``DetBackflow`` built on ``block_orbitals(..., k)`` to sector :math:`k`.
+def block_backflow(model, k: int, gap: float | None = None):
+    r"""Restrict a ``DetBackflow`` built on ``block_orbitals(..., k)`` to the sectors :math:`k'\le k`.
 
-    * ``W`` is zeroed on the core columns (its first ``N-k`` rows), so the correction reaches only
-      the :math:`k` excitation columns. Its rank is then bounded by :math:`k` at any width
-      :math:`d`, so every channel is used and no rank freeze is needed.
-    * The up-mode features are suppressed. The last FFN's bias ``b2`` gets
-      :math:`-g\sqrt{n_b+1}` on the even channels, which ``DetBackflow`` maps to up modes
-      (``x.reshape(d/2, 2N)``). After ``final_layer``'s rescaling, :math:`x_\uparrow\sim e^{-g}`.
+    ``W`` is zeroed on the core columns (its first ``N-k`` rows), so the correction reaches only
+    the :math:`k` excitation columns. Its rank is then bounded by :math:`k` at any width :math:`d`,
+    so every channel is used and no rank freeze is needed. The down rows then span only the
+    excitation columns: more than :math:`k` down electrons give a rank-deficient matrix,
+    :math:`\psi=0` identically. On sector :math:`k` the matrix is block triangular and the
+    amplitude :math:`\det A[\uparrow]\det B'[\downarrow]` does not depend on the up-mode features;
+    fewer down electrons, :math:`k'<k`, take :math:`k-k'` entries from the up rows in the
+    excitation columns, so their amplitudes are of order (up features)\ :sup:`k-k'`. Fit on
+    ``KSectors.space(k)`` with the target 0 there (``KSectors.target``), which drives those
+    features down, or with any superposition of the :math:`k'\le k` sectors.
 
-    More than :math:`k` down electrons then give a rank-deficient matrix (:math:`\psi=0`
-    identically), and fewer give :math:`O(e^{-g})`. At :math:`N=12` with :math:`g=20`: weight 0 at
-    :math:`k\ge3` and :math:`10^{-17}` at :math:`k=1`. For a later transfer to :math:`h>0` with SR,
-    prefer :math:`g\approx8`, since the suppressed features have gradients :math:`\propto e^{-g}`.
+    ``gap`` (the older pipeline, which fitted on sector :math:`k` alone) suppresses the up-mode
+    features instead: the last FFN's bias ``b2`` gets :math:`-g\sqrt{n_b+1}` on the even channels,
+    which ``DetBackflow`` maps to up modes (``x.reshape(d/2, 2N)``), so :math:`x_\uparrow\sim
+    e^{-g}` after ``final_layer``'s rescaling and the :math:`k'<k` weight is :math:`O(e^{-2g})`
+    (:math:`10^{-17}` at :math:`N=12`, :math:`g=20`).
 
     :return: ``(model, masks)``, with ``masks = {"W": ..., "U0": ...}`` for ``pretrain_masked``.
     """
@@ -609,8 +639,9 @@ def block_backflow(model, k: int, gap: float = 20.0):
     Ntot = model.W.shape[0]
     W_mask = jnp.zeros_like(model.W).at[Ntot - k:, :].set(1.0)
     model = eqx.tree_at(lambda m: m.W, model, model.W * W_mask)
-    b2 = model.net.layers[-2].b2.at[0::2].set(-gap * float(np.sqrt(model.net.nblocks + 1)))
-    model = eqx.tree_at(lambda m: m.net.layers[-2].b2, model, b2)
+    if gap is not None:
+        b2 = model.net.layers[-2].b2.at[0::2].set(-gap * float(np.sqrt(model.net.nblocks + 1)))
+        model = eqx.tree_at(lambda m: m.net.layers[-2].b2, model, b2)
     U0_mask = (jnp.zeros_like(model.U0).at[:Ntot, :Ntot - k].set(1.0)
                .at[Ntot:, Ntot - k:].set(1.0))
     return model, {"W": W_mask, "U0": U0_mask}

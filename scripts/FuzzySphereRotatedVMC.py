@@ -1,7 +1,7 @@
 # Single-state counterpart of FuzzySphereRotatedNES.py: SR on one rotated exciton member of FuzzySphereRotatedAnsatz.py
 # (--member, its index in the ansatz), at transverse field h in the ansatz's Lz sector, where NES needs K >= 2. The member
-# is released as there (untied, the k>=2 up-feature suppression lowered to exp(-gap), the k=0,1 determinants given a
-# small random backflow) and trained by energy minimisation against H + lambda L^- L^+, sampled from |psi|^reweight with
+# is released as there (untied, the k=0,1 determinants with W = 0 given a small random backflow, and in older ansatz
+# runs the up-feature suppression lowered to exp(-gap)) and trained by energy minimisation against H + lambda L^- L^+, sampled from |psi|^reweight with
 # pair hops mixed with single-electron flavour flips. Minimisation finds the lowest level of the imposed sectors, so
 # the target is the member's only if it is that level: a k=2 root above the vacuum, or a member of L > Lz without a
 # symmetry that excludes the lower L, falls to the vacuum. Symmetries, the penalty, the trust region, --cont-run and the
@@ -70,8 +70,10 @@ parser.add_argument("--no-untie", action="store_true", help="keep the features c
 parser.add_argument("--det-backflow-scale", type=float, default=0.1,
                     help="k=0,1 member: W = this x the default random init; 0 keeps W = 0")
 parser.add_argument("--gap", type=float, default=8.0,
-                    help="k>=2 member, and a k=1 one with a live backflow: up features suppressed by exp(-gap); the "
-                         "live k=0 one: down features; <= 0 keeps the ansatz's")
+                    help="older ansatz runs only (before 2026-11-18), whose members suppress one flavour's features by "
+                         "exp(-20) (k>=1: up; the live k=0 vacuum: down): lowered to exp(-gap) at release, <= 0 keeps "
+                         "it. Newer members carry no such bias (they are fitted on their sectors k' <= k instead) and "
+                         "ignore this")
 parser.add_argument("--fs-exact-sweeps", type=int, default=10,
                     help="in this run's first this many sweeps (continuations too: Adam restarts) --max-fs and "
                          "--warmup-fs act on the step's actual 1 - F, estimated from the amplitude ratios psi_new/psi "
@@ -82,7 +84,7 @@ parser.add_argument("--fs-exact-sweeps", type=int, default=10,
 parser.add_argument("--open-fill", type=float, default=0.0,
                     help="members with a live backflow: fill the reference's structural zeros (which keep it in its "
                          "exciton sector) with this x std(U0) x N(0,1), opening the neighbouring sectors linearly; "
-                         "use with --gap 20, which keeps the suppressed flavour shut; 0 disables")
+                         "0 disables")
 parser.add_argument("--lmlp-coeff", default="0",
                     help="coefficient lambda of the L^- L^+ penalty, or 'auto': the smallest lambda that keeps the "
                          "lowest level of every L > Lz --lmlp-margin above the lowest L = Lz one, and at least the "
@@ -228,11 +230,12 @@ ksectors = KSectors(N, lz)
 
 
 def member_eigenvalue(U, project=fit_ry_ph is not None):
-    """<U> of the ansatz member at h=0, an exact sum over its sector k, which Ry and PH x Ry map onto itself: the
+    """<U> of the ansatz member at h=0, an exact sum over the sectors k' <= k it lives on,
+    each of which Ry and PH x Ry map onto itself: the
     eigenvalue for an exact member; the projection onto the other sector would keep (1 - <U>)/2 of its weight. With
     `project`, of the PH x Ry projected model the ansatz fitted, psi_P(x) = [psi(x) + r sign psi(x')]/2."""
     model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"]).rebuild(theta=0.0)
-    s = jnp.asarray(ksectors.configs(k))
+    s = jnp.asarray(ksectors.space(k))
     t, sign = jax.vmap(U.images)(s)
 
     def terms(x):                       # (coefficient, configurations) whose amplitudes add up to the member's at x
@@ -278,12 +281,16 @@ tms_Lp = GetLpTerms(N, 2)
 tms_LmLp = tms_Lp.H @ tms_Lp
 
 
+# members of ansatz runs before 2026-11-18 carry a feature-suppressing bias (rotated.set_gap); newer ones none
+legacy_gap = "gap" in ansatz["args"]
+
+
 def release(member):
     model = load_member(member["spec"], N, Path(args["ansatz_meta"]).parent / member["file"])
     if not args["no_untie"]:
         model = untie(model)
-    live = member.get("backflow") == "live"            # k = 0, 1 with a live backflow (older ansatz runs: W = 0)
-    if (member["k"] >= 2 or live) and args["gap"] > 0:     # the fits; the live vacuum suppresses its down features
+    live = member.get("backflow") == "live"            # k = 1 (older runs: also 0) with a fitted backflow
+    if legacy_gap and (member["k"] >= 2 or live) and args["gap"] > 0:     # older runs: their bias, lowered
         model = set_gap(model, args["gap"], flavour="down" if member["k"] == 0 else "up")
     if live and args["open_fill"] > 0:
         # the neighbouring sectors opened through the reference's structural zeros (the down block of the vacuum, the
@@ -303,8 +310,9 @@ def release(member):
 
 if cont_run_id is None:
     model = release(member)
-    start = (f"theta {np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}, "
-             f"k>=2 gap {args['gap'] if args['gap'] > 0 else 'unchanged'}")
+    start = (f"theta {np.degrees(ansatz['theta']):.4f} deg, {'charge-only' if args['no_untie'] else 'untied'}"
+             + (f", older ansatz run: feature bias lowered to exp(-{args['gap']:g})" if legacy_gap and args["gap"] > 0
+                else ""))
 else:
     model = load_member(cont_meta["members"][0]["spec"], N, f"{path}/{cont_meta['members'][0]['file']}")
     start = f"continued from {cont_run_id} (lambda {cont_meta['lam']:g} at its end)"
